@@ -79,7 +79,8 @@ fn main() -> Result<()> {
             }
         };
 
-        if let Err(err) = run_session(session, &mut udf, &args) {
+        let (pre, pre_cfg, post, post_cfg) = session;
+        if let Err(err) = run_session(pre, pre_cfg, post, post_cfg, &mut udf, &args) {
             eprintln!("Session ended with error: {err:#}");
         }
     }

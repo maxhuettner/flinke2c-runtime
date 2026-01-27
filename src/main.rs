@@ -35,23 +35,32 @@ struct Args {
 
     #[arg(long, value_delimiter = ',', default_value = "jar/flinke2c.jar")]
     udf_jars: Vec<PathBuf>,
-    #[arg(long, default_value = "org.example.flinke2c.CurrencyConversionFunction")]
-    udf_class: String,
     #[arg(long, default_value = "org.example.proxy.ScalarFunctionAdapter")]
     udf_adapter_class: String,
     #[arg(long, default_value = "evalBatch")]
     udf_method: String,
-    #[arg(long, default_value = "([Ljava/lang/String;)V")]
+    #[arg(long, default_value = "([[Ljava/lang/String;)V")]
     udf_sig: String,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct FunctionArg {
+    name: String,
+    #[serde(rename = "type")]
+    arg_type: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ConfigMessage {
     role: String,
-    tm_host: String,
-    job_id: String,
-    calc_field_name: String,
+    #[serde(default)]
+    function_class: Option<String>,
+    #[serde(default)]
+    function_kind: Option<String>,
+    #[serde(default)]
+    function_args: Vec<FunctionArg>,
 }
 
 fn main() -> Result<()> {
@@ -59,12 +68,9 @@ fn main() -> Result<()> {
 
     let listener = TcpListener::bind((args.listen_host.as_str(), args.in_port))
         .context("bind in-port")?;
-    let mut udf = UdfHandle::new_with_args(
-        &args.udf_jars,
-        &args.udf_adapter_class,
-        "(Ljava/lang/String;)V",
-        &[JavaArg::String(args.udf_class.clone())],
-    )?;
+    let mut current_udf_class: Option<String> = None;
+    let mut current_udf_types: Option<Vec<String>> = None;
+    let mut udf: Option<UdfHandle> = None;
 
     println!(
         "Waiting for PRE/POST on {}:{} ...",
@@ -80,7 +86,16 @@ fn main() -> Result<()> {
         };
 
         let (pre, pre_cfg, post, post_cfg) = session;
-        if let Err(err) = run_session(pre, pre_cfg, post, post_cfg, &mut udf, &args) {
+        if let Err(err) = run_session(
+            pre,
+            pre_cfg,
+            post,
+            post_cfg,
+            &mut udf,
+            &mut current_udf_class,
+            &mut current_udf_types,
+            &args,
+        ) {
             eprintln!("Session ended with error: {err:#}");
         }
     }
@@ -98,6 +113,7 @@ fn read_config(stream: &mut TcpStream) -> Result<ConfigMessage> {
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).context("read config")?;
     let cfg: ConfigMessage = serde_json::from_slice(&buf).context("parse config json")?;
+    println!("Received config: {:?}", cfg);
     Ok(cfg)
 }
 
@@ -139,25 +155,72 @@ fn run_session(
     pre_cfg: ConfigMessage,
     post: TcpStream,
     post_cfg: ConfigMessage,
-    udf: &mut UdfHandle,
+    udf: &mut Option<UdfHandle>,
+    current_udf_class: &mut Option<String>,
+    current_udf_types: &mut Option<Vec<String>>,
     args: &Args,
 ) -> Result<()> {
+    let pre_fn = pre_cfg.function_class.as_deref().unwrap_or("<none>");
+    let post_fn = post_cfg.function_class.as_deref().unwrap_or("<none>");
+    let pre_kind = pre_cfg.function_kind.as_deref().unwrap_or("<none>");
+    let post_kind = post_cfg.function_kind.as_deref().unwrap_or("<none>");
     println!(
-        "PRE config: jobId={}, tmHost={}, calcFieldName={}",
-        pre_cfg.job_id, pre_cfg.tm_host, pre_cfg.calc_field_name
+        "PRE config: functionKind={}, functionClass={}, functionArgs={}",
+        pre_kind,
+        pre_fn,
+        pre_cfg.function_args.len()
     );
     println!(
-        "POST config: jobId={}, tmHost={}, calcFieldName={}",
-        post_cfg.job_id, post_cfg.tm_host, post_cfg.calc_field_name
+        "POST config: functionKind={}, functionClass={}, functionArgs={}",
+        post_kind,
+        post_fn,
+        post_cfg.function_args.len()
     );
-    if pre_cfg.calc_field_name != post_cfg.calc_field_name {
-        eprintln!(
-            "PRE/POST config mismatch: pre {}, post {}",
-            pre_cfg.calc_field_name, post_cfg.calc_field_name
+
+    let desired_udf_class = pre_cfg
+        .function_class
+        .as_deref()
+        .context("functionClass missing from PRE config")?
+        .to_string();
+    let desired_udf_types: Vec<String> = pre_cfg
+        .function_args
+        .iter()
+        .map(|arg| arg.arg_type.clone())
+        .collect();
+
+    let class_changed = current_udf_class
+        .as_deref()
+        .map(|current| current != desired_udf_class)
+        .unwrap_or(true);
+    let types_changed = current_udf_types
+        .as_ref()
+        .map(|current| current != &desired_udf_types)
+        .unwrap_or(true);
+    if class_changed || types_changed || udf.is_none() {
+        let current_class_display = current_udf_class.as_deref().unwrap_or("<unset>");
+        let current_types_display = current_udf_types
+            .as_ref()
+            .map(|v| format!("{v:?}"))
+            .unwrap_or_else(|| "<unset>".to_string());
+        println!(
+            "Switching UDF config: class {} -> {}, types {} -> {:?}",
+            current_class_display, desired_udf_class, current_types_display, desired_udf_types
         );
+        *udf = Some(UdfHandle::new_with_args(
+            &args.udf_jars,
+            &args.udf_adapter_class,
+            "(Ljava/lang/String;[Ljava/lang/String;)V",
+            &[
+                JavaArg::String(desired_udf_class.clone()),
+                JavaArg::StringArray(desired_udf_types.clone()),
+            ],
+        )?);
+        *current_udf_class = Some(desired_udf_class);
+        *current_udf_types = Some(desired_udf_types);
     }
 
-    if udf.reload_if_changed()? {
+    let udf_handle = udf.as_mut().context("UDF handle not initialized")?;
+    if udf_handle.reload_if_changed()? {
         println!("Reloaded UDF classes after jar change");
     }
 
@@ -167,14 +230,15 @@ fn run_session(
     {
         let reader = StreamReader::try_new(tee, None).context("create Arrow IPC reader")?;
         let schema = reader.schema();
-        let field_index = resolve_field_index(schema.as_ref(), &pre_cfg)?;
+        let arg_indices = resolve_function_arg_indices(schema.as_ref(), &pre_cfg)?;
+        println!("Resolved {} UDF args at indices {:?}", arg_indices.len(), arg_indices);
 
         for maybe_batch in reader {
             let batch = maybe_batch.context("read Arrow record batch")?;
             apply_udf_to_batch(
                 &batch,
-                field_index,
-                udf,
+                &arg_indices,
+                udf_handle,
                 &args.udf_method,
                 &args.udf_sig,
             )?;
@@ -184,30 +248,54 @@ fn run_session(
     Ok(())
 }
 
-fn resolve_field_index(schema: &arrow_schema::Schema, cfg: &ConfigMessage) -> Result<usize> {
-    if let Some((idx, _)) = schema
-        .fields()
-        .iter()
-        .enumerate()
-        .find(|(_, field)| field.name() == &cfg.calc_field_name)
-    {
-        return Ok(idx);
+fn resolve_function_arg_indices(
+    schema: &arrow_schema::Schema,
+    pre_cfg: &ConfigMessage,
+) -> Result<Vec<usize>> {
+    let args = &pre_cfg.function_args;
+    if !args.is_empty() {
+        let mut indices = Vec::with_capacity(args.len());
+        for arg in args {
+            let name = arg.name.as_str();
+            let resolved_idx = schema
+                .fields()
+                .iter()
+                .enumerate()
+                .find(|(_, field)| field.name() == name)
+                .map(|(idx, _)| idx)
+                .with_context(|| format!("functionArg {} not found in Arrow schema", name))?;
+            indices.push(resolved_idx);
+        }
+        return Ok(indices);
     }
-    bail!(
-        "calcFieldName {} not found in Arrow schema",
-        cfg.calc_field_name
-    );
+
+    bail!("No functionArgs provided in PRE config");
 }
 
 fn apply_udf_to_batch(
     batch: &arrow_array::RecordBatch,
-    field_index: usize,
+    arg_indices: &[usize],
     udf: &UdfHandle,
     method: &str,
     method_sig: &str,
 ) -> Result<()> {
-    let values = column_to_strings(batch.column(field_index))?;
-    udf.call_string_array(method, method_sig, &values)?;
+    let mut columns = Vec::with_capacity(arg_indices.len());
+    for &idx in arg_indices {
+        columns.push(column_to_strings(batch.column(idx))?);
+    }
+    if method_sig.contains("[[Ljava/lang/String;") {
+        udf.call_string_matrix(method, method_sig, &columns)?;
+        return Ok(());
+    }
+
+    if columns.len() != 1 {
+        bail!(
+            "UDF method signature {} expects 1 argument but config resolved {}",
+            method_sig,
+            columns.len()
+        );
+    }
+    udf.call_string_array(method, method_sig, &columns[0])?;
     Ok(())
 }
 

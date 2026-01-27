@@ -12,6 +12,7 @@ static JVM: OnceLock<JavaVM> = OnceLock::new();
 pub enum JavaArg {
     Null,
     String(String),
+    StringArray(Vec<String>),
     BigDecimal(String),
     Boolean(bool),
     Byte(i8),
@@ -101,6 +102,42 @@ impl UdfHandle {
             method,
             method_sig,
             &[JValue::Object(&array)],
+        )?;
+        check_exception(&mut env, "invoke method")?;
+        if !matches!(ret, JValueOwned::Void) {
+            let _ = jvalue_to_string(&mut env, ret)?;
+        }
+        Ok(())
+    }
+
+    /// Call a method that takes a single String[][] argument and returns void.
+    /// The matrix is column-major: columns[arg_index][row_index].
+    pub fn call_string_matrix(
+        &self,
+        method: &str,
+        method_sig: &str,
+        columns: &[Vec<Option<String>>],
+    ) -> Result<()> {
+        if columns.is_empty() {
+            return Ok(());
+        }
+        let row_count = columns[0].len();
+        if columns.iter().any(|col| col.len() != row_count) {
+            bail!("string matrix columns have mismatched lengths");
+        }
+
+        let jvm = get_or_create_jvm()?;
+        let mut env = jvm
+            .attach_current_thread()
+            .context("attach JVM thread")?;
+        set_context_class_loader(&mut env, self.class_loader.as_obj())?;
+
+        let matrix = new_string_matrix(&mut env, columns)?;
+        let ret = env.call_method(
+            self.udf_obj.as_obj(),
+            method,
+            method_sig,
+            &[JValue::Object(&matrix)],
         )?;
         check_exception(&mut env, "invoke method")?;
         if !matches!(ret, JValueOwned::Void) {
@@ -479,6 +516,11 @@ fn build_jargs<'local, 'b>(
                 keepalive.push(JObject::from(jvalue));
                 prepared.push(PreparedArg::Obj(keepalive.len() - 1));
             }
+            JavaArg::StringArray(values) => {
+                let obj = new_string_array_from_strings(env, values)?;
+                keepalive.push(obj);
+                prepared.push(PreparedArg::Obj(keepalive.len() - 1));
+            }
             JavaArg::BigDecimal(v) => {
                 let obj = new_big_decimal(env, v)?;
                 keepalive.push(obj);
@@ -511,6 +553,38 @@ fn build_jargs<'local, 'b>(
     }
 
     Ok(jargs)
+}
+
+fn new_string_array_from_strings<'local>(
+    env: &mut JNIEnv<'local>,
+    values: &[String],
+) -> Result<JObject<'local>> {
+    let string_class = env.find_class("java/lang/String")?;
+    let array: JObjectArray =
+        env.new_object_array(values.len() as i32, string_class, JObject::null())?;
+
+    for (idx, value) in values.iter().enumerate() {
+        let jstr = env.new_string(value)?;
+        env.set_object_array_element(&array, idx as i32, JObject::from(jstr))?;
+    }
+
+    Ok(JObject::from(array))
+}
+
+fn new_string_matrix<'local>(
+    env: &mut JNIEnv<'local>,
+    columns: &[Vec<Option<String>>],
+) -> Result<JObject<'local>> {
+    let string_array_class = env.find_class("[Ljava/lang/String;")?;
+    let outer: JObjectArray =
+        env.new_object_array(columns.len() as i32, string_array_class, JObject::null())?;
+
+    for (idx, column) in columns.iter().enumerate() {
+        let inner = new_string_array(env, column)?;
+        env.set_object_array_element(&outer, idx as i32, inner)?;
+    }
+
+    Ok(JObject::from(outer))
 }
 
 fn new_string_array<'local>(

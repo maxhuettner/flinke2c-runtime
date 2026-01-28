@@ -110,6 +110,31 @@ impl UdfHandle {
         Ok(())
     }
 
+    /// Call a method that takes a single String[] argument and returns String[][].
+    pub fn call_string_array_to_columns(
+        &self,
+        method: &str,
+        method_sig: &str,
+        values: &[Option<String>],
+    ) -> Result<Vec<Vec<Option<String>>>> {
+        let jvm = get_or_create_jvm()?;
+        let mut env = jvm
+            .attach_current_thread()
+            .context("attach JVM thread")?;
+        set_context_class_loader(&mut env, self.class_loader.as_obj())?;
+
+        let array = new_string_array(&mut env, values)?;
+        let ret = env.call_method(
+            self.udf_obj.as_obj(),
+            method,
+            method_sig,
+            &[JValue::Object(&array)],
+        )?;
+        check_exception(&mut env, "invoke method")?;
+        let obj = ret.l()?;
+        string_matrix_to_vec(&mut env, obj)
+    }
+
     /// Call a method that takes a single String[][] argument and returns void.
     /// The matrix is column-major: columns[arg_index][row_index].
     pub fn call_string_matrix(
@@ -144,6 +169,39 @@ impl UdfHandle {
             let _ = jvalue_to_string(&mut env, ret)?;
         }
         Ok(())
+    }
+
+    /// Call a method that takes a single String[][] argument and returns String[][].
+    pub fn call_string_matrix_to_columns(
+        &self,
+        method: &str,
+        method_sig: &str,
+        columns: &[Vec<Option<String>>],
+    ) -> Result<Vec<Vec<Option<String>>>> {
+        if columns.is_empty() {
+            return Ok(Vec::new());
+        }
+        let row_count = columns[0].len();
+        if columns.iter().any(|col| col.len() != row_count) {
+            bail!("string matrix columns have mismatched lengths");
+        }
+
+        let jvm = get_or_create_jvm()?;
+        let mut env = jvm
+            .attach_current_thread()
+            .context("attach JVM thread")?;
+        set_context_class_loader(&mut env, self.class_loader.as_obj())?;
+
+        let matrix = new_string_matrix(&mut env, columns)?;
+        let ret = env.call_method(
+            self.udf_obj.as_obj(),
+            method,
+            method_sig,
+            &[JValue::Object(&matrix)],
+        )?;
+        check_exception(&mut env, "invoke method")?;
+        let obj = ret.l()?;
+        string_matrix_to_vec(&mut env, obj)
     }
 
     /// Force a reload of the jar(s) and rebuild the cached instance.
@@ -585,6 +643,60 @@ fn new_string_matrix<'local>(
     }
 
     Ok(JObject::from(outer))
+}
+
+fn string_matrix_to_vec(
+    env: &mut JNIEnv<'_>,
+    matrix_obj: JObject<'_>,
+) -> Result<Vec<Vec<Option<String>>>> {
+    if matrix_obj.is_null() {
+        return Ok(Vec::new());
+    }
+
+    let outer = JObjectArray::from(matrix_obj);
+    let outer_len = env.get_array_length(&outer)?;
+    let mut columns = Vec::with_capacity(outer_len as usize);
+    let mut expected_rows: Option<usize> = None;
+
+    for idx in 0..outer_len {
+        let inner_obj = env.get_object_array_element(&outer, idx)?;
+        let column = string_array_to_vec(env, inner_obj)?;
+        if let Some(rows) = expected_rows {
+            if column.len() != rows {
+                bail!(
+                    "returned column {} has {} rows but expected {}",
+                    idx,
+                    column.len(),
+                    rows
+                );
+            }
+        } else {
+            expected_rows = Some(column.len());
+        }
+        columns.push(column);
+    }
+
+    Ok(columns)
+}
+
+fn string_array_to_vec(env: &mut JNIEnv<'_>, array_obj: JObject<'_>) -> Result<Vec<Option<String>>> {
+    if array_obj.is_null() {
+        return Ok(Vec::new());
+    }
+
+    let array = JObjectArray::from(array_obj);
+    let len = env.get_array_length(&array)?;
+    let mut out = Vec::with_capacity(len as usize);
+    for idx in 0..len {
+        let elem = env.get_object_array_element(&array, idx)?;
+        if elem.is_null() {
+            out.push(None);
+            continue;
+        }
+        let s: String = env.get_string(&JString::from(elem))?.into();
+        out.push(Some(s));
+    }
+    Ok(out)
 }
 
 fn new_string_array<'local>(

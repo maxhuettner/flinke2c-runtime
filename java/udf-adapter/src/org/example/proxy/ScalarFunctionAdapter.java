@@ -5,18 +5,34 @@ import java.math.BigDecimal;
 import java.sql.Date;
 import java.sql.Time;
 import java.sql.Timestamp;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeFormatterBuilder;
+import java.time.temporal.ChronoField;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.function.Function;
-import java.util.function.Supplier;
 
 public final class ScalarFunctionAdapter {
     private interface ValueParser {
         Object parse(String value);
     }
 
+    private static final String ROW_CLASS_NAME = "org.apache.flink.types.Row";
+    private static final DateTimeFormatter TIMESTAMP_FORMATTER = new DateTimeFormatterBuilder()
+            .appendPattern("yyyy-MM-dd HH:mm:ss")
+            .optionalStart()
+            .appendFraction(ChronoField.NANO_OF_SECOND, 0, 9, true)
+            .optionalEnd()
+            .toFormatter(Locale.ROOT);
+
     private final Object udf;
     private final Method eval;
     private final ValueParser[] parsers;
+    private final Class<?> rowClass;
+    private final Method rowGetArity;
+    private final Method rowGetField;
 
     public ScalarFunctionAdapter(String udfClassName) throws Exception {
         this(udfClassName, new String[] { "DECIMAL" });
@@ -33,6 +49,10 @@ public final class ScalarFunctionAdapter {
         resolvedEval.setAccessible(true);
         this.eval = resolvedEval;
         this.parsers = buildParsers(effectiveTypes, resolvedEval.getParameterTypes());
+
+        this.rowClass = loadRowClass();
+        this.rowGetArity = resolveRowMethod(rowClass, "getArity");
+        this.rowGetField = resolveRowMethod(rowClass, "getField", int.class);
     }
 
     public void evalBatch(String[] values) throws Exception {
@@ -44,20 +64,8 @@ public final class ScalarFunctionAdapter {
             return;
         }
 
+        int rowCount = validateColumns(columns);
         int argCount = eval.getParameterCount();
-        if (columns.length != argCount) {
-            throw new IllegalArgumentException(
-                    "Expected " + argCount + " argument columns but got " + columns.length);
-        }
-
-        int rowCount = columns[0] == null ? 0 : columns[0].length;
-        for (int arg = 1; arg < columns.length; arg++) {
-            int len = columns[arg] == null ? 0 : columns[arg].length;
-            if (len != rowCount) {
-                throw new IllegalArgumentException("Argument columns have mismatched lengths");
-            }
-        }
-
         Object[] args = new Object[argCount];
         for (int row = 0; row < rowCount; row++) {
             for (int arg = 0; arg < argCount; arg++) {
@@ -77,6 +85,76 @@ public final class ScalarFunctionAdapter {
             return new String[0];
         }
 
+        int rowCount = validateColumns(columns);
+        int argCount = eval.getParameterCount();
+        String[] out = new String[rowCount];
+        Object[] args = new Object[argCount];
+        for (int row = 0; row < rowCount; row++) {
+            for (int arg = 0; arg < argCount; arg++) {
+                String value = columns[arg][row];
+                args[arg] = parsers[arg].parse(value);
+            }
+            Object result = eval.invoke(udf, args);
+            out[row] = result == null ? null : result.toString();
+        }
+        return out;
+    }
+
+    public String[][] evalBatchToColumns(String[] values) throws Exception {
+        return evalBatchToColumns(new String[][] { values });
+    }
+
+    public String[][] evalBatchToColumns(String[][] columns) throws Exception {
+        if (columns == null || columns.length == 0) {
+            return new String[0][0];
+        }
+
+        int rowCount = validateColumns(columns);
+        int argCount = eval.getParameterCount();
+        Object[] args = new Object[argCount];
+        List<String[]> rowResults = new ArrayList<>(rowCount);
+        int outputArity = -1;
+
+        for (int row = 0; row < rowCount; row++) {
+            for (int arg = 0; arg < argCount; arg++) {
+                String value = columns[arg][row];
+                args[arg] = parsers[arg].parse(value);
+            }
+            Object result = eval.invoke(udf, args);
+            String[] rowValues = toRowValues(result);
+            if (rowValues.length > 0) {
+                if (outputArity < 0) {
+                    outputArity = rowValues.length;
+                } else if (rowValues.length != outputArity) {
+                    throw new IllegalStateException(
+                            "Inconsistent output arity: expected " + outputArity + " but got " + rowValues.length);
+                }
+            }
+            rowResults.add(rowValues);
+        }
+
+        if (outputArity < 0) {
+            outputArity = isRowReturn() ? argCount : 1;
+        }
+
+        String[][] out = new String[outputArity][rowCount];
+        for (int row = 0; row < rowCount; row++) {
+            String[] rowValues = rowResults.get(row);
+            if (rowValues.length == 0 && outputArity > 0) {
+                continue;
+            }
+            if (rowValues.length != outputArity) {
+                throw new IllegalStateException(
+                        "Row " + row + " has arity " + rowValues.length + " but expected " + outputArity);
+            }
+            for (int col = 0; col < outputArity; col++) {
+                out[col][row] = rowValues[col];
+            }
+        }
+        return out;
+    }
+
+    private int validateColumns(String[][] columns) {
         int argCount = eval.getParameterCount();
         if (columns.length != argCount) {
             throw new IllegalArgumentException(
@@ -90,18 +168,45 @@ public final class ScalarFunctionAdapter {
                 throw new IllegalArgumentException("Argument columns have mismatched lengths");
             }
         }
+        return rowCount;
+    }
 
-        String[] out = new String[rowCount];
-        Object[] args = new Object[argCount];
-        for (int row = 0; row < rowCount; row++) {
-            for (int arg = 0; arg < argCount; arg++) {
-                String value = columns[arg][row];
-                args[arg] = parsers[arg].parse(value);
-            }
-            Object result = eval.invoke(udf, args);
-            out[row] = result == null ? null : result.toString();
+    private boolean isRowReturn() {
+        return rowClass != null && rowClass.isAssignableFrom(eval.getReturnType());
+    }
+
+    private String[] toRowValues(Object result) throws Exception {
+        if (result == null) {
+            return new String[0];
         }
-        return out;
+        if (rowClass != null && rowClass.isInstance(result)) {
+            int arity = (Integer) rowGetArity.invoke(result);
+            String[] out = new String[arity];
+            for (int i = 0; i < arity; i++) {
+                Object value = rowGetField.invoke(result, i);
+                out[i] = value == null ? null : value.toString();
+            }
+            return out;
+        }
+        return new String[] { result.toString() };
+    }
+
+    private static Class<?> loadRowClass() {
+        try {
+            return Class.forName(ROW_CLASS_NAME);
+        } catch (ClassNotFoundException ignored) {
+            return null;
+        }
+    }
+
+    private static Method resolveRowMethod(Class<?> rowClass, String name, Class<?>... params)
+            throws Exception {
+        if (rowClass == null) {
+            return null;
+        }
+        Method method = rowClass.getMethod(name, params);
+        method.setAccessible(true);
+        return method;
     }
 
     private static Method resolveEvalMethod(Class<?> udfClass, int paramCount, String[] argTypes)
@@ -183,10 +288,13 @@ public final class ScalarFunctionAdapter {
         if (isTime(paramType, baseType)) {
             return valueOrNull(Time::valueOf);
         }
+        if (isLocalDateTime(paramType)) {
+            return valueOrNull(ScalarFunctionAdapter::parseLocalDateTime);
+        }
         if (isTimestamp(paramType, baseType)) {
             return valueOrNull(Timestamp::valueOf);
         }
-        
+
         return value -> value;
     }
 
@@ -278,7 +386,17 @@ public final class ScalarFunctionAdapter {
     }
 
     private static boolean isTimestamp(Class<?> type, String baseType) {
-        return type == Timestamp.class || baseType.equals("TIMESTAMP") || baseType.equals("TIMESTAMP_LTZ")
+        return type == Timestamp.class
+                || baseType.equals("TIMESTAMP")
+                || baseType.equals("TIMESTAMP_LTZ")
                 || baseType.equals("TIMESTAMP_WITH_LOCAL_TIME_ZONE");
+    }
+
+    private static boolean isLocalDateTime(Class<?> type) {
+        return type == LocalDateTime.class;
+    }
+
+    private static LocalDateTime parseLocalDateTime(String value) {
+        return LocalDateTime.parse(value, TIMESTAMP_FORMATTER);
     }
 }

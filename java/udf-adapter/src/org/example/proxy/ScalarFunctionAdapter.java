@@ -1,11 +1,15 @@
 package org.example.proxy;
 
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.sql.Date;
 import java.sql.Time;
 import java.sql.Timestamp;
+import java.time.Instant;
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.temporal.ChronoField;
@@ -15,6 +19,24 @@ import java.util.Locale;
 import java.util.function.Function;
 
 public final class ScalarFunctionAdapter {
+    private static final int DECIMAL_BYTES = 16;
+    public static final class ColumnarResult {
+        private final Object[] columns;
+        private final boolean[][] nulls;
+
+        ColumnarResult(Object[] columns, boolean[][] nulls) {
+            this.columns = columns;
+            this.nulls = nulls;
+        }
+
+        public Object[] columns() {
+            return columns;
+        }
+
+        public boolean[][] nulls() {
+            return nulls;
+        }
+    }
     private interface ValueParser {
         Object parse(String value);
     }
@@ -28,11 +50,16 @@ public final class ScalarFunctionAdapter {
             .toFormatter(Locale.ROOT);
 
     private final Object udf;
-    private final Method eval;
+    private final Method evalMethod;
+    private final MethodHandle evalHandle;
+    private final MethodHandle evalHandleSpreader;
     private final ValueParser[] parsers;
+    private final int[] decimalScales;
+    private final int argCount;
     private final Class<?> rowClass;
-    private final Method rowGetArity;
-    private final Method rowGetField;
+    private final MethodHandle rowGetArityHandle;
+    private final MethodHandle rowGetFieldHandle;
+    private final boolean rowReturn;
 
     public ScalarFunctionAdapter(String udfClassName) throws Exception {
         this(udfClassName, new String[] { "DECIMAL" });
@@ -47,12 +74,21 @@ public final class ScalarFunctionAdapter {
 
         Method resolvedEval = resolveEvalMethod(udfClass, paramCount, effectiveTypes);
         resolvedEval.setAccessible(true);
-        this.eval = resolvedEval;
+        this.evalMethod = resolvedEval;
         this.parsers = buildParsers(effectiveTypes, resolvedEval.getParameterTypes());
+        this.decimalScales = extractDecimalScales(effectiveTypes, paramCount);
+        this.argCount = resolvedEval.getParameterCount();
+
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        this.evalHandle = lookup.unreflect(resolvedEval);
+        this.evalHandleSpreader = evalHandle.bindTo(udf).asSpreader(Object[].class, argCount);
 
         this.rowClass = loadRowClass();
-        this.rowGetArity = resolveRowMethod(rowClass, "getArity");
-        this.rowGetField = resolveRowMethod(rowClass, "getField", int.class);
+        Method rowArityMethod = resolveRowMethod(rowClass, "getArity");
+        Method rowFieldMethod = resolveRowMethod(rowClass, "getField", int.class);
+        this.rowGetArityHandle = rowArityMethod == null ? null : lookup.unreflect(rowArityMethod);
+        this.rowGetFieldHandle = rowFieldMethod == null ? null : lookup.unreflect(rowFieldMethod);
+        this.rowReturn = rowClass != null && rowClass.isAssignableFrom(resolvedEval.getReturnType());
     }
 
     public void evalBatch(String[] values) throws Exception {
@@ -65,14 +101,13 @@ public final class ScalarFunctionAdapter {
         }
 
         int rowCount = validateColumns(columns);
-        int argCount = eval.getParameterCount();
         Object[] args = new Object[argCount];
         for (int row = 0; row < rowCount; row++) {
             for (int arg = 0; arg < argCount; arg++) {
                 String value = columns[arg][row];
                 args[arg] = parsers[arg].parse(value);
             }
-            eval.invoke(udf, args);
+            invokeEval(args);
         }
     }
 
@@ -86,7 +121,6 @@ public final class ScalarFunctionAdapter {
         }
 
         int rowCount = validateColumns(columns);
-        int argCount = eval.getParameterCount();
         String[] out = new String[rowCount];
         Object[] args = new Object[argCount];
         for (int row = 0; row < rowCount; row++) {
@@ -94,7 +128,7 @@ public final class ScalarFunctionAdapter {
                 String value = columns[arg][row];
                 args[arg] = parsers[arg].parse(value);
             }
-            Object result = eval.invoke(udf, args);
+            Object result = invokeEval(args);
             out[row] = result == null ? null : result.toString();
         }
         return out;
@@ -110,52 +144,187 @@ public final class ScalarFunctionAdapter {
         }
 
         int rowCount = validateColumns(columns);
-        int argCount = eval.getParameterCount();
         Object[] args = new Object[argCount];
-        List<String[]> rowResults = new ArrayList<>(rowCount);
         int outputArity = -1;
+        String[][] out = null;
 
         for (int row = 0; row < rowCount; row++) {
             for (int arg = 0; arg < argCount; arg++) {
                 String value = columns[arg][row];
                 args[arg] = parsers[arg].parse(value);
             }
-            Object result = eval.invoke(udf, args);
-            String[] rowValues = toRowValues(result);
-            if (rowValues.length > 0) {
-                if (outputArity < 0) {
-                    outputArity = rowValues.length;
-                } else if (rowValues.length != outputArity) {
-                    throw new IllegalStateException(
-                            "Inconsistent output arity: expected " + outputArity + " but got " + rowValues.length);
+            Object result = invokeEval(args);
+            if (rowReturn) {
+                if (result == null) {
+                    continue;
                 }
+                int arity = rowArity(result);
+                if (outputArity < 0) {
+                    outputArity = arity;
+                    out = new String[outputArity][rowCount];
+                } else if (arity != outputArity) {
+                    throw new IllegalStateException(
+                            "Inconsistent output arity: expected " + outputArity + " but got " + arity);
+                }
+                for (int col = 0; col < outputArity; col++) {
+                    Object value = rowField(result, col);
+                    out[col][row] = value == null ? null : value.toString();
+                }
+            } else {
+                if (outputArity < 0) {
+                    outputArity = 1;
+                    out = new String[1][rowCount];
+                }
+                out[0][row] = result == null ? null : result.toString();
             }
-            rowResults.add(rowValues);
         }
 
-        if (outputArity < 0) {
-            outputArity = isRowReturn() ? argCount : 1;
-        }
-
-        String[][] out = new String[outputArity][rowCount];
-        for (int row = 0; row < rowCount; row++) {
-            String[] rowValues = rowResults.get(row);
-            if (rowValues.length == 0 && outputArity > 0) {
-                continue;
-            }
-            if (rowValues.length != outputArity) {
-                throw new IllegalStateException(
-                        "Row " + row + " has arity " + rowValues.length + " but expected " + outputArity);
-            }
-            for (int col = 0; col < outputArity; col++) {
-                out[col][row] = rowValues[col];
-            }
+        if (out == null) {
+            outputArity = rowReturn ? argCount : 1;
+            out = new String[outputArity][rowCount];
         }
         return out;
     }
 
+    public String[][] evalBatchToColumnsTyped(Object[] columns, boolean[][] nulls) throws Exception {
+        if (columns == null || columns.length == 0) {
+            return new String[0][0];
+        }
+
+        int rowCount = validateTypedColumns(columns, nulls);
+        ColumnReader[] readers = buildReaders(columns, nulls);
+        Object[] args = new Object[argCount];
+        int outputArity = -1;
+        String[][] out = null;
+
+        for (int row = 0; row < rowCount; row++) {
+            for (int arg = 0; arg < argCount; arg++) {
+                args[arg] = readers[arg].get(row);
+            }
+            Object result = invokeEval(args);
+            if (rowReturn) {
+                if (result == null) {
+                    continue;
+                }
+                int arity = rowArity(result);
+                if (outputArity < 0) {
+                    outputArity = arity;
+                    out = new String[outputArity][rowCount];
+                } else if (arity != outputArity) {
+                    throw new IllegalStateException(
+                            "Inconsistent output arity: expected " + outputArity + " but got " + arity);
+                }
+                for (int col = 0; col < outputArity; col++) {
+                    Object value = rowField(result, col);
+                    out[col][row] = value == null ? null : value.toString();
+                }
+            } else {
+                if (outputArity < 0) {
+                    outputArity = 1;
+                    out = new String[1][rowCount];
+                }
+                out[0][row] = result == null ? null : result.toString();
+            }
+        }
+
+        if (out == null) {
+            outputArity = rowReturn ? argCount : 1;
+            out = new String[outputArity][rowCount];
+        }
+        return out;
+    }
+
+    public ColumnarResult evalBatchToColumnsTypedOut(Object[] columns, boolean[][] nulls)
+            throws Exception {
+        if (columns == null || columns.length == 0) {
+            return new ColumnarResult(new Object[0], new boolean[0][0]);
+        }
+
+        int rowCount = validateTypedColumns(columns, nulls);
+        ColumnReader[] readers = buildReaders(columns, nulls);
+        Object[] args = new Object[argCount];
+        int outputArity = -1;
+        Object[] out = null;
+        boolean[][] outNulls = null;
+        List<Integer> pendingNullRows = new ArrayList<>();
+
+        for (int row = 0; row < rowCount; row++) {
+            for (int arg = 0; arg < argCount; arg++) {
+                args[arg] = readers[arg].get(row);
+            }
+            Object result = invokeEval(args);
+            if (rowReturn) {
+                if (result == null) {
+                    if (outputArity > 0) {
+                        for (int col = 0; col < outputArity; col++) {
+                            outNulls[col][row] = true;
+                        }
+                    } else {
+                        pendingNullRows.add(row);
+                    }
+                    continue;
+                }
+                int arity = rowArity(result);
+                if (outputArity < 0) {
+                    outputArity = arity;
+                    out = new Object[outputArity];
+                    outNulls = new boolean[outputArity][rowCount];
+                    for (int pendingRow : pendingNullRows) {
+                        for (int col = 0; col < outputArity; col++) {
+                            outNulls[col][pendingRow] = true;
+                        }
+                    }
+                    pendingNullRows.clear();
+                } else if (arity != outputArity) {
+                    throw new IllegalStateException(
+                            "Inconsistent output arity: expected " + outputArity + " but got " + arity);
+                }
+                for (int col = 0; col < outputArity; col++) {
+                    Object value = rowField(result, col);
+                    if (value == null) {
+                        outNulls[col][row] = true;
+                        continue;
+                    }
+                    out[col] = ensureOutputArray(out[col], value, rowCount);
+                    writeOutputValue(out[col], value, row);
+                }
+            } else {
+                if (outputArity < 0) {
+                    outputArity = 1;
+                    out = new Object[1];
+                    outNulls = new boolean[1][rowCount];
+                }
+                if (result == null) {
+                    outNulls[0][row] = true;
+                    continue;
+                }
+                out[0] = ensureOutputArray(out[0], result, rowCount);
+                writeOutputValue(out[0], result, row);
+            }
+        }
+
+        if (out == null) {
+            outputArity = rowReturn ? argCount : 1;
+            out = new Object[outputArity];
+            outNulls = new boolean[outputArity][rowCount];
+            for (int row = 0; row < rowCount; row++) {
+                for (int col = 0; col < outputArity; col++) {
+                    outNulls[col][row] = true;
+                }
+            }
+        }
+
+        for (int col = 0; col < out.length; col++) {
+            if (out[col] == null) {
+                out[col] = new String[rowCount];
+            }
+        }
+
+        return new ColumnarResult(out, outNulls);
+    }
+
     private int validateColumns(String[][] columns) {
-        int argCount = eval.getParameterCount();
+        int argCount = this.argCount;
         if (columns.length != argCount) {
             throw new IllegalArgumentException(
                     "Expected " + argCount + " argument columns but got " + columns.length);
@@ -171,24 +340,372 @@ public final class ScalarFunctionAdapter {
         return rowCount;
     }
 
-    private boolean isRowReturn() {
-        return rowClass != null && rowClass.isAssignableFrom(eval.getReturnType());
+    private interface ColumnReader {
+        Object get(int row) throws Exception;
     }
 
-    private String[] toRowValues(Object result) throws Exception {
-        if (result == null) {
-            return new String[0];
+    private ColumnReader[] buildReaders(Object[] columns, boolean[][] nulls) {
+        ColumnReader[] readers = new ColumnReader[argCount];
+        Class<?>[] paramTypes = evalMethod.getParameterTypes();
+        for (int i = 0; i < argCount; i++) {
+            Object column = columns[i];
+            boolean[] isNull = nulls != null && i < nulls.length ? nulls[i] : null;
+            readers[i] = readerFor(column, isNull, paramTypes[i], parsers[i], decimalScales[i]);
         }
-        if (rowClass != null && rowClass.isInstance(result)) {
-            int arity = (Integer) rowGetArity.invoke(result);
-            String[] out = new String[arity];
-            for (int i = 0; i < arity; i++) {
-                Object value = rowGetField.invoke(result, i);
-                out[i] = value == null ? null : value.toString();
+        return readers;
+    }
+
+    private ColumnReader readerFor(
+            Object column,
+            boolean[] nulls,
+            Class<?> paramType,
+            ValueParser parser,
+            int decimalScale) {
+        if (column instanceof byte[]) {
+            byte[] values = (byte[]) column;
+            return row -> {
+                if (isNull(nulls, row)) {
+                    return defaultValue(paramType);
+                }
+                BigDecimal decimal = decimalFromBytes(values, row, decimalScale);
+                if (paramType == BigDecimal.class) {
+                    return decimal;
+                }
+                if (paramType == String.class) {
+                    return decimal.toString();
+                }
+                return decimal;
+            };
+        }
+        if (column instanceof long[]) {
+            long[] values = (long[]) column;
+            return row -> {
+                if (isNull(nulls, row)) {
+                    return defaultValue(paramType);
+                }
+                long value = values[row];
+                if (paramType == Timestamp.class) {
+                    return new Timestamp(value);
+                }
+                if (paramType == LocalDateTime.class) {
+                    return LocalDateTime.ofInstant(Instant.ofEpochMilli(value), ZoneOffset.UTC);
+                }
+                if (paramType == Date.class) {
+                    return new Date(value);
+                }
+                if (paramType == Time.class) {
+                    return new Time(value);
+                }
+                if (paramType == Integer.class || paramType == int.class) {
+                    return (int) value;
+                }
+                return value;
+            };
+        }
+        if (column instanceof int[]) {
+            int[] values = (int[]) column;
+            return row -> {
+                if (isNull(nulls, row)) {
+                    return defaultValue(paramType);
+                }
+                int value = values[row];
+                if (paramType == Long.class || paramType == long.class) {
+                    return (long) value;
+                }
+                return value;
+            };
+        }
+        if (column instanceof double[]) {
+            double[] values = (double[]) column;
+            return row -> {
+                if (isNull(nulls, row)) {
+                    return defaultValue(paramType);
+                }
+                double value = values[row];
+                if (paramType == Float.class || paramType == float.class) {
+                    return (float) value;
+                }
+                return value;
+            };
+        }
+        if (column instanceof float[]) {
+            float[] values = (float[]) column;
+            return row -> {
+                if (isNull(nulls, row)) {
+                    return defaultValue(paramType);
+                }
+                float value = values[row];
+                if (paramType == Double.class || paramType == double.class) {
+                    return (double) value;
+                }
+                return value;
+            };
+        }
+        if (column instanceof boolean[]) {
+            boolean[] values = (boolean[]) column;
+            return row -> {
+                if (isNull(nulls, row)) {
+                    return defaultValue(paramType);
+                }
+                return values[row];
+            };
+        }
+        if (column instanceof String[]) {
+            String[] values = (String[]) column;
+            return row -> {
+                String value = values[row];
+                if (value == null || isNull(nulls, row)) {
+                    return defaultValue(paramType);
+                }
+                return parser.parse(value);
+            };
+        }
+
+        throw new IllegalArgumentException("Unsupported column type: " + column.getClass());
+    }
+
+    private int validateTypedColumns(Object[] columns, boolean[][] nulls) {
+        int argCount = this.argCount;
+        if (columns.length != argCount) {
+            throw new IllegalArgumentException(
+                    "Expected " + argCount + " argument columns but got " + columns.length);
+        }
+
+        int rowCount = columnLength(columns[0]);
+        for (int arg = 1; arg < columns.length; arg++) {
+            int len = columnLength(columns[arg]);
+            if (len != rowCount) {
+                throw new IllegalArgumentException("Argument columns have mismatched lengths");
             }
-            return out;
         }
-        return new String[] { result.toString() };
+        if (nulls != null && nulls.length != argCount) {
+            throw new IllegalArgumentException("Null bitmap column count mismatch");
+        }
+        if (nulls != null) {
+            for (int arg = 0; arg < nulls.length; arg++) {
+                boolean[] colNulls = nulls[arg];
+                if (colNulls != null && colNulls.length != rowCount) {
+                    throw new IllegalArgumentException("Null bitmap length mismatch");
+                }
+            }
+        }
+        return rowCount;
+    }
+
+    private static int columnLength(Object column) {
+        if (column instanceof long[]) {
+            return ((long[]) column).length;
+        }
+        if (column instanceof int[]) {
+            return ((int[]) column).length;
+        }
+        if (column instanceof double[]) {
+            return ((double[]) column).length;
+        }
+        if (column instanceof float[]) {
+            return ((float[]) column).length;
+        }
+        if (column instanceof boolean[]) {
+            return ((boolean[]) column).length;
+        }
+        if (column instanceof byte[]) {
+            int len = ((byte[]) column).length;
+            if (len % DECIMAL_BYTES != 0) {
+                throw new IllegalArgumentException("Decimal byte column has invalid length " + len);
+            }
+            return len / DECIMAL_BYTES;
+        }
+        if (column instanceof String[]) {
+            return ((String[]) column).length;
+        }
+        throw new IllegalArgumentException("Unsupported column type: " + column.getClass());
+    }
+
+    private static boolean isNull(boolean[] nulls, int row) {
+        return nulls != null && row < nulls.length && nulls[row];
+    }
+
+    private static Object defaultValue(Class<?> paramType) {
+        if (paramType == boolean.class) {
+            return false;
+        }
+        if (paramType == byte.class) {
+            return (byte) 0;
+        }
+        if (paramType == short.class) {
+            return (short) 0;
+        }
+        if (paramType == int.class) {
+            return 0;
+        }
+        if (paramType == long.class) {
+            return 0L;
+        }
+        if (paramType == float.class) {
+            return 0.0f;
+        }
+        if (paramType == double.class) {
+            return 0.0d;
+        }
+        return null;
+    }
+
+    private static Object ensureOutputArray(Object current, Object value, int rowCount) {
+        if (current != null) {
+            return current;
+        }
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Boolean) {
+            return new boolean[rowCount];
+        }
+        if (value instanceof Float || value instanceof Double) {
+            return new double[rowCount];
+        }
+        if (value instanceof BigDecimal) {
+            return new byte[rowCount * DECIMAL_BYTES];
+        }
+        if (value instanceof String) {
+            return new String[rowCount];
+        }
+        if (value instanceof Timestamp
+                || value instanceof LocalDateTime
+                || value instanceof Date
+                || value instanceof Time) {
+            return new long[rowCount];
+        }
+        if (value instanceof Number) {
+            return new long[rowCount];
+        }
+        return new String[rowCount];
+    }
+
+    private static void writeOutputValue(Object array, Object value, int row) {
+        if (array instanceof byte[]) {
+            writeDecimalBytes((byte[]) array, row, (BigDecimal) value);
+            return;
+        }
+        if (array instanceof long[]) {
+            ((long[]) array)[row] = toEpochMillis(value);
+            return;
+        }
+        if (array instanceof double[]) {
+            ((double[]) array)[row] = toDouble(value);
+            return;
+        }
+        if (array instanceof boolean[]) {
+            ((boolean[]) array)[row] = (Boolean) value;
+            return;
+        }
+        if (array instanceof String[]) {
+            ((String[]) array)[row] = value == null ? null : value.toString();
+        }
+    }
+
+    private static void writeDecimalBytes(byte[] target, int row, BigDecimal value) {
+        byte[] unscaled = value.unscaledValue().toByteArray();
+        if (unscaled.length > DECIMAL_BYTES) {
+            throw new IllegalArgumentException(
+                    "Decimal value does not fit into 128 bits: " + value);
+        }
+        int offset = row * DECIMAL_BYTES;
+        byte pad = (byte) (value.signum() < 0 ? 0xFF : 0x00);
+        for (int i = 0; i < DECIMAL_BYTES; i++) {
+            target[offset + i] = pad;
+        }
+        int copyStart = Math.max(0, unscaled.length - DECIMAL_BYTES);
+        int copyLen = Math.min(unscaled.length, DECIMAL_BYTES);
+        System.arraycopy(
+                unscaled,
+                copyStart,
+                target,
+                offset + (DECIMAL_BYTES - copyLen),
+                copyLen);
+    }
+
+    private static long toEpochMillis(Object value) {
+        if (value == null) {
+            return 0L;
+        }
+        if (value instanceof Timestamp) {
+            return ((Timestamp) value).getTime();
+        }
+        if (value instanceof Date) {
+            return ((Date) value).getTime();
+        }
+        if (value instanceof Time) {
+            return ((Time) value).getTime();
+        }
+        if (value instanceof LocalDateTime) {
+            return ((LocalDateTime) value)
+                    .atZone(ZoneOffset.UTC)
+                    .toInstant()
+                    .toEpochMilli();
+        }
+        if (value instanceof Number) {
+            return ((Number) value).longValue();
+        }
+        throw new IllegalArgumentException("Unsupported value for long output: " + value.getClass());
+    }
+
+    private static double toDouble(Object value) {
+        if (value == null) {
+            return 0.0d;
+        }
+        if (value instanceof Number) {
+            return ((Number) value).doubleValue();
+        }
+        throw new IllegalArgumentException("Unsupported value for double output: " + value.getClass());
+    }
+
+    private static BigDecimal decimalFromBytes(byte[] values, int row, int scale) {
+        int offset = row * DECIMAL_BYTES;
+        if (offset + DECIMAL_BYTES > values.length) {
+            throw new IllegalArgumentException("Decimal byte array index out of range");
+        }
+        byte[] slice = new byte[DECIMAL_BYTES];
+        System.arraycopy(values, offset, slice, 0, DECIMAL_BYTES);
+        return new BigDecimal(new java.math.BigInteger(slice), scale);
+    }
+
+    private Object invokeEval(Object[] args) throws Exception {
+        try {
+            return evalHandleSpreader.invoke(args);
+        } catch (Throwable t) {
+            if (t instanceof Exception) {
+                throw (Exception) t;
+            }
+            throw new Exception("Failed to invoke eval method", t);
+        }
+    }
+
+    private int rowArity(Object row) throws Exception {
+        if (rowGetArityHandle == null) {
+            return 0;
+        }
+        try {
+            return (int) rowGetArityHandle.invoke(row);
+        } catch (Throwable t) {
+            if (t instanceof Exception) {
+                throw (Exception) t;
+            }
+            throw new Exception("Failed to read Row arity", t);
+        }
+    }
+
+    private Object rowField(Object row, int index) throws Exception {
+        if (rowGetFieldHandle == null) {
+            return null;
+        }
+        try {
+            return rowGetFieldHandle.invoke(row, index);
+        } catch (Throwable t) {
+            if (t instanceof Exception) {
+                throw (Exception) t;
+            }
+            throw new Exception("Failed to read Row field", t);
+        }
     }
 
     private static Class<?> loadRowClass() {
@@ -330,6 +847,40 @@ public final class ScalarFunctionAdapter {
                 return Timestamp.class;
             default:
                 return String.class;
+        }
+    }
+
+    private static int[] extractDecimalScales(String[] argTypes, int paramCount) {
+        int[] out = new int[paramCount];
+        for (int i = 0; i < paramCount; i++) {
+            String configType = (argTypes != null && i < argTypes.length) ? argTypes[i] : null;
+            out[i] = extractScale(configType);
+        }
+        return out;
+    }
+
+    private static int extractScale(String configType) {
+        if (configType == null) {
+            return 0;
+        }
+        String trimmed = configType.trim();
+        int paren = trimmed.indexOf('(');
+        if (paren < 0) {
+            return 0;
+        }
+        int comma = trimmed.indexOf(',', paren + 1);
+        if (comma < 0) {
+            return 0;
+        }
+        int end = trimmed.indexOf(')', comma + 1);
+        if (end < 0) {
+            end = trimmed.length();
+        }
+        String scaleStr = trimmed.substring(comma + 1, end).trim();
+        try {
+            return Integer.parseInt(scaleStr);
+        } catch (NumberFormatException ignored) {
+            return 0;
         }
     }
 

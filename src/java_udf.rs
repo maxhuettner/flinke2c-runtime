@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use jni::objects::{GlobalRef, JClass, JObject, JObjectArray, JString, JValue, JValueOwned};
+use jni::sys::{jboolean, jbyte};
 use jni::{InitArgsBuilder, JNIVersion, JNIEnv, JavaVM};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,6 +23,31 @@ pub enum JavaArg {
     Float(f32),
     Double(f64),
     Char(u16),
+}
+
+#[derive(Debug)]
+pub enum InputColumn {
+    String(Vec<Option<String>>),
+    I64 { values: Vec<i64>, is_null: Option<Vec<bool>> },
+    I32 { values: Vec<i32>, is_null: Option<Vec<bool>> },
+    F64 { values: Vec<f64>, is_null: Option<Vec<bool>> },
+    F32 { values: Vec<f32>, is_null: Option<Vec<bool>> },
+    Bool { values: Vec<bool>, is_null: Option<Vec<bool>> },
+    Decimal128 { values: Vec<i128>, is_null: Option<Vec<bool>> },
+}
+
+impl InputColumn {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::String(values) => values.len(),
+            Self::I64 { values, .. } => values.len(),
+            Self::I32 { values, .. } => values.len(),
+            Self::F64 { values, .. } => values.len(),
+            Self::F32 { values, .. } => values.len(),
+            Self::Bool { values, .. } => values.len(),
+            Self::Decimal128 { values, .. } => values.len(),
+        }
+    }
 }
 
 pub struct UdfHandle {
@@ -202,6 +228,95 @@ impl UdfHandle {
         check_exception(&mut env, "invoke method")?;
         let obj = ret.l()?;
         string_matrix_to_vec(&mut env, obj)
+    }
+
+    /// Call a method that takes Object[] columns + boolean[][] nulls and returns String[][].
+    pub fn call_typed_columns_to_columns(
+        &self,
+        method: &str,
+        columns: &[InputColumn],
+    ) -> Result<Vec<Vec<Option<String>>>> {
+        if columns.is_empty() {
+            return Ok(Vec::new());
+        }
+        let row_count = columns[0].len();
+        if columns.iter().any(|col| col.len() != row_count) {
+            bail!("typed columns have mismatched lengths");
+        }
+
+        let jvm = get_or_create_jvm()?;
+        let mut env = jvm
+            .attach_current_thread()
+            .context("attach JVM thread")?;
+        set_context_class_loader(&mut env, self.class_loader.as_obj())?;
+
+        let (columns_obj, nulls_obj) = new_typed_columns(&mut env, columns)?;
+        let ret = env.call_method(
+            self.udf_obj.as_obj(),
+            method,
+            "([Ljava/lang/Object;[[Z)[[Ljava/lang/String;",
+            &[
+                JValue::Object(&columns_obj),
+                JValue::Object(&nulls_obj),
+            ],
+        )?;
+        check_exception(&mut env, "invoke method")?;
+        let obj = ret.l()?;
+        string_matrix_to_vec(&mut env, obj)
+    }
+
+    /// Call a method that takes Object[] columns + boolean[][] nulls and returns ColumnarResult.
+    pub fn call_typed_columns_to_typed_results(
+        &self,
+        method: &str,
+        columns: &[InputColumn],
+    ) -> Result<Vec<InputColumn>> {
+        if columns.is_empty() {
+            return Ok(Vec::new());
+        }
+        let row_count = columns[0].len();
+        if columns.iter().any(|col| col.len() != row_count) {
+            bail!("typed columns have mismatched lengths");
+        }
+
+        let jvm = get_or_create_jvm()?;
+        let mut env = jvm
+            .attach_current_thread()
+            .context("attach JVM thread")?;
+        set_context_class_loader(&mut env, self.class_loader.as_obj())?;
+
+        let (columns_obj, nulls_obj) = new_typed_columns(&mut env, columns)?;
+        let ret = env.call_method(
+            self.udf_obj.as_obj(),
+            method,
+            "([Ljava/lang/Object;[[Z)Lorg/example/proxy/ScalarFunctionAdapter$ColumnarResult;",
+            &[
+                JValue::Object(&columns_obj),
+                JValue::Object(&nulls_obj),
+            ],
+        )?;
+        check_exception(&mut env, "invoke method")?;
+        let result_obj = ret.l()?;
+        if result_obj.is_null() {
+            return Ok(Vec::new());
+        }
+
+        let columns_val =
+            env.call_method(&result_obj, "columns", "()[Ljava/lang/Object;", &[])?;
+        check_exception(&mut env, "ColumnarResult.columns")?;
+        let columns_obj = columns_val.l()?;
+        let columns_array = JObjectArray::from(columns_obj);
+
+        let nulls_val = env.call_method(&result_obj, "nulls", "()[[Z", &[])?;
+        check_exception(&mut env, "ColumnarResult.nulls")?;
+        let nulls_obj = nulls_val.l()?;
+        let nulls_array = if nulls_obj.is_null() {
+            None
+        } else {
+            Some(JObjectArray::from(nulls_obj))
+        };
+
+        typed_columns_to_vec(&mut env, columns_array, nulls_array)
     }
 
     /// Force a reload of the jar(s) and rebuild the cached instance.
@@ -679,6 +794,173 @@ fn string_matrix_to_vec(
     Ok(columns)
 }
 
+fn typed_columns_to_vec(
+    env: &mut JNIEnv<'_>,
+    columns_obj: JObjectArray<'_>,
+    nulls_obj: Option<JObjectArray<'_>>,
+) -> Result<Vec<InputColumn>> {
+    let long_array_class = env.find_class("[J")?;
+    let int_array_class = env.find_class("[I")?;
+    let double_array_class = env.find_class("[D")?;
+    let float_array_class = env.find_class("[F")?;
+    let boolean_array_class = env.find_class("[Z")?;
+    let byte_array_class = env.find_class("[B")?;
+    let string_array_class = env.find_class("[Ljava/lang/String;")?;
+
+    let col_len = env.get_array_length(&columns_obj)? as usize;
+    let nulls = nulls_matrix_to_vec(env, nulls_obj, col_len)?;
+    let mut columns = Vec::with_capacity(col_len);
+
+    for idx in 0..col_len {
+        let col_obj = env.get_object_array_element(&columns_obj, idx as i32)?;
+        if col_obj.is_null() {
+            columns.push(InputColumn::String(Vec::new()));
+            continue;
+        }
+
+        let nulls_col = nulls.get(idx).cloned().unwrap_or(None);
+
+        if env.is_instance_of(&col_obj, &long_array_class)? {
+            let values = long_array_to_vec(env, col_obj)?;
+            columns.push(InputColumn::I64 {
+                values,
+                is_null: nulls_col,
+            });
+            continue;
+        }
+        if env.is_instance_of(&col_obj, &int_array_class)? {
+            let values = int_array_to_vec(env, col_obj)?;
+            columns.push(InputColumn::I32 {
+                values,
+                is_null: nulls_col,
+            });
+            continue;
+        }
+        if env.is_instance_of(&col_obj, &double_array_class)? {
+            let values = double_array_to_vec(env, col_obj)?;
+            columns.push(InputColumn::F64 {
+                values,
+                is_null: nulls_col,
+            });
+            continue;
+        }
+        if env.is_instance_of(&col_obj, &float_array_class)? {
+            let values = float_array_to_vec(env, col_obj)?;
+            columns.push(InputColumn::F32 {
+                values,
+                is_null: nulls_col,
+            });
+            continue;
+        }
+        if env.is_instance_of(&col_obj, &boolean_array_class)? {
+            let values = boolean_array_to_vec(env, col_obj)?;
+            columns.push(InputColumn::Bool {
+                values,
+                is_null: nulls_col,
+            });
+            continue;
+        }
+        if env.is_instance_of(&col_obj, &byte_array_class)? {
+            let values = byte_array_to_i128_vec(env, col_obj)?;
+            columns.push(InputColumn::Decimal128 {
+                values,
+                is_null: nulls_col,
+            });
+            continue;
+        }
+        if env.is_instance_of(&col_obj, &string_array_class)? {
+            let values = string_array_to_vec(env, col_obj)?;
+            columns.push(InputColumn::String(values));
+            continue;
+        }
+
+        bail!("Unsupported output column type from Java");
+    }
+
+    Ok(columns)
+}
+
+fn nulls_matrix_to_vec(
+    env: &mut JNIEnv<'_>,
+    nulls_obj: Option<JObjectArray<'_>>,
+    col_len: usize,
+) -> Result<Vec<Option<Vec<bool>>>> {
+    let mut out = vec![None; col_len];
+    let Some(nulls_obj) = nulls_obj else {
+        return Ok(out);
+    };
+
+    let outer_len = env.get_array_length(&nulls_obj)? as usize;
+    for idx in 0..outer_len.min(col_len) {
+        let inner_obj = env.get_object_array_element(&nulls_obj, idx as i32)?;
+        if inner_obj.is_null() {
+            continue;
+        }
+        let values = boolean_array_to_vec(env, inner_obj)?;
+        out[idx] = Some(values);
+    }
+    Ok(out)
+}
+
+fn long_array_to_vec(env: &mut JNIEnv<'_>, obj: JObject<'_>) -> Result<Vec<i64>> {
+    let array = jni::objects::JLongArray::from(obj);
+    let len = env.get_array_length(&array)?;
+    let mut out = vec![0_i64; len as usize];
+    env.get_long_array_region(&array, 0, &mut out)?;
+    Ok(out)
+}
+
+fn int_array_to_vec(env: &mut JNIEnv<'_>, obj: JObject<'_>) -> Result<Vec<i32>> {
+    let array = jni::objects::JIntArray::from(obj);
+    let len = env.get_array_length(&array)?;
+    let mut out = vec![0_i32; len as usize];
+    env.get_int_array_region(&array, 0, &mut out)?;
+    Ok(out)
+}
+
+fn double_array_to_vec(env: &mut JNIEnv<'_>, obj: JObject<'_>) -> Result<Vec<f64>> {
+    let array = jni::objects::JDoubleArray::from(obj);
+    let len = env.get_array_length(&array)?;
+    let mut out = vec![0_f64; len as usize];
+    env.get_double_array_region(&array, 0, &mut out)?;
+    Ok(out)
+}
+
+fn float_array_to_vec(env: &mut JNIEnv<'_>, obj: JObject<'_>) -> Result<Vec<f32>> {
+    let array = jni::objects::JFloatArray::from(obj);
+    let len = env.get_array_length(&array)?;
+    let mut out = vec![0_f32; len as usize];
+    env.get_float_array_region(&array, 0, &mut out)?;
+    Ok(out)
+}
+
+fn boolean_array_to_vec(env: &mut JNIEnv<'_>, obj: JObject<'_>) -> Result<Vec<bool>> {
+    let array = jni::objects::JBooleanArray::from(obj);
+    let len = env.get_array_length(&array)?;
+    let mut raw = vec![0_u8; len as usize];
+    env.get_boolean_array_region(&array, 0, &mut raw)?;
+    Ok(raw.iter().map(|v| *v != 0).collect())
+}
+
+fn byte_array_to_i128_vec(env: &mut JNIEnv<'_>, obj: JObject<'_>) -> Result<Vec<i128>> {
+    let array = jni::objects::JByteArray::from(obj);
+    let len = env.get_array_length(&array)? as usize;
+    if len % 16 != 0 {
+        bail!("decimal byte array length {} is not divisible by 16", len);
+    }
+    let mut raw = vec![0_i8; len];
+    env.get_byte_array_region(&array, 0, &mut raw)?;
+    let mut out = Vec::with_capacity(len / 16);
+    for chunk in raw.chunks_exact(16) {
+        let mut bytes = [0_u8; 16];
+        for (idx, b) in chunk.iter().enumerate() {
+            bytes[idx] = *b as u8;
+        }
+        out.push(i128::from_be_bytes(bytes));
+    }
+    Ok(out)
+}
+
 fn string_array_to_vec(env: &mut JNIEnv<'_>, array_obj: JObject<'_>) -> Result<Vec<Option<String>>> {
     if array_obj.is_null() {
         return Ok(Vec::new());
@@ -714,6 +996,101 @@ fn new_string_array<'local>(
     }
 
     Ok(JObject::from(array))
+}
+
+fn new_typed_columns<'local>(
+    env: &mut JNIEnv<'local>,
+    columns: &[InputColumn],
+) -> Result<(JObjectArray<'local>, JObjectArray<'local>)> {
+    let object_class = env.find_class("java/lang/Object")?;
+    let boolean_array_class = env.find_class("[Z")?;
+    let col_array =
+        env.new_object_array(columns.len() as i32, object_class, JObject::null())?;
+    let nulls_array =
+        env.new_object_array(columns.len() as i32, boolean_array_class, JObject::null())?;
+
+    for (idx, column) in columns.iter().enumerate() {
+        let (col_obj, nulls_obj) = input_column_to_java(env, column)?;
+        env.set_object_array_element(&col_array, idx as i32, col_obj)?;
+        if let Some(nulls_obj) = nulls_obj {
+            env.set_object_array_element(&nulls_array, idx as i32, nulls_obj)?;
+        }
+    }
+
+    Ok((col_array, nulls_array))
+}
+
+fn input_column_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    column: &InputColumn,
+) -> Result<(JObject<'local>, Option<JObject<'local>>)> {
+    match column {
+        InputColumn::String(values) => {
+            let array = new_string_array(env, values)?;
+            Ok((JObject::from(array), None))
+        }
+        InputColumn::I64 { values, is_null } => {
+            let array = env.new_long_array(values.len() as i32)?;
+            env.set_long_array_region(&array, 0, values)?;
+            let nulls = build_nulls_array(env, is_null.as_deref())?;
+            Ok((JObject::from(array), nulls))
+        }
+        InputColumn::I32 { values, is_null } => {
+            let array = env.new_int_array(values.len() as i32)?;
+            env.set_int_array_region(&array, 0, values)?;
+            let nulls = build_nulls_array(env, is_null.as_deref())?;
+            Ok((JObject::from(array), nulls))
+        }
+        InputColumn::F64 { values, is_null } => {
+            let array = env.new_double_array(values.len() as i32)?;
+            env.set_double_array_region(&array, 0, values)?;
+            let nulls = build_nulls_array(env, is_null.as_deref())?;
+            Ok((JObject::from(array), nulls))
+        }
+        InputColumn::F32 { values, is_null } => {
+            let array = env.new_float_array(values.len() as i32)?;
+            env.set_float_array_region(&array, 0, values)?;
+            let nulls = build_nulls_array(env, is_null.as_deref())?;
+            Ok((JObject::from(array), nulls))
+        }
+        InputColumn::Bool { values, is_null } => {
+            let array = env.new_boolean_array(values.len() as i32)?;
+            let raw: Vec<jboolean> = values
+                .iter()
+                .map(|v| if *v { 1_u8 } else { 0_u8 })
+                .collect();
+            env.set_boolean_array_region(&array, 0, &raw)?;
+            let nulls = build_nulls_array(env, is_null.as_deref())?;
+            Ok((JObject::from(array), nulls))
+        }
+        InputColumn::Decimal128 { values, is_null } => {
+            let mut raw: Vec<jbyte> = Vec::with_capacity(values.len() * 16);
+            for value in values {
+                let bytes = value.to_be_bytes();
+                raw.extend(bytes.iter().map(|b| *b as i8));
+            }
+            let array = env.new_byte_array(raw.len() as i32)?;
+            env.set_byte_array_region(&array, 0, &raw)?;
+            let nulls = build_nulls_array(env, is_null.as_deref())?;
+            Ok((JObject::from(array), nulls))
+        }
+    }
+}
+
+fn build_nulls_array<'local>(
+    env: &mut JNIEnv<'local>,
+    nulls: Option<&[bool]>,
+) -> Result<Option<JObject<'local>>> {
+    let Some(nulls) = nulls else {
+        return Ok(None);
+    };
+    let array = env.new_boolean_array(nulls.len() as i32)?;
+    let raw: Vec<jboolean> = nulls
+        .iter()
+        .map(|v| if *v { 1_u8 } else { 0_u8 })
+        .collect();
+    env.set_boolean_array_region(&array, 0, &raw)?;
+    Ok(Some(JObject::from(array)))
 }
 
 fn jvalue_to_string(env: &mut JNIEnv<'_>, value: JValueOwned<'_>) -> Result<Option<String>> {

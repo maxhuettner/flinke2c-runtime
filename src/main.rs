@@ -1,8 +1,9 @@
 use anyhow::{bail, Context, Result};
 use arrow_array::array::{
-    Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    LargeStringArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int16Array,
+    Int32Array, Int64Array, Int8Array, LargeStringArray, StringArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt32Array,
+    UInt64Array,
 };
 use arrow_array::builder::{
     Decimal128Builder, Float32Builder, Float64Builder, Int32Builder, Int64Builder,
@@ -19,7 +20,7 @@ use std::io::{BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
-use crate::java_udf::{JavaArg, UdfHandle};
+use crate::java_udf::{InputColumn, JavaArg, UdfHandle};
 
 mod java_udf;
 
@@ -286,7 +287,6 @@ fn run_session(
             result_names.as_deref(),
             udf_handle,
             &args.udf_method,
-            &args.udf_sig,
             args.debug_sample_rows,
             &mut debug_batches_remaining,
         )?;
@@ -372,17 +372,26 @@ fn apply_udf_to_batch(
     result_names: Option<&[&str]>,
     udf: &UdfHandle,
     method: &str,
-    method_sig: &str,
     debug_sample_rows: usize,
     debug_batches_remaining: &mut usize,
 ) -> Result<arrow_array::RecordBatch> {
     let row_count = batch.num_rows();
-    let mut arg_columns = Vec::with_capacity(arg_indices.len());
+    let mut input_columns = Vec::with_capacity(arg_indices.len());
+    let mut debug_arg_columns: Option<Vec<Vec<Option<String>>>> =
+        if debug_sample_rows > 0 && *debug_batches_remaining > 0 {
+            Some(Vec::with_capacity(arg_indices.len()))
+        } else {
+            None
+        };
     for &idx in arg_indices {
-        arg_columns.push(column_to_strings(batch.column(idx))?);
+        let array = batch.column(idx);
+        input_columns.push(column_to_input(array)?);
+        if let Some(debug_cols) = debug_arg_columns.as_mut() {
+            debug_cols.push(column_to_strings(array)?);
+        }
     }
 
-    let output_columns = call_udf_to_columns(udf, method, method_sig, &arg_columns)?;
+    let output_columns = call_udf_to_columns(udf, method, &input_columns)?;
     let output_targets = resolve_output_targets(
         batch,
         arg_indices,
@@ -392,16 +401,30 @@ fn apply_udf_to_batch(
         output_columns.len(),
     )?;
 
-    maybe_print_debug_sample(
-        schema,
-        arg_names,
-        &arg_columns,
-        &output_targets,
-        &output_columns,
-        row_count,
-        debug_sample_rows,
-        debug_batches_remaining,
-    );
+    if let Some(debug_args) = debug_arg_columns.as_ref() {
+        let mut debug_outputs = Vec::with_capacity(output_targets.len());
+        for target in &output_targets {
+            if target.source_idx >= output_columns.len() {
+                debug_outputs.push(Vec::new());
+                continue;
+            }
+            let field = schema.field(target.target_idx);
+            debug_outputs.push(output_column_to_debug_strings(
+                &output_columns[target.source_idx],
+                field.data_type(),
+            )?);
+        }
+        maybe_print_debug_sample(
+            schema,
+            arg_names,
+            debug_args,
+            &output_targets,
+            &debug_outputs,
+            row_count,
+            debug_sample_rows,
+            debug_batches_remaining,
+        );
+    }
 
     let new_columns = build_output_columns(batch, schema, &output_targets, &output_columns)?;
     arrow_array::RecordBatch::try_new(batch.schema(), new_columns)
@@ -411,27 +434,15 @@ fn apply_udf_to_batch(
 fn call_udf_to_columns(
     udf: &UdfHandle,
     method: &str,
-    method_sig: &str,
-    arg_columns: &[Vec<Option<String>>],
-) -> Result<Vec<Vec<Option<String>>>> {
-    let columns_method = if method.ends_with("ToColumns") {
+    input_columns: &[InputColumn],
+) -> Result<Vec<InputColumn>> {
+    let columns_method = if method.ends_with("ToColumnsTypedOut") {
         method.to_string()
     } else {
-        format!("{method}ToColumns")
+        format!("{method}ToColumnsTypedOut")
     };
-    let columns_sig = to_string_matrix_signature(method_sig)?;
 
-    if method_sig.contains("[[Ljava/lang/String;") {
-        return udf.call_string_matrix_to_columns(&columns_method, &columns_sig, arg_columns);
-    }
-    if arg_columns.len() != 1 {
-        bail!(
-            "UDF method signature {} expects 1 argument but config resolved {}",
-            method_sig,
-            arg_columns.len()
-        );
-    }
-    udf.call_string_array_to_columns(&columns_method, &columns_sig, &arg_columns[0])
+    udf.call_typed_columns_to_typed_results(&columns_method, input_columns)
 }
 
 fn resolve_output_targets(
@@ -535,7 +546,7 @@ fn build_output_columns(
     batch: &arrow_array::RecordBatch,
     schema: &arrow_schema::Schema,
     output_targets: &[OutputTarget],
-    output_columns: &[Vec<Option<String>>],
+    output_columns: &[InputColumn],
 ) -> Result<Vec<ArrayRef>> {
     let row_count = batch.num_rows();
     let mut new_columns: Vec<ArrayRef> = batch.columns().to_vec();
@@ -548,17 +559,17 @@ fn build_output_columns(
                 output_columns.len()
             );
         }
-        let values = &output_columns[target.source_idx];
-        if values.len() != row_count {
+        let field = schema.field(target.target_idx);
+        let column = &output_columns[target.source_idx];
+        if column.len() != row_count {
             bail!(
                 "output column {} has {} rows but batch has {}",
                 target.source_idx,
-                values.len(),
+                column.len(),
                 row_count
             );
         }
-        let field = schema.field(target.target_idx);
-        let array = strings_to_array(values, field.data_type())
+        let array = output_column_to_array(column, field.data_type())
             .with_context(|| format!("convert output for field {}", field.name()))?;
         new_columns[target.target_idx] = array;
     }
@@ -621,6 +632,797 @@ fn maybe_print_debug_sample(
     }
 
     *debug_batches_remaining = debug_batches_remaining.saturating_sub(1);
+}
+
+fn column_to_input(array: &ArrayRef) -> Result<InputColumn> {
+    match array.data_type() {
+        DataType::Int64 => column_to_i64(array),
+        DataType::Int32 => column_to_i32(array),
+        DataType::Int16 => column_to_i32(array),
+        DataType::Int8 => column_to_i32(array),
+        DataType::Float64 => column_to_f64(array),
+        DataType::Float32 => column_to_f32(array),
+        DataType::Boolean => column_to_bool(array),
+        DataType::Timestamp(unit, _) => column_to_timestamp_millis(array, unit),
+        DataType::Decimal128(_, _) => column_to_decimal128(array),
+        DataType::Utf8 | DataType::LargeUtf8 => Ok(InputColumn::String(column_to_strings(array)?)),
+        _ => Ok(InputColumn::String(column_to_strings(array)?)),
+    }
+}
+
+fn column_to_i64(array: &ArrayRef) -> Result<InputColumn> {
+    let arr = array
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .context("downcast Int64")?;
+    let len = arr.len();
+    let mut values = Vec::with_capacity(len);
+    let mut nulls = if arr.null_count() > 0 {
+        Some(Vec::with_capacity(len))
+    } else {
+        None
+    };
+    for i in 0..len {
+        if arr.is_null(i) {
+            values.push(0);
+            if let Some(nulls) = nulls.as_mut() {
+                nulls.push(true);
+            }
+        } else {
+            values.push(arr.value(i));
+            if let Some(nulls) = nulls.as_mut() {
+                nulls.push(false);
+            }
+        }
+    }
+    Ok(InputColumn::I64 {
+        values,
+        is_null: nulls,
+    })
+}
+
+fn column_to_i32(array: &ArrayRef) -> Result<InputColumn> {
+    let len = array.len();
+    let mut values = Vec::with_capacity(len);
+    let mut nulls = if array.null_count() > 0 {
+        Some(Vec::with_capacity(len))
+    } else {
+        None
+    };
+
+    match array.data_type() {
+        DataType::Int32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .context("downcast Int32")?;
+            for i in 0..len {
+                if arr.is_null(i) {
+                    values.push(0);
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(true);
+                    }
+                } else {
+                    values.push(arr.value(i));
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(false);
+                    }
+                }
+            }
+        }
+        DataType::Int16 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .context("downcast Int16")?;
+            for i in 0..len {
+                if arr.is_null(i) {
+                    values.push(0);
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(true);
+                    }
+                } else {
+                    values.push(arr.value(i) as i32);
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(false);
+                    }
+                }
+            }
+        }
+        DataType::Int8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .context("downcast Int8")?;
+            for i in 0..len {
+                if arr.is_null(i) {
+                    values.push(0);
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(true);
+                    }
+                } else {
+                    values.push(arr.value(i) as i32);
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(false);
+                    }
+                }
+            }
+        }
+        _ => {
+            bail!("column_to_i32 called with unsupported type {}", array.data_type());
+        }
+    }
+
+    Ok(InputColumn::I32 {
+        values,
+        is_null: nulls,
+    })
+}
+
+fn column_to_f64(array: &ArrayRef) -> Result<InputColumn> {
+    let arr = array
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .context("downcast Float64")?;
+    let len = arr.len();
+    let mut values = Vec::with_capacity(len);
+    let mut nulls = if arr.null_count() > 0 {
+        Some(Vec::with_capacity(len))
+    } else {
+        None
+    };
+    for i in 0..len {
+        if arr.is_null(i) {
+            values.push(0.0);
+            if let Some(nulls) = nulls.as_mut() {
+                nulls.push(true);
+            }
+        } else {
+            values.push(arr.value(i));
+            if let Some(nulls) = nulls.as_mut() {
+                nulls.push(false);
+            }
+        }
+    }
+    Ok(InputColumn::F64 {
+        values,
+        is_null: nulls,
+    })
+}
+
+fn column_to_f32(array: &ArrayRef) -> Result<InputColumn> {
+    let arr = array
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .context("downcast Float32")?;
+    let len = arr.len();
+    let mut values = Vec::with_capacity(len);
+    let mut nulls = if arr.null_count() > 0 {
+        Some(Vec::with_capacity(len))
+    } else {
+        None
+    };
+    for i in 0..len {
+        if arr.is_null(i) {
+            values.push(0.0);
+            if let Some(nulls) = nulls.as_mut() {
+                nulls.push(true);
+            }
+        } else {
+            values.push(arr.value(i));
+            if let Some(nulls) = nulls.as_mut() {
+                nulls.push(false);
+            }
+        }
+    }
+    Ok(InputColumn::F32 {
+        values,
+        is_null: nulls,
+    })
+}
+
+fn column_to_bool(array: &ArrayRef) -> Result<InputColumn> {
+    let arr = array
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .context("downcast Boolean")?;
+    let len = arr.len();
+    let mut values = Vec::with_capacity(len);
+    let mut nulls = if arr.null_count() > 0 {
+        Some(Vec::with_capacity(len))
+    } else {
+        None
+    };
+    for i in 0..len {
+        if arr.is_null(i) {
+            values.push(false);
+            if let Some(nulls) = nulls.as_mut() {
+                nulls.push(true);
+            }
+        } else {
+            values.push(arr.value(i));
+            if let Some(nulls) = nulls.as_mut() {
+                nulls.push(false);
+            }
+        }
+    }
+    Ok(InputColumn::Bool {
+        values,
+        is_null: nulls,
+    })
+}
+
+fn column_to_timestamp_millis(array: &ArrayRef, unit: &TimeUnit) -> Result<InputColumn> {
+    let len = array.len();
+    let mut values = Vec::with_capacity(len);
+    let mut nulls = if array.null_count() > 0 {
+        Some(Vec::with_capacity(len))
+    } else {
+        None
+    };
+
+    match unit {
+        TimeUnit::Second => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .context("downcast TimestampSecond")?;
+            for i in 0..len {
+                if arr.is_null(i) {
+                    values.push(0);
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(true);
+                    }
+                } else {
+                    values.push(arr.value(i) * 1_000);
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(false);
+                    }
+                }
+            }
+        }
+        TimeUnit::Millisecond => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .context("downcast TimestampMillisecond")?;
+            for i in 0..len {
+                if arr.is_null(i) {
+                    values.push(0);
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(true);
+                    }
+                } else {
+                    values.push(arr.value(i));
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(false);
+                    }
+                }
+            }
+        }
+        TimeUnit::Microsecond => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .context("downcast TimestampMicrosecond")?;
+            for i in 0..len {
+                if arr.is_null(i) {
+                    values.push(0);
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(true);
+                    }
+                } else {
+                    values.push(arr.value(i) / 1_000);
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(false);
+                    }
+                }
+            }
+        }
+        TimeUnit::Nanosecond => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .context("downcast TimestampNanosecond")?;
+            for i in 0..len {
+                if arr.is_null(i) {
+                    values.push(0);
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(true);
+                    }
+                } else {
+                    values.push(arr.value(i) / 1_000_000);
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(false);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(InputColumn::I64 {
+        values,
+        is_null: nulls,
+    })
+}
+
+fn column_to_decimal128(array: &ArrayRef) -> Result<InputColumn> {
+    let arr = array
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .context("downcast Decimal128")?;
+    let len = arr.len();
+    let mut values = Vec::with_capacity(len);
+    let mut nulls = if arr.null_count() > 0 {
+        Some(Vec::with_capacity(len))
+    } else {
+        None
+    };
+    for i in 0..len {
+        if arr.is_null(i) {
+            values.push(0);
+            if let Some(nulls) = nulls.as_mut() {
+                nulls.push(true);
+            }
+        } else {
+            values.push(arr.value(i));
+            if let Some(nulls) = nulls.as_mut() {
+                nulls.push(false);
+            }
+        }
+    }
+    Ok(InputColumn::Decimal128 {
+        values,
+        is_null: nulls,
+    })
+}
+
+fn output_column_to_array(column: &InputColumn, data_type: &DataType) -> Result<ArrayRef> {
+    match column {
+        InputColumn::String(values) => strings_to_array(values, data_type),
+        InputColumn::Bool { values, is_null } => match data_type {
+            DataType::Boolean => build_bool_array(values, is_null.as_deref()),
+            _ => strings_to_array(&bools_to_strings(values, is_null.as_deref()), data_type),
+        },
+        InputColumn::Decimal128 { values, is_null } => match data_type {
+            DataType::Decimal128(precision, scale) => {
+                build_decimal_array(values, is_null.as_deref(), *precision, *scale)
+            }
+            _ => strings_to_array(
+                &decimal_to_strings(values, is_null.as_deref(), 0),
+                data_type,
+            ),
+        },
+        InputColumn::F64 { values, is_null } => match data_type {
+            DataType::Float64 => build_f64_array(values, is_null.as_deref()),
+            DataType::Float32 => build_f32_from_f64(values, is_null.as_deref()),
+            _ => strings_to_array(&f64_to_strings(values, is_null.as_deref()), data_type),
+        },
+        InputColumn::F32 { values, is_null } => match data_type {
+            DataType::Float32 => build_f32_array(values, is_null.as_deref()),
+            DataType::Float64 => build_f64_from_f32(values, is_null.as_deref()),
+            _ => strings_to_array(&f32_to_strings(values, is_null.as_deref()), data_type),
+        },
+        InputColumn::I32 { values, is_null } => match data_type {
+            DataType::Int32 => build_i32_array(values, is_null.as_deref()),
+            DataType::Int64 => build_i64_from_i32(values, is_null.as_deref()),
+            DataType::Int16 => build_i16_from_i32(values, is_null.as_deref()),
+            DataType::Int8 => build_i8_from_i32(values, is_null.as_deref()),
+            _ => strings_to_array(&i32_to_strings(values, is_null.as_deref()), data_type),
+        },
+        InputColumn::I64 { values, is_null } => match data_type {
+            DataType::Int64 => build_i64_array(values, is_null.as_deref()),
+            DataType::Int32 => build_i32_from_i64(values, is_null.as_deref()),
+            DataType::Int16 => build_i16_from_i64(values, is_null.as_deref()),
+            DataType::Int8 => build_i8_from_i64(values, is_null.as_deref()),
+            DataType::Timestamp(unit, _) => {
+                build_timestamp_array(values, is_null.as_deref(), unit)
+            }
+            DataType::Date64 => build_date64_array(values, is_null.as_deref()),
+            DataType::Date32 => build_date32_array(values, is_null.as_deref()),
+            _ => strings_to_array(&i64_to_strings(values, is_null.as_deref()), data_type),
+        },
+    }
+}
+
+fn output_column_to_debug_strings(
+    column: &InputColumn,
+    data_type: &DataType,
+) -> Result<Vec<Option<String>>> {
+    match column {
+        InputColumn::String(values) => Ok(values.clone()),
+        InputColumn::Bool { values, is_null } => Ok(bools_to_strings(values, is_null.as_deref())),
+        InputColumn::Decimal128 { values, is_null } => match data_type {
+            DataType::Decimal128(_, scale) => Ok(decimal_to_strings(values, is_null.as_deref(), *scale)),
+            _ => Ok(decimal_to_strings(values, is_null.as_deref(), 0)),
+        },
+        InputColumn::F64 { values, is_null } => Ok(f64_to_strings(values, is_null.as_deref())),
+        InputColumn::F32 { values, is_null } => Ok(f32_to_strings(values, is_null.as_deref())),
+        InputColumn::I32 { values, is_null } => Ok(i32_to_strings(values, is_null.as_deref())),
+        InputColumn::I64 { values, is_null } => match data_type {
+            DataType::Timestamp(unit, _) => {
+                i64_timestamp_to_strings(values, is_null.as_deref(), unit)
+            }
+            _ => Ok(i64_to_strings(values, is_null.as_deref())),
+        },
+    }
+}
+
+fn build_i64_array(values: &[i64], nulls: Option<&[bool]>) -> Result<ArrayRef> {
+    let mut builder = Int64Builder::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        if is_null_at(nulls, idx) {
+            builder.append_null();
+        } else {
+            builder.append_value(*value);
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_i32_array(values: &[i32], nulls: Option<&[bool]>) -> Result<ArrayRef> {
+    let mut builder = Int32Builder::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        if is_null_at(nulls, idx) {
+            builder.append_null();
+        } else {
+            builder.append_value(*value);
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_i16_from_i32(values: &[i32], nulls: Option<&[bool]>) -> Result<ArrayRef> {
+    let mut builder = arrow_array::builder::Int16Builder::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        if is_null_at(nulls, idx) {
+            builder.append_null();
+        } else {
+            builder.append_value(*value as i16);
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_i8_from_i32(values: &[i32], nulls: Option<&[bool]>) -> Result<ArrayRef> {
+    let mut builder = arrow_array::builder::Int8Builder::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        if is_null_at(nulls, idx) {
+            builder.append_null();
+        } else {
+            builder.append_value(*value as i8);
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_i64_from_i32(values: &[i32], nulls: Option<&[bool]>) -> Result<ArrayRef> {
+    let mut builder = Int64Builder::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        if is_null_at(nulls, idx) {
+            builder.append_null();
+        } else {
+            builder.append_value(*value as i64);
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_i32_from_i64(values: &[i64], nulls: Option<&[bool]>) -> Result<ArrayRef> {
+    let mut builder = Int32Builder::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        if is_null_at(nulls, idx) {
+            builder.append_null();
+        } else {
+            builder.append_value(*value as i32);
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_i16_from_i64(values: &[i64], nulls: Option<&[bool]>) -> Result<ArrayRef> {
+    let mut builder = arrow_array::builder::Int16Builder::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        if is_null_at(nulls, idx) {
+            builder.append_null();
+        } else {
+            builder.append_value(*value as i16);
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_i8_from_i64(values: &[i64], nulls: Option<&[bool]>) -> Result<ArrayRef> {
+    let mut builder = arrow_array::builder::Int8Builder::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        if is_null_at(nulls, idx) {
+            builder.append_null();
+        } else {
+            builder.append_value(*value as i8);
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_f64_array(values: &[f64], nulls: Option<&[bool]>) -> Result<ArrayRef> {
+    let mut builder = Float64Builder::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        if is_null_at(nulls, idx) {
+            builder.append_null();
+        } else {
+            builder.append_value(*value);
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_f32_array(values: &[f32], nulls: Option<&[bool]>) -> Result<ArrayRef> {
+    let mut builder = Float32Builder::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        if is_null_at(nulls, idx) {
+            builder.append_null();
+        } else {
+            builder.append_value(*value);
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_f32_from_f64(values: &[f64], nulls: Option<&[bool]>) -> Result<ArrayRef> {
+    let mut builder = Float32Builder::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        if is_null_at(nulls, idx) {
+            builder.append_null();
+        } else {
+            builder.append_value(*value as f32);
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_f64_from_f32(values: &[f32], nulls: Option<&[bool]>) -> Result<ArrayRef> {
+    let mut builder = Float64Builder::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        if is_null_at(nulls, idx) {
+            builder.append_null();
+        } else {
+            builder.append_value(*value as f64);
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_bool_array(values: &[bool], nulls: Option<&[bool]>) -> Result<ArrayRef> {
+    let mut builder = arrow_array::builder::BooleanBuilder::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        if is_null_at(nulls, idx) {
+            builder.append_null();
+        } else {
+            builder.append_value(*value);
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_timestamp_array(
+    values: &[i64],
+    nulls: Option<&[bool]>,
+    unit: &TimeUnit,
+) -> Result<ArrayRef> {
+    match unit {
+        TimeUnit::Second => {
+            let mut builder = TimestampSecondBuilder::with_capacity(values.len());
+            for (idx, value) in values.iter().enumerate() {
+                if is_null_at(nulls, idx) {
+                    builder.append_null();
+                } else {
+                    builder.append_value(value / 1_000);
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        TimeUnit::Millisecond => {
+            let mut builder = TimestampMillisecondBuilder::with_capacity(values.len());
+            for (idx, value) in values.iter().enumerate() {
+                if is_null_at(nulls, idx) {
+                    builder.append_null();
+                } else {
+                    builder.append_value(*value);
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        TimeUnit::Microsecond => {
+            let mut builder = TimestampMicrosecondBuilder::with_capacity(values.len());
+            for (idx, value) in values.iter().enumerate() {
+                if is_null_at(nulls, idx) {
+                    builder.append_null();
+                } else {
+                    let converted = value
+                        .checked_mul(1_000)
+                        .context("timestamp microsecond overflow")?;
+                    builder.append_value(converted);
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        TimeUnit::Nanosecond => {
+            let mut builder = TimestampNanosecondBuilder::with_capacity(values.len());
+            for (idx, value) in values.iter().enumerate() {
+                if is_null_at(nulls, idx) {
+                    builder.append_null();
+                } else {
+                    let converted = value
+                        .checked_mul(1_000_000)
+                        .context("timestamp nanosecond overflow")?;
+                    builder.append_value(converted);
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+    }
+}
+
+fn build_date64_array(values: &[i64], nulls: Option<&[bool]>) -> Result<ArrayRef> {
+    let mut builder = arrow_array::builder::Date64Builder::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        if is_null_at(nulls, idx) {
+            builder.append_null();
+        } else {
+            builder.append_value(*value);
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_date32_array(values: &[i64], nulls: Option<&[bool]>) -> Result<ArrayRef> {
+    let mut builder = arrow_array::builder::Date32Builder::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        if is_null_at(nulls, idx) {
+            builder.append_null();
+        } else {
+            builder.append_value((value / 86_400_000) as i32);
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_decimal_array(
+    values: &[i128],
+    nulls: Option<&[bool]>,
+    precision: u8,
+    scale: i8,
+) -> Result<ArrayRef> {
+    let mut builder = Decimal128Builder::with_capacity(values.len())
+        .with_precision_and_scale(precision, scale)
+        .context("configure decimal builder")?;
+    for (idx, value) in values.iter().enumerate() {
+        if is_null_at(nulls, idx) {
+            builder.append_null();
+        } else {
+            builder.append_value(*value);
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn is_null_at(nulls: Option<&[bool]>, idx: usize) -> bool {
+    nulls.map(|vals| vals.get(idx).copied().unwrap_or(false))
+        .unwrap_or(false)
+}
+
+fn i64_to_strings(values: &[i64], nulls: Option<&[bool]>) -> Vec<Option<String>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            if is_null_at(nulls, idx) {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        })
+        .collect()
+}
+
+fn i32_to_strings(values: &[i32], nulls: Option<&[bool]>) -> Vec<Option<String>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            if is_null_at(nulls, idx) {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        })
+        .collect()
+}
+
+fn f64_to_strings(values: &[f64], nulls: Option<&[bool]>) -> Vec<Option<String>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            if is_null_at(nulls, idx) {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        })
+        .collect()
+}
+
+fn f32_to_strings(values: &[f32], nulls: Option<&[bool]>) -> Vec<Option<String>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            if is_null_at(nulls, idx) {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        })
+        .collect()
+}
+
+fn bools_to_strings(values: &[bool], nulls: Option<&[bool]>) -> Vec<Option<String>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            if is_null_at(nulls, idx) {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        })
+        .collect()
+}
+
+fn i64_timestamp_to_strings(
+    values: &[i64],
+    nulls: Option<&[bool]>,
+    unit: &TimeUnit,
+) -> Result<Vec<Option<String>>> {
+    let mut out = Vec::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        if is_null_at(nulls, idx) {
+            out.push(None);
+        } else {
+            let converted = match unit {
+                TimeUnit::Second => value / 1_000,
+                TimeUnit::Millisecond => *value,
+                TimeUnit::Microsecond => value
+                    .checked_mul(1_000)
+                    .context("timestamp microsecond overflow")?,
+                TimeUnit::Nanosecond => value
+                    .checked_mul(1_000_000)
+                    .context("timestamp nanosecond overflow")?,
+            };
+            out.push(Some(timestamp_to_string(converted, unit)?));
+        }
+    }
+    Ok(out)
+}
+
+fn decimal_to_strings(
+    values: &[i128],
+    nulls: Option<&[bool]>,
+    scale: i8,
+) -> Vec<Option<String>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            if is_null_at(nulls, idx) {
+                None
+            } else {
+                Some(decimal_to_string(*value, scale))
+            }
+        })
+        .collect()
 }
 
 fn column_to_strings(array: &ArrayRef) -> Result<Vec<Option<String>>> {
@@ -855,13 +1657,6 @@ fn timestamp_to_string(value: i64, unit: &TimeUnit) -> Result<String> {
         _ => naive.format("%Y-%m-%d %H:%M:%S%.9f").to_string(),
     };
     Ok(formatted)
-}
-
-fn to_string_matrix_signature(method_sig: &str) -> Result<String> {
-    let prefix = method_sig
-        .strip_suffix(")V")
-        .context("method signature must end with )V")?;
-    Ok(format!("{prefix})[[Ljava/lang/String;"))
 }
 
 fn strings_to_array(values: &[Option<String>], data_type: &DataType) -> Result<ArrayRef> {

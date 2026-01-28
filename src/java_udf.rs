@@ -4,10 +4,11 @@ use jni::sys::{jboolean, jbyte};
 use jni::{InitArgsBuilder, JNIVersion, JNIEnv, JavaVM};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 static JVM: OnceLock<JavaVM> = OnceLock::new();
+static JVM_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub enum JavaArg {
@@ -445,6 +446,12 @@ pub fn call_decimal_udf(
 }
 
 fn get_or_create_jvm() -> Result<&'static JavaVM> {
+    if let Some(jvm) = JVM.get() {
+        return Ok(jvm);
+    }
+
+    let lock = JVM_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock().expect("lock JVM init mutex");
     if let Some(jvm) = JVM.get() {
         return Ok(jvm);
     }

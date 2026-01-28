@@ -4,6 +4,7 @@ import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.sql.Date;
 import java.sql.Time;
 import java.sql.Timestamp;
@@ -52,6 +53,7 @@ public final class ScalarFunctionAdapter {
     private final Object udf;
     private final Method evalMethod;
     private final MethodHandle evalHandle;
+    private final MethodHandle evalHandleBound;
     private final MethodHandle evalHandleSpreader;
     private final ValueParser[] parsers;
     private final int[] decimalScales;
@@ -81,7 +83,8 @@ public final class ScalarFunctionAdapter {
 
         MethodHandles.Lookup lookup = MethodHandles.lookup();
         this.evalHandle = lookup.unreflect(resolvedEval);
-        this.evalHandleSpreader = evalHandle.bindTo(udf).asSpreader(Object[].class, argCount);
+        this.evalHandleBound = evalHandle.bindTo(udf);
+        this.evalHandleSpreader = evalHandleBound.asSpreader(Object[].class, argCount);
 
         this.rowClass = loadRowClass();
         Method rowArityMethod = resolveRowMethod(rowClass, "getArity");
@@ -247,6 +250,23 @@ public final class ScalarFunctionAdapter {
         Object[] out = null;
         boolean[][] outNulls = null;
         List<Integer> pendingNullRows = new ArrayList<>();
+
+        if (!rowReturn && argCount == 1) {
+            Object outputArray = allocateOutputArray(evalMethod.getReturnType(), rowCount);
+            Object[] outputColumns = new Object[] { outputArray };
+            boolean[][] outputNulls = new boolean[1][rowCount];
+            ColumnReader reader = readers[0];
+            for (int row = 0; row < rowCount; row++) {
+                Object arg = reader.get(row);
+                Object result = invokeEvalSingle(arg);
+                if (result == null) {
+                    outputNulls[0][row] = true;
+                    continue;
+                }
+                writeOutputValue(outputArray, result, row);
+            }
+            return new ColumnarResult(outputColumns, outputNulls);
+        }
 
         for (int row = 0; row < rowCount; row++) {
             for (int arg = 0; arg < argCount; arg++) {
@@ -581,6 +601,36 @@ public final class ScalarFunctionAdapter {
         return new String[rowCount];
     }
 
+    private static Object allocateOutputArray(Class<?> returnType, int rowCount) {
+        if (returnType == null) {
+            return new String[rowCount];
+        }
+        if (returnType == Boolean.class || returnType == boolean.class) {
+            return new boolean[rowCount];
+        }
+        if (returnType == Float.class || returnType == float.class
+                || returnType == Double.class || returnType == double.class) {
+            return new double[rowCount];
+        }
+        if (returnType == BigDecimal.class) {
+            return new byte[rowCount * DECIMAL_BYTES];
+        }
+        if (returnType == Timestamp.class
+                || returnType == LocalDateTime.class
+                || returnType == Date.class
+                || returnType == Time.class) {
+            return new long[rowCount];
+        }
+        if (Number.class.isAssignableFrom(returnType)
+                || returnType == long.class
+                || returnType == int.class
+                || returnType == short.class
+                || returnType == byte.class) {
+            return new long[rowCount];
+        }
+        return new String[rowCount];
+    }
+
     private static void writeOutputValue(Object array, Object value, int row) {
         if (array instanceof byte[]) {
             writeDecimalBytes((byte[]) array, row, (BigDecimal) value);
@@ -604,24 +654,40 @@ public final class ScalarFunctionAdapter {
     }
 
     private static void writeDecimalBytes(byte[] target, int row, BigDecimal value) {
-        byte[] unscaled = value.unscaledValue().toByteArray();
-        if (unscaled.length > DECIMAL_BYTES) {
+        BigInteger unscaled = value.unscaledValue();
+        int offset = row * DECIMAL_BYTES;
+        if (unscaled.bitLength() <= 63) {
+            long v = unscaled.longValue();
+            writeLongTo128(target, offset, v);
+            return;
+        }
+        byte[] bytes = unscaled.toByteArray();
+        if (bytes.length > DECIMAL_BYTES) {
             throw new IllegalArgumentException(
                     "Decimal value does not fit into 128 bits: " + value);
         }
-        int offset = row * DECIMAL_BYTES;
         byte pad = (byte) (value.signum() < 0 ? 0xFF : 0x00);
         for (int i = 0; i < DECIMAL_BYTES; i++) {
             target[offset + i] = pad;
         }
-        int copyStart = Math.max(0, unscaled.length - DECIMAL_BYTES);
-        int copyLen = Math.min(unscaled.length, DECIMAL_BYTES);
+        int copyStart = Math.max(0, bytes.length - DECIMAL_BYTES);
+        int copyLen = Math.min(bytes.length, DECIMAL_BYTES);
         System.arraycopy(
-                unscaled,
+                bytes,
                 copyStart,
                 target,
                 offset + (DECIMAL_BYTES - copyLen),
                 copyLen);
+    }
+
+    private static void writeLongTo128(byte[] target, int offset, long value) {
+        byte pad = (byte) (value < 0 ? 0xFF : 0x00);
+        for (int i = 0; i < 8; i++) {
+            target[offset + i] = pad;
+        }
+        for (int i = 0; i < 8; i++) {
+            target[offset + 8 + i] = (byte) (value >>> (56 - (i * 8)));
+        }
     }
 
     private static long toEpochMillis(Object value) {
@@ -664,14 +730,41 @@ public final class ScalarFunctionAdapter {
         if (offset + DECIMAL_BYTES > values.length) {
             throw new IllegalArgumentException("Decimal byte array index out of range");
         }
+        long high = readLong(values, offset);
+        long low = readLong(values, offset + 8);
+        if ((high == 0 && low >= 0) || (high == -1 && low < 0)) {
+            return BigDecimal.valueOf(low, scale);
+        }
         byte[] slice = new byte[DECIMAL_BYTES];
         System.arraycopy(values, offset, slice, 0, DECIMAL_BYTES);
-        return new BigDecimal(new java.math.BigInteger(slice), scale);
+        return new BigDecimal(new BigInteger(slice), scale);
+    }
+
+    private static long readLong(byte[] values, int offset) {
+        return ((long) (values[offset] & 0xFF) << 56)
+                | ((long) (values[offset + 1] & 0xFF) << 48)
+                | ((long) (values[offset + 2] & 0xFF) << 40)
+                | ((long) (values[offset + 3] & 0xFF) << 32)
+                | ((long) (values[offset + 4] & 0xFF) << 24)
+                | ((long) (values[offset + 5] & 0xFF) << 16)
+                | ((long) (values[offset + 6] & 0xFF) << 8)
+                | ((long) (values[offset + 7] & 0xFF));
     }
 
     private Object invokeEval(Object[] args) throws Exception {
         try {
             return evalHandleSpreader.invoke(args);
+        } catch (Throwable t) {
+            if (t instanceof Exception) {
+                throw (Exception) t;
+            }
+            throw new Exception("Failed to invoke eval method", t);
+        }
+    }
+
+    private Object invokeEvalSingle(Object arg) throws Exception {
+        try {
+            return evalHandleBound.invoke(arg);
         } catch (Throwable t) {
             if (t instanceof Exception) {
                 throw (Exception) t;

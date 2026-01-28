@@ -5,6 +5,7 @@ use arrow_array::array::{
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt32Array,
     UInt64Array,
 };
+use arrow_array::RecordBatch;
 use arrow_array::builder::{
     Decimal128Builder, Float32Builder, Float64Builder, Int32Builder, Int64Builder,
     LargeStringBuilder, StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
@@ -16,10 +17,12 @@ use arrow_schema::{DataType, TimeUnit};
 use clap::Parser;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::io::{BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::thread;
 use crate::java_udf::{InputColumn, JavaArg, UdfHandle};
 
 mod java_udf;
@@ -33,6 +36,10 @@ struct Args {
 
     #[arg(long, default_value = "262144")]
     buf_size: usize,
+    #[arg(long, default_value_t = num_cpus::get())]
+    workers: usize,
+    #[arg(long, default_value_t = 0)]
+    max_in_flight: usize,
 
     #[arg(long, value_delimiter = ',', default_value = "jar/flinke2c.jar")]
     udf_jars: Vec<PathBuf>,
@@ -215,7 +222,7 @@ fn run_session(
         .as_ref()
         .map(|current| current != &desired_udf_types)
         .unwrap_or(true);
-    if class_changed || types_changed || udf.is_none() {
+    if class_changed || types_changed {
         let current_class_display = current_udf_class.as_deref().unwrap_or("<unset>");
         let current_types_display = current_udf_types
             .as_ref()
@@ -225,22 +232,8 @@ fn run_session(
             "Switching UDF config: class {} -> {}, types {} -> {:?}",
             current_class_display, desired_udf_class, current_types_display, desired_udf_types
         );
-        *udf = Some(UdfHandle::new_with_args(
-            &args.udf_jars,
-            &args.udf_adapter_class,
-            "(Ljava/lang/String;[Ljava/lang/String;)V",
-            &[
-                JavaArg::String(desired_udf_class.clone()),
-                JavaArg::StringArray(desired_udf_types.clone()),
-            ],
-        )?);
         *current_udf_class = Some(desired_udf_class);
         *current_udf_types = Some(desired_udf_types);
-    }
-
-    let udf_handle = udf.as_mut().context("UDF handle not initialized")?;
-    if udf_handle.reload_if_changed()? {
-        println!("Reloaded UDF classes after jar change");
     }
 
     let mut out = BufWriter::with_capacity(args.buf_size, post);
@@ -256,48 +249,235 @@ fn run_session(
             indices
         );
     }
-    let result_names: Option<Vec<&str>> = if pre_cfg.function_results.is_empty() {
+    let result_names: Option<Vec<String>> = if pre_cfg.function_results.is_empty() {
         None
     } else {
         Some(
             pre_cfg
                 .function_results
                 .iter()
-                .map(|result| result.output_name.as_str())
+                .map(|result| result.output_name.clone())
                 .collect(),
         )
     };
-    let arg_names: Vec<&str> = pre_cfg
+    let arg_names: Vec<String> = pre_cfg
         .function_args
         .iter()
-        .map(|arg| arg.name.as_str())
+        .map(|arg| arg.name.clone())
         .collect();
-    let mut debug_batches_remaining = args.debug_sample_batches;
-    let mut writer =
-        StreamWriter::try_new(&mut out, schema.as_ref()).context("create Arrow IPC writer")?;
 
-    for maybe_batch in reader {
-        let batch = maybe_batch.context("read Arrow record batch")?;
-        let new_batch = apply_udf_to_batch(
-            &batch,
-            schema.as_ref(),
-            &arg_indices,
-            &arg_names,
-            result_indices.as_deref(),
-            result_names.as_deref(),
-            udf_handle,
-            &args.udf_method,
-            args.debug_sample_rows,
-            &mut debug_batches_remaining,
-        )?;
-        writer.write(&new_batch).context("write Arrow record batch")?;
+    let worker_count = args.workers.max(1);
+    if worker_count == 1 {
+        if class_changed || types_changed || udf.is_none() {
+            *udf = Some(UdfHandle::new_with_args(
+                &args.udf_jars,
+                &args.udf_adapter_class,
+                "(Ljava/lang/String;[Ljava/lang/String;)V",
+                &[
+                    JavaArg::String(
+                        current_udf_class
+                            .as_ref()
+                            .context("missing UDF class")?
+                            .clone(),
+                    ),
+                    JavaArg::StringArray(
+                        current_udf_types
+                            .as_ref()
+                            .context("missing UDF types")?
+                            .clone(),
+                    ),
+                ],
+            )?);
+        }
+        let udf_handle = udf.as_mut().context("UDF handle not initialized")?;
+        if udf_handle.reload_if_changed()? {
+            println!("Reloaded UDF classes after jar change");
+        }
+
+        let mut debug_batches_remaining = args.debug_sample_batches;
+        let mut writer =
+            StreamWriter::try_new(&mut out, schema.as_ref()).context("create Arrow IPC writer")?;
+
+        for maybe_batch in reader {
+            let batch = maybe_batch.context("read Arrow record batch")?;
+            let new_batch = apply_udf_to_batch(
+                &batch,
+                schema.as_ref(),
+                &arg_indices,
+                &arg_names,
+                result_indices.as_deref(),
+                result_names.as_deref(),
+                udf_handle,
+                &args.udf_method,
+                args.debug_sample_rows,
+                &mut debug_batches_remaining,
+            )?;
+            writer.write(&new_batch).context("write Arrow record batch")?;
+        }
+
+        writer.finish().context("finish Arrow IPC writer")?;
+        drop(writer);
+        out.flush().ok();
+        return Ok(());
     }
 
-    writer.finish().context("finish Arrow IPC writer")?;
-    drop(writer);
-    out.flush().ok();
+    if args.debug_sample_rows > 0 {
+        eprintln!("Debug sampling disabled in parallel mode");
+    }
+
+    let max_in_flight = if args.max_in_flight == 0 {
+        worker_count * 2
+    } else {
+        args.max_in_flight
+    };
+
+    let (result_tx, result_rx) = mpsc::channel::<WorkResult>();
+    let mut senders = Vec::with_capacity(worker_count);
+    let mut worker_handles = Vec::with_capacity(worker_count);
+    let inflight = Arc::new((std::sync::Mutex::new(0usize), std::sync::Condvar::new()));
+
+    for _ in 0..worker_count {
+        let (tx, rx) = mpsc::channel::<Option<WorkItem>>();
+        senders.push(tx);
+
+        let result_tx = result_tx.clone();
+        let schema = Arc::clone(&schema);
+        let arg_indices = arg_indices.clone();
+        let arg_names = arg_names.clone();
+        let result_indices = result_indices.clone();
+        let result_names = result_names.clone();
+        let udf_jars = args.udf_jars.clone();
+        let udf_adapter = args.udf_adapter_class.clone();
+        let udf_method = args.udf_method.clone();
+        let udf_class = current_udf_class
+            .as_ref()
+            .context("missing UDF class")?
+            .clone();
+        let udf_types = current_udf_types
+            .as_ref()
+            .context("missing UDF types")?
+            .clone();
+
+        let handle = thread::spawn(move || {
+            let udf_handle = UdfHandle::new_with_args(
+                &udf_jars,
+                &udf_adapter,
+                "(Ljava/lang/String;[Ljava/lang/String;)V",
+                &[
+                    JavaArg::String(udf_class),
+                    JavaArg::StringArray(udf_types),
+                ],
+            );
+            let udf_handle = match udf_handle {
+                Ok(handle) => handle,
+                Err(err) => {
+                    let _ = result_tx.send(WorkResult { seq: 0, result: Err(err) });
+                    return;
+                }
+            };
+
+            let mut debug_batches_remaining = 0usize;
+            for msg in rx {
+                let Some(work) = msg else {
+                    break;
+                };
+                let result = apply_udf_to_batch(
+                    &work.batch,
+                    schema.as_ref(),
+                    &arg_indices,
+                    &arg_names,
+                    result_indices.as_deref(),
+                    result_names.as_deref(),
+                    &udf_handle,
+                    &udf_method,
+                    0,
+                    &mut debug_batches_remaining,
+                );
+                if result_tx.send(WorkResult { seq: work.seq, result }).is_err() {
+                    break;
+                }
+            }
+        });
+        worker_handles.push(handle);
+    }
+    drop(result_tx);
+
+    let schema_for_writer = Arc::clone(&schema);
+    let inflight_writer = Arc::clone(&inflight);
+    let writer_handle = thread::spawn(move || -> Result<()> {
+        let mut writer =
+            StreamWriter::try_new(&mut out, schema_for_writer.as_ref())
+                .context("create Arrow IPC writer")?;
+        let mut pending: BTreeMap<usize, RecordBatch> = BTreeMap::new();
+        let mut next_seq = 0usize;
+
+        while let Ok(work) = result_rx.recv() {
+            let WorkResult { seq, result } = work;
+            let batch = result?;
+            if seq == next_seq {
+                writer.write(&batch).context("write Arrow record batch")?;
+                next_seq += 1;
+                while let Some(next_batch) = pending.remove(&next_seq) {
+                    writer
+                        .write(&next_batch)
+                        .context("write Arrow record batch")?;
+                    next_seq += 1;
+                }
+            } else {
+                pending.insert(seq, batch);
+            }
+
+            let (lock, cvar) = &*inflight_writer;
+            let mut count = lock.lock().expect("lock inflight");
+            *count = count.saturating_sub(1);
+            cvar.notify_one();
+        }
+
+        if !pending.is_empty() {
+            bail!("writer ended with {} pending batches", pending.len());
+        }
+
+        writer.finish().context("finish Arrow IPC writer")?;
+        drop(writer);
+        out.flush().ok();
+        Ok(())
+    });
+
+    let mut dispatched = 0usize;
+    let mut send_index = 0usize;
+    for maybe_batch in reader {
+        let batch = maybe_batch.context("read Arrow record batch")?;
+        let (lock, cvar) = &*inflight;
+        let mut count = lock.lock().expect("lock inflight");
+        while *count >= max_in_flight {
+            count = cvar.wait(count).expect("wait inflight");
+        }
+        *count += 1;
+        drop(count);
+
+        let sender = &senders[send_index % senders.len()];
+        sender
+            .send(Some(WorkItem { seq: dispatched, batch }))
+            .context("dispatch batch to worker")?;
+        dispatched += 1;
+        send_index += 1;
+    }
+
+    for sender in &senders {
+        let _ = sender.send(None);
+    }
+    drop(senders);
+
+    for handle in worker_handles {
+        let _ = handle.join();
+    }
+
+    writer_handle
+        .join()
+        .expect("writer thread panicked")?;
     Ok(())
 }
+
 
 fn resolve_function_arg_indices(
     schema: &arrow_schema::Schema,
@@ -357,6 +537,16 @@ fn resolve_function_result_indices(
     Ok(Some(indices))
 }
 
+struct WorkItem {
+    seq: usize,
+    batch: RecordBatch,
+}
+
+struct WorkResult {
+    seq: usize,
+    result: Result<RecordBatch>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct OutputTarget {
     target_idx: usize,
@@ -367,9 +557,9 @@ fn apply_udf_to_batch(
     batch: &arrow_array::RecordBatch,
     schema: &arrow_schema::Schema,
     arg_indices: &[usize],
-    arg_names: &[&str],
+    arg_names: &[String],
     result_targets: Option<&[usize]>,
-    result_names: Option<&[&str]>,
+    result_names: Option<&[String]>,
     udf: &UdfHandle,
     method: &str,
     debug_sample_rows: usize,
@@ -449,8 +639,8 @@ fn resolve_output_targets(
     batch: &arrow_array::RecordBatch,
     arg_indices: &[usize],
     result_targets: Option<&[usize]>,
-    result_names: Option<&[&str]>,
-    arg_names: &[&str],
+    result_names: Option<&[String]>,
+    arg_names: &[String],
     output_arity: usize,
 ) -> Result<Vec<OutputTarget>> {
     if let Some(targets) = result_targets {
@@ -485,10 +675,13 @@ fn resolve_output_targets(
                 .context("functionResults names missing for name-based output mapping")?;
             let mut mapped = Vec::with_capacity(targets.len());
             for (idx, &target_idx) in targets.iter().enumerate() {
-                let name = names.get(idx).copied().unwrap_or("<unknown>");
+                let name = names
+                    .get(idx)
+                    .map(|value| value.as_str())
+                    .unwrap_or("<unknown>");
                 let source_idx = arg_names
                     .iter()
-                    .position(|arg| *arg == name)
+                    .position(|arg| arg == name)
                     .with_context(|| {
                         format!(
                             "functionResult {} not found in functionArgs for name-based mapping",
@@ -579,7 +772,7 @@ fn build_output_columns(
 
 fn maybe_print_debug_sample(
     schema: &arrow_schema::Schema,
-    arg_names: &[&str],
+    arg_names: &[String],
     arg_columns: &[Vec<Option<String>>],
     output_targets: &[OutputTarget],
     output_columns: &[Vec<Option<String>>],
@@ -601,7 +794,10 @@ fn maybe_print_debug_sample(
     for row_idx in 0..sample_rows {
         let mut input_parts = Vec::with_capacity(arg_columns.len());
         for (arg_idx, column) in arg_columns.iter().enumerate() {
-            let name = arg_names.get(arg_idx).copied().unwrap_or("<arg>");
+            let name = arg_names
+                .get(arg_idx)
+                .map(|value| value.as_str())
+                .unwrap_or("<arg>");
             let value = column
                 .get(row_idx)
                 .and_then(|v| v.as_deref())

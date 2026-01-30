@@ -320,6 +320,64 @@ impl UdfHandle {
         typed_columns_to_vec(&mut env, columns_array, nulls_array)
     }
 
+    /// Call a method that takes Object[] columns + boolean[][] nulls + String[] outputNames
+    /// and returns ColumnarResult.
+    pub fn call_typed_columns_to_named_results(
+        &self,
+        method: &str,
+        columns: &[InputColumn],
+        output_names: &[String],
+    ) -> Result<Vec<InputColumn>> {
+        if columns.is_empty() {
+            return Ok(Vec::new());
+        }
+        let row_count = columns[0].len();
+        if columns.iter().any(|col| col.len() != row_count) {
+            bail!("typed columns have mismatched lengths");
+        }
+
+        let jvm = get_or_create_jvm()?;
+        let mut env = jvm
+            .attach_current_thread()
+            .context("attach JVM thread")?;
+        set_context_class_loader(&mut env, self.class_loader.as_obj())?;
+
+        let (columns_obj, nulls_obj) = new_typed_columns(&mut env, columns)?;
+        let names_obj = new_string_array_from_strings(&mut env, output_names)?;
+        let ret = env.call_method(
+            self.udf_obj.as_obj(),
+            method,
+            "([Ljava/lang/Object;[[Z[Ljava/lang/String;)Lorg/example/proxy/ScalarFunctionAdapter$ColumnarResult;",
+            &[
+                JValue::Object(&columns_obj),
+                JValue::Object(&nulls_obj),
+                JValue::Object(&names_obj),
+            ],
+        )?;
+        check_exception(&mut env, "invoke method")?;
+        let result_obj = ret.l()?;
+        if result_obj.is_null() {
+            return Ok(Vec::new());
+        }
+
+        let columns_val =
+            env.call_method(&result_obj, "columns", "()[Ljava/lang/Object;", &[])?;
+        check_exception(&mut env, "ColumnarResult.columns")?;
+        let columns_obj = columns_val.l()?;
+        let columns_array = JObjectArray::from(columns_obj);
+
+        let nulls_val = env.call_method(&result_obj, "nulls", "()[[Z", &[])?;
+        check_exception(&mut env, "ColumnarResult.nulls")?;
+        let nulls_obj = nulls_val.l()?;
+        let nulls_array = if nulls_obj.is_null() {
+            None
+        } else {
+            Some(JObjectArray::from(nulls_obj))
+        };
+
+        typed_columns_to_vec(&mut env, columns_array, nulls_array)
+    }
+
     /// Force a reload of the jar(s) and rebuild the cached instance.
     pub fn reload(&mut self) -> Result<()> {
         let classpath = self.classpath_jars.clone();

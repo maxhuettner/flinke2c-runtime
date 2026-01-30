@@ -20,7 +20,7 @@ use rmpv::decode as msgpack_decode;
 use rmpv::encode as msgpack_encode;
 use rmpv::{Utf8String, Value};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -66,16 +66,29 @@ struct Args {
 #[serde(rename_all = "camelCase")]
 struct FunctionArg {
     name: String,
-    #[serde(rename = "type")]
-    arg_type: String,
+    #[serde(rename = "type", alias = "wireType")]
+    arg_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct FunctionResult {
     output_name: String,
-    #[serde(default)]
+    #[serde(
+        default,
+        rename = "outputType",
+        alias = "outputWireType",
+        alias = "wireType"
+    )]
     output_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct FieldSpec {
+    name: String,
+    #[serde(default, rename = "wireType", alias = "type")]
+    field_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -92,6 +105,10 @@ struct ConfigMessage {
     function_results: Vec<FunctionResult>,
     #[serde(default)]
     reorder_responses: bool,
+    #[serde(default)]
+    pre_fields: Vec<FieldSpec>,
+    #[serde(default)]
+    post_fields: Vec<FieldSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,14 +139,17 @@ impl FieldType {
 #[derive(Clone, Debug)]
 struct SessionConfig {
     reorder_responses: bool,
+    expected_input_len: usize,
+    output_row_len: usize,
+    pre_name_to_pos: std::collections::HashMap<String, usize>,
+    post_fields: Vec<FieldSpec>,
+    post_field_positions: Vec<usize>,
     arg_positions: Vec<usize>,
     arg_names: Vec<String>,
     arg_types: Vec<FieldType>,
     output_positions: Vec<usize>,
     output_names: Vec<String>,
     output_types: Vec<FieldType>,
-    expected_input_len: usize,
-    output_row_len: usize,
 }
 
 fn main() -> Result<()> {
@@ -221,23 +241,86 @@ fn accept_pair(
 
 fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
     let reorder_responses = pre_cfg.reorder_responses;
-    let arg_offset = if reorder_responses { 2 } else { 1 };
+
+    if pre_cfg.pre_fields.is_empty() {
+        bail!("preFields missing from PRE config");
+    }
+    if pre_cfg.post_fields.is_empty() {
+        bail!("postFields missing from PRE config");
+    }
+
+    let has_op_in_pre = pre_cfg
+        .pre_fields
+        .first()
+        .map(|f| f.name == "__op")
+        .unwrap_or(false);
+    let has_op_in_post = pre_cfg
+        .post_fields
+        .first()
+        .map(|f| f.name == "__op")
+        .unwrap_or(false);
+
+    let mut pre_name_to_pos = std::collections::HashMap::new();
+    for (idx, field) in pre_cfg.pre_fields.iter().enumerate() {
+        let pos = field_row_pos(idx, has_op_in_pre, reorder_responses);
+        if pre_name_to_pos.insert(field.name.clone(), pos).is_some() {
+            bail!("duplicate preField name {}", field.name);
+        }
+    }
+
+    let mut post_field_positions = Vec::with_capacity(pre_cfg.post_fields.len());
+    for (idx, _field) in pre_cfg.post_fields.iter().enumerate() {
+        let pos = field_row_pos(idx, has_op_in_post, reorder_responses);
+        post_field_positions.push(pos);
+    }
+
+    let expected_input_len = if has_op_in_pre {
+        pre_cfg.pre_fields.len() + if reorder_responses { 1 } else { 0 }
+    } else {
+        pre_cfg.pre_fields.len() + 1 + if reorder_responses { 1 } else { 0 }
+    };
+
+    let output_row_len = if has_op_in_post {
+        pre_cfg.post_fields.len() + if reorder_responses { 1 } else { 0 }
+    } else {
+        pre_cfg.post_fields.len() + 1 + if reorder_responses { 1 } else { 0 }
+    };
 
     let mut arg_positions = Vec::with_capacity(pre_cfg.function_args.len());
     let mut arg_names = Vec::with_capacity(pre_cfg.function_args.len());
     let mut arg_types = Vec::with_capacity(pre_cfg.function_args.len());
-    for (idx, arg) in pre_cfg.function_args.iter().enumerate() {
-        let pos = arg_offset + idx;
+    for arg in &pre_cfg.function_args {
+        let pos = pre_name_to_pos
+            .get(&arg.name)
+            .copied()
+            .with_context(|| format!("functionArg {} not found in preFields", arg.name))?;
         arg_positions.push(pos);
         arg_names.push(arg.name.clone());
-        arg_types.push(parse_field_type(&arg.arg_type));
+        let arg_type = arg
+            .arg_type
+            .as_deref()
+            .with_context(|| format!("functionArg type missing for {}", arg.name))?;
+        arg_types.push(parse_field_type(arg_type));
+    }
+
+    let mut post_name_to_pos = std::collections::HashMap::new();
+    for (idx, field) in pre_cfg.post_fields.iter().enumerate() {
+        let pos = post_field_positions[idx];
+        if post_name_to_pos.insert(field.name.clone(), pos).is_some() {
+            bail!("duplicate postField name {}", field.name);
+        }
     }
 
     let mut output_positions = Vec::with_capacity(pre_cfg.function_results.len());
     let mut output_names = Vec::with_capacity(pre_cfg.function_results.len());
     let mut output_types = Vec::with_capacity(pre_cfg.function_results.len());
-    for (idx, result) in pre_cfg.function_results.iter().enumerate() {
-        let pos = arg_offset + idx;
+    for result in &pre_cfg.function_results {
+        let pos = post_name_to_pos
+            .get(&result.output_name)
+            .copied()
+            .with_context(|| {
+                format!("functionResult {} not found in postFields", result.output_name)
+            })?;
         output_positions.push(pos);
         output_names.push(result.output_name.clone());
         let output_type = result
@@ -246,27 +329,44 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
             .map(parse_field_type)
             .with_context(|| {
                 format!(
-                    "functionResult outputType missing for {}",
+                    "functionResult outputType/wireType missing for {}",
                     result.output_name
                 )
             })?;
         output_types.push(output_type);
     }
 
-    let expected_input_len = arg_offset + pre_cfg.function_args.len();
-    let output_row_len = arg_offset + pre_cfg.function_results.len();
-
     Ok(SessionConfig {
         reorder_responses,
+        expected_input_len,
+        output_row_len,
+        pre_name_to_pos,
+        post_fields: pre_cfg.post_fields.clone(),
+        post_field_positions,
         arg_positions,
         arg_names,
         arg_types,
         output_positions,
         output_names,
         output_types,
-        expected_input_len,
-        output_row_len,
     })
+}
+
+fn field_row_pos(field_idx: usize, has_op: bool, reorder: bool) -> usize {
+    if has_op {
+        if reorder {
+            if field_idx == 0 {
+                0
+            } else {
+                field_idx + 1
+            }
+        } else {
+            field_idx
+        }
+    } else {
+        let base = 1 + if reorder { 1 } else { 0 };
+        base + field_idx
+    }
 }
 
 fn run_session(
@@ -320,7 +420,11 @@ fn run_session(
     let desired_udf_types: Vec<String> = pre_cfg
         .function_args
         .iter()
-        .map(|arg| arg.arg_type.clone())
+        .map(|arg| {
+            arg.arg_type
+                .clone()
+                .unwrap_or_else(|| "<missing>".to_string())
+        })
         .collect();
 
     let class_changed = current_udf_class
@@ -708,25 +812,56 @@ fn apply_udf_to_rows(
     }
 
     let input_columns = build_input_columns(rows, &session.arg_positions, &session.arg_types)?;
-    let output_columns = call_udf_to_columns(udf, method, &input_columns)?;
+    let output_columns = call_udf_to_columns(udf, method, &input_columns, &session.output_names)?;
 
     let mut out_rows = Vec::with_capacity(rows.len());
     for row_idx in 0..rows.len() {
+        let source_row = rows
+            .get(row_idx)
+            .context("missing source row")?;
         let mut out_row = vec![Value::Nil; session.output_row_len];
-        if let Some(source_row) = rows.get(row_idx) {
-            if let Some(op) = source_row.get(0) {
-                out_row[0] = op.clone();
-            }
-            if session.reorder_responses {
-                if let Some(row_id) = source_row.get(1) {
-                    if session.output_row_len > 1 {
-                        out_row[1] = row_id.clone();
-                    }
+
+        if let Some(op) = source_row.get(0) {
+            out_row[0] = op.clone();
+        }
+        if session.reorder_responses {
+            if let Some(row_id) = source_row.get(1) {
+                if session.output_row_len > 1 {
+                    out_row[1] = row_id.clone();
                 }
             }
         }
 
-        if output_columns.len() != session.output_positions.len() {
+        let output_name_set: HashSet<&str> = session
+            .output_names
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        for (idx, field) in session.post_fields.iter().enumerate() {
+            let pos = session.post_field_positions[idx];
+            if field.name == "__op" {
+                out_row[pos] = out_row[0].clone();
+                continue;
+            }
+            if field.name == "__rowId" {
+                if session.reorder_responses && session.output_row_len > 1 {
+                    out_row[pos] = out_row[1].clone();
+                }
+                continue;
+            }
+            if let Some(pre_pos) = session.pre_name_to_pos.get(&field.name).copied() {
+                out_row[pos] = source_row
+                    .get(pre_pos)
+                    .cloned()
+                    .unwrap_or(Value::Nil);
+                continue;
+            }
+            if !output_name_set.contains(field.name.as_str()) {
+                bail!("postField {} not found in preFields", field.name);
+            }
+        }
+
+        if output_columns.len() < session.output_positions.len() {
             bail!(
                 "UDF returned {} columns but functionResults resolved {} targets",
                 output_columns.len(),
@@ -1473,7 +1608,8 @@ fn apply_udf_to_batch(
         }
     }
 
-    let output_columns = call_udf_to_columns(udf, method, &input_columns)?;
+    let output_names = result_names.unwrap_or(&[]);
+    let output_columns = call_udf_to_columns(udf, method, &input_columns, output_names)?;
     let output_targets = resolve_output_targets(
         batch,
         arg_indices,
@@ -1517,6 +1653,7 @@ fn call_udf_to_columns(
     udf: &UdfHandle,
     method: &str,
     input_columns: &[InputColumn],
+    output_names: &[String],
 ) -> Result<Vec<InputColumn>> {
     let columns_method = if method.ends_with("Fast") || method.ends_with("ToColumnsTypedOut") {
         method.to_string()
@@ -1524,7 +1661,16 @@ fn call_udf_to_columns(
         format!("{method}Fast")
     };
 
-    udf.call_typed_columns_to_typed_results(&columns_method, input_columns)
+    if output_names.is_empty() {
+        return udf.call_typed_columns_to_typed_results(&columns_method, input_columns);
+    }
+
+    let named_method = if columns_method.ends_with("Named") {
+        columns_method.clone()
+    } else {
+        format!("{columns_method}Named")
+    };
+    udf.call_typed_columns_to_named_results(&named_method, input_columns, output_names)
 }
 
 fn resolve_output_targets(
@@ -2959,11 +3105,17 @@ fn parse_field_type(type_str: &str) -> FieldType {
         "STRING" | "VARCHAR" | "CHAR" | "TEXT" => FieldType::String,
         "BOOLEAN" | "BOOL" => FieldType::Boolean,
         "BIGINT" | "LONG" => FieldType::Int64,
+        "INT64" => FieldType::Int64,
         "INT" | "INTEGER" => FieldType::Int32,
+        "INT32" => FieldType::Int32,
         "SMALLINT" => FieldType::Int16,
+        "INT16" => FieldType::Int16,
         "TINYINT" => FieldType::Int8,
+        "INT8" => FieldType::Int8,
         "DOUBLE" => FieldType::Float64,
+        "FLOAT64" => FieldType::Float64,
         "FLOAT" | "REAL" => FieldType::Float32,
+        "FLOAT32" => FieldType::Float32,
         "DECIMAL" | "NUMERIC" => {
             let (precision, scale) = parse_decimal_precision_scale(type_str);
             FieldType::Decimal { precision, scale }
@@ -2973,6 +3125,7 @@ fn parse_field_type(type_str: &str) -> FieldType {
             FieldType::Timestamp { unit }
         }
         "DATE" => FieldType::Date,
+        "BIN" | "BINARY" | "VARBINARY" => FieldType::Unknown("BIN".to_string()),
         other => FieldType::Unknown(other.to_string()),
     }
 }

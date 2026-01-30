@@ -15,9 +15,7 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.temporal.ChronoField;
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.function.Function;
@@ -45,7 +43,6 @@ public final class ScalarFunctionAdapter {
         Object parse(String value);
     }
 
-    private static final String ROW_CLASS_NAME = "org.apache.flink.types.Row";
     private static final DateTimeFormatter TIMESTAMP_FORMATTER = new DateTimeFormatterBuilder()
             .appendPattern("yyyy-MM-dd HH:mm:ss")
             .optionalStart()
@@ -61,14 +58,6 @@ public final class ScalarFunctionAdapter {
     private final ValueParser[] parsers;
     private final int[] decimalScales;
     private final int argCount;
-    private final Class<?> rowClass;
-    private final MethodHandle rowGetArityHandle;
-    private final MethodHandle rowGetFieldHandle;
-    private final Method rowGetFieldByNameMethod;
-    private final Method rowGetFieldNamesMethod;
-    private final Method rowGetFieldIndexMethod;
-    private final boolean rowReturn;
-    private boolean warnedRowNameFallback = false;
 
     public ScalarFunctionAdapter(String udfClassName) throws Exception {
         this(udfClassName, new String[] { "DECIMAL" });
@@ -93,15 +82,6 @@ public final class ScalarFunctionAdapter {
         this.evalHandleBound = evalHandle.bindTo(udf);
         this.evalHandleSpreader = evalHandleBound.asSpreader(Object[].class, argCount);
 
-        this.rowClass = loadRowClass();
-        Method rowArityMethod = resolveRowMethod(rowClass, "getArity");
-        Method rowFieldMethod = resolveRowMethod(rowClass, "getField", int.class);
-        this.rowGetArityHandle = rowArityMethod == null ? null : lookup.unreflect(rowArityMethod);
-        this.rowGetFieldHandle = rowFieldMethod == null ? null : lookup.unreflect(rowFieldMethod);
-        this.rowGetFieldByNameMethod = resolveOptionalRowMethod(rowClass, "getField", String.class);
-        this.rowGetFieldNamesMethod = resolveOptionalRowMethod(rowClass, "getFieldNames");
-        this.rowGetFieldIndexMethod = resolveOptionalRowMethod(rowClass, "getFieldIndex", String.class);
-        this.rowReturn = rowClass != null && rowClass.isAssignableFrom(resolvedEval.getReturnType());
     }
 
     public void evalBatch(String[] values) throws Exception {
@@ -158,8 +138,8 @@ public final class ScalarFunctionAdapter {
 
         int rowCount = validateColumns(columns);
         Object[] args = new Object[argCount];
-        int outputArity = -1;
-        String[][] out = null;
+        int outputArity = 1;
+        String[][] out = new String[outputArity][rowCount];
 
         for (int row = 0; row < rowCount; row++) {
             for (int arg = 0; arg < argCount; arg++) {
@@ -167,34 +147,7 @@ public final class ScalarFunctionAdapter {
                 args[arg] = parsers[arg].parse(value);
             }
             Object result = invokeEval(args);
-            if (rowReturn) {
-                if (result == null) {
-                    continue;
-                }
-                int arity = rowArity(result);
-                if (outputArity < 0) {
-                    outputArity = arity;
-                    out = new String[outputArity][rowCount];
-                } else if (arity != outputArity) {
-                    throw new IllegalStateException(
-                            "Inconsistent output arity: expected " + outputArity + " but got " + arity);
-                }
-                for (int col = 0; col < outputArity; col++) {
-                    Object value = rowField(result, col);
-                    out[col][row] = value == null ? null : value.toString();
-                }
-            } else {
-                if (outputArity < 0) {
-                    outputArity = 1;
-                    out = new String[1][rowCount];
-                }
-                out[0][row] = result == null ? null : result.toString();
-            }
-        }
-
-        if (out == null) {
-            outputArity = rowReturn ? argCount : 1;
-            out = new String[outputArity][rowCount];
+            out[0][row] = result == null ? null : result.toString();
         }
         return out;
     }
@@ -207,42 +160,15 @@ public final class ScalarFunctionAdapter {
         int rowCount = validateTypedColumns(columns, nulls);
         ColumnReader[] readers = buildReaders(columns, nulls);
         Object[] args = new Object[argCount];
-        int outputArity = -1;
-        String[][] out = null;
+        int outputArity = 1;
+        String[][] out = new String[outputArity][rowCount];
 
         for (int row = 0; row < rowCount; row++) {
             for (int arg = 0; arg < argCount; arg++) {
                 args[arg] = readers[arg].get(row);
             }
             Object result = invokeEval(args);
-            if (rowReturn) {
-                if (result == null) {
-                    continue;
-                }
-                int arity = rowArity(result);
-                if (outputArity < 0) {
-                    outputArity = arity;
-                    out = new String[outputArity][rowCount];
-                } else if (arity != outputArity) {
-                    throw new IllegalStateException(
-                            "Inconsistent output arity: expected " + outputArity + " but got " + arity);
-                }
-                for (int col = 0; col < outputArity; col++) {
-                    Object value = rowField(result, col);
-                    out[col][row] = value == null ? null : value.toString();
-                }
-            } else {
-                if (outputArity < 0) {
-                    outputArity = 1;
-                    out = new String[1][rowCount];
-                }
-                out[0][row] = result == null ? null : result.toString();
-            }
-        }
-
-        if (out == null) {
-            outputArity = rowReturn ? argCount : 1;
-            out = new String[outputArity][rowCount];
+            out[0][row] = result == null ? null : result.toString();
         }
         return out;
     }
@@ -256,12 +182,14 @@ public final class ScalarFunctionAdapter {
         int rowCount = validateTypedColumns(columns, nulls);
         ColumnReader[] readers = buildReaders(columns, nulls);
         Object[] args = new Object[argCount];
-        int outputArity = -1;
-        Object[] out = null;
-        boolean[][] outNulls = null;
-        List<Integer> pendingNullRows = new ArrayList<>();
 
-        if (!rowReturn && argCount == 1) {
+        Class<?> returnType = evalMethod.getReturnType();
+        if (!isScalarReturnType(returnType)) {
+            throw new IllegalArgumentException(
+                    "POJO return requires named output mapping (use evalBatchFastNamed)");
+        }
+
+        if (argCount == 1) {
             Object outputArray = allocateOutputArray(evalMethod.getReturnType(), rowCount);
             Object[] outputColumns = new Object[] { outputArray };
             boolean[][] outputNulls = new boolean[1][rowCount];
@@ -278,76 +206,24 @@ public final class ScalarFunctionAdapter {
             return new ColumnarResult(outputColumns, outputNulls);
         }
 
+        Object[] out = new Object[] { null };
+        boolean[][] outNulls = new boolean[1][rowCount];
+
         for (int row = 0; row < rowCount; row++) {
             for (int arg = 0; arg < argCount; arg++) {
                 args[arg] = readers[arg].get(row);
             }
             Object result = invokeEval(args);
-            if (rowReturn) {
-                if (result == null) {
-                    if (outputArity > 0) {
-                        for (int col = 0; col < outputArity; col++) {
-                            outNulls[col][row] = true;
-                        }
-                    } else {
-                        pendingNullRows.add(row);
-                    }
-                    continue;
-                }
-                int arity = rowArity(result);
-                if (outputArity < 0) {
-                    outputArity = arity;
-                    out = new Object[outputArity];
-                    outNulls = new boolean[outputArity][rowCount];
-                    for (int pendingRow : pendingNullRows) {
-                        for (int col = 0; col < outputArity; col++) {
-                            outNulls[col][pendingRow] = true;
-                        }
-                    }
-                    pendingNullRows.clear();
-                } else if (arity != outputArity) {
-                    throw new IllegalStateException(
-                            "Inconsistent output arity: expected " + outputArity + " but got " + arity);
-                }
-                for (int col = 0; col < outputArity; col++) {
-                    Object value = rowField(result, col);
-                    if (value == null) {
-                        outNulls[col][row] = true;
-                        continue;
-                    }
-                    out[col] = ensureOutputArray(out[col], value, rowCount);
-                    writeOutputValue(out[col], value, row);
-                }
-            } else {
-                if (outputArity < 0) {
-                    outputArity = 1;
-                    out = new Object[1];
-                    outNulls = new boolean[1][rowCount];
-                }
-                if (result == null) {
-                    outNulls[0][row] = true;
-                    continue;
-                }
-                out[0] = ensureOutputArray(out[0], result, rowCount);
-                writeOutputValue(out[0], result, row);
+            if (result == null) {
+                outNulls[0][row] = true;
+                continue;
             }
+            out[0] = ensureOutputArray(out[0], result, rowCount);
+            writeOutputValue(out[0], result, row);
         }
 
-        if (out == null) {
-            outputArity = rowReturn ? argCount : 1;
-            out = new Object[outputArity];
-            outNulls = new boolean[outputArity][rowCount];
-            for (int row = 0; row < rowCount; row++) {
-                for (int col = 0; col < outputArity; col++) {
-                    outNulls[col][row] = true;
-                }
-            }
-        }
-
-        for (int col = 0; col < out.length; col++) {
-            if (out[col] == null) {
-                out[col] = new String[rowCount];
-            }
+        if (out[0] == null) {
+            out[0] = new String[rowCount];
         }
 
         return new ColumnarResult(out, outNulls);
@@ -358,7 +234,7 @@ public final class ScalarFunctionAdapter {
             return new ColumnarResult(new Object[0], new boolean[0][0]);
         }
 
-        if (argCount == 1 && !rowReturn && columns[0] instanceof byte[]) {
+        if (argCount == 1 && columns[0] instanceof byte[]) {
             int rowCount = validateTypedColumns(columns, nulls);
             byte[] values = (byte[]) columns[0];
             boolean[] isNull = nulls != null && nulls.length > 0 ? nulls[0] : null;
@@ -407,10 +283,6 @@ public final class ScalarFunctionAdapter {
             return evalBatchFast(columns, nulls);
         }
 
-        if (rowReturn) {
-            return evalBatchFastNamedRow(columns, nulls, outputNames);
-        }
-
         Class<?> returnType = evalMethod.getReturnType();
         if (isScalarReturnType(returnType) && outputNames.length == 1) {
             return evalBatchFast(columns, nulls);
@@ -424,66 +296,6 @@ public final class ScalarFunctionAdapter {
             boolean[][] nulls,
             String[] outputNames) throws Exception {
         return evalBatchFastNamed(columns, nulls, outputNames);
-    }
-
-    private ColumnarResult evalBatchFastNamedRow(
-            Object[] columns,
-            boolean[][] nulls,
-            String[] outputNames) throws Exception {
-        int rowCount = validateTypedColumns(columns, nulls);
-        ColumnReader[] readers = buildReaders(columns, nulls);
-        Object[] args = new Object[argCount];
-        int outputArity = outputNames.length;
-        Object[] out = new Object[outputArity];
-        boolean[][] outNulls = new boolean[outputArity][rowCount];
-        int[] nameToIndex = null;
-        int rowArity = -1;
-
-        for (int row = 0; row < rowCount; row++) {
-            for (int arg = 0; arg < argCount; arg++) {
-                args[arg] = readers[arg].get(row);
-            }
-            Object result = invokeEval(args);
-            if (result == null) {
-                for (int col = 0; col < outputArity; col++) {
-                    outNulls[col][row] = true;
-                }
-                continue;
-            }
-
-            if (rowGetFieldByNameMethod == null && nameToIndex == null) {
-                rowArity = rowArity(result);
-                nameToIndex = mapOutputNamesToRowIndices(result, outputNames, rowArity);
-            }
-
-            for (int col = 0; col < outputArity; col++) {
-                Object value;
-                if (rowGetFieldByNameMethod != null) {
-                    value = rowGetFieldByNameMethod.invoke(result, outputNames[col]);
-                } else {
-                    int idx = nameToIndex[col];
-                    if (rowArity >= 0 && idx >= rowArity) {
-                        throw new IllegalArgumentException(
-                                "Row output index " + idx + " out of bounds for arity " + rowArity);
-                    }
-                    value = rowField(result, idx);
-                }
-                if (value == null) {
-                    outNulls[col][row] = true;
-                    continue;
-                }
-                out[col] = ensureOutputArray(out[col], value, rowCount);
-                writeOutputValue(out[col], value, row);
-            }
-        }
-
-        for (int col = 0; col < out.length; col++) {
-            if (out[col] == null) {
-                out[col] = new String[rowCount];
-            }
-        }
-
-        return new ColumnarResult(out, outNulls);
     }
 
     private ColumnarResult evalBatchFastNamedPojo(
@@ -963,119 +775,6 @@ public final class ScalarFunctionAdapter {
             }
             throw new Exception("Failed to invoke eval method", t);
         }
-    }
-
-    private int rowArity(Object row) throws Exception {
-        if (rowGetArityHandle == null) {
-            return 0;
-        }
-        try {
-            return (int) rowGetArityHandle.invoke(row);
-        } catch (Throwable t) {
-            if (t instanceof Exception) {
-                throw (Exception) t;
-            }
-            throw new Exception("Failed to read Row arity", t);
-        }
-    }
-
-    private Object rowField(Object row, int index) throws Exception {
-        if (rowGetFieldHandle == null) {
-            return null;
-        }
-        try {
-            return rowGetFieldHandle.invoke(row, index);
-        } catch (Throwable t) {
-            if (t instanceof Exception) {
-                throw (Exception) t;
-            }
-            throw new Exception("Failed to read Row field", t);
-        }
-    }
-
-    private static Class<?> loadRowClass() {
-        try {
-            return Class.forName(ROW_CLASS_NAME);
-        } catch (ClassNotFoundException ignored) {
-            return null;
-        }
-    }
-
-    private static Method resolveRowMethod(Class<?> rowClass, String name, Class<?>... params)
-            throws Exception {
-        if (rowClass == null) {
-            return null;
-        }
-        Method method = rowClass.getMethod(name, params);
-        method.setAccessible(true);
-        return method;
-    }
-
-    private static Method resolveOptionalRowMethod(Class<?> rowClass, String name, Class<?>... params) {
-        if (rowClass == null) {
-            return null;
-        }
-        try {
-            Method method = rowClass.getMethod(name, params);
-            method.setAccessible(true);
-            return method;
-        } catch (NoSuchMethodException ignored) {
-            return null;
-        }
-    }
-
-    private int[] mapOutputNamesToRowIndices(Object row, String[] outputNames, int rowArity)
-            throws Exception {
-        if (rowGetFieldNamesMethod != null) {
-            Object namesObj = rowGetFieldNamesMethod.invoke(row);
-            if (namesObj instanceof String[]) {
-                String[] fieldNames = (String[]) namesObj;
-                Map<String, Integer> nameToIndex = new HashMap<>();
-                for (int i = 0; i < fieldNames.length; i++) {
-                    nameToIndex.put(normalizeName(fieldNames[i]), i);
-                }
-                int[] indices = new int[outputNames.length];
-                for (int i = 0; i < outputNames.length; i++) {
-                    Integer idx = nameToIndex.get(normalizeName(outputNames[i]));
-                    if (idx == null) {
-                        throw new IllegalArgumentException(
-                                "Row output missing field " + outputNames[i]);
-                    }
-                    indices[i] = idx;
-                }
-                return indices;
-            }
-        }
-
-        if (rowGetFieldIndexMethod != null) {
-            int[] indices = new int[outputNames.length];
-            for (int i = 0; i < outputNames.length; i++) {
-                Object idxObj = rowGetFieldIndexMethod.invoke(row, outputNames[i]);
-                if (idxObj instanceof Number) {
-                    indices[i] = ((Number) idxObj).intValue();
-                } else {
-                    throw new IllegalArgumentException(
-                            "Row getFieldIndex returned non-numeric value for " + outputNames[i]);
-                }
-            }
-            return indices;
-        }
-
-        if (!warnedRowNameFallback) {
-            warnedRowNameFallback = true;
-            System.err.println(
-                    "Row output does not expose field names; falling back to positional mapping.");
-        }
-        if (rowArity >= 0 && outputNames.length > rowArity) {
-            throw new IllegalArgumentException(
-                    "Row output arity " + rowArity + " is smaller than output names length "
-                            + outputNames.length);
-        }
-        int[] indices = new int[outputNames.length];
-        for (int i = 0; i < outputNames.length; i++) {
-            indices[i] = i;
-        }
-        return indices;
     }
 
     private OutputAccessor[] buildPojoAccessors(Class<?> returnType, String[] outputNames)

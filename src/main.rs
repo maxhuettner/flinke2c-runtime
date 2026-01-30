@@ -144,12 +144,28 @@ struct SessionConfig {
     pre_name_to_pos: std::collections::HashMap<String, usize>,
     post_fields: Vec<FieldSpec>,
     post_field_positions: Vec<usize>,
+    post_field_sources: Vec<PostFieldSource>,
+    passthrough_identity: bool,
     arg_positions: Vec<usize>,
     arg_names: Vec<String>,
     arg_types: Vec<FieldType>,
     output_positions: Vec<usize>,
     output_names: Vec<String>,
     output_types: Vec<FieldType>,
+}
+
+#[derive(Clone, Debug)]
+enum PostFieldSourceKind {
+    Op,
+    RowId,
+    InputPos(usize),
+    Output,
+}
+
+#[derive(Clone, Debug)]
+struct PostFieldSource {
+    pos: usize,
+    kind: PostFieldSourceKind,
 }
 
 fn main() -> Result<()> {
@@ -336,6 +352,39 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
         output_types.push(output_type);
     }
 
+    let output_name_set: HashSet<&str> = output_names.iter().map(|s| s.as_str()).collect();
+    let mut post_field_sources = Vec::with_capacity(pre_cfg.post_fields.len());
+    let mut passthrough_identity = true;
+    for (idx, field) in pre_cfg.post_fields.iter().enumerate() {
+        let pos = post_field_positions[idx];
+        let kind = if field.name == "__op" {
+            if pos != 0 {
+                passthrough_identity = false;
+            }
+            PostFieldSourceKind::Op
+        } else if field.name == "__rowId" {
+            if !reorder_responses || pos != 1 {
+                passthrough_identity = false;
+            }
+            PostFieldSourceKind::RowId
+        } else if let Some(pre_pos) = pre_name_to_pos.get(&field.name).copied() {
+            if pre_pos != pos {
+                passthrough_identity = false;
+            }
+            PostFieldSourceKind::InputPos(pre_pos)
+        } else if output_name_set.contains(field.name.as_str()) {
+            passthrough_identity = false;
+            PostFieldSourceKind::Output
+        } else {
+            bail!("postField {} not found in preFields", field.name);
+        };
+        post_field_sources.push(PostFieldSource { pos, kind });
+    }
+
+    if expected_input_len != output_row_len {
+        passthrough_identity = false;
+    }
+
     Ok(SessionConfig {
         reorder_responses,
         expected_input_len,
@@ -343,6 +392,8 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
         pre_name_to_pos,
         post_fields: pre_cfg.post_fields.clone(),
         post_field_positions,
+        post_field_sources,
+        passthrough_identity,
         arg_positions,
         arg_names,
         arg_types,
@@ -819,47 +870,51 @@ fn apply_udf_to_rows(
         let source_row = rows
             .get(row_idx)
             .context("missing source row")?;
-        let mut out_row = vec![Value::Nil; session.output_row_len];
 
-        if let Some(op) = source_row.get(0) {
-            out_row[0] = op.clone();
-        }
-        if session.reorder_responses {
-            if let Some(row_id) = source_row.get(1) {
-                if session.output_row_len > 1 {
-                    out_row[1] = row_id.clone();
+        let mut out_row = if session.passthrough_identity
+            && source_row.len() == session.output_row_len
+        {
+            source_row.clone()
+        } else {
+            let mut row = vec![Value::Nil; session.output_row_len];
+            if let Some(op) = source_row.get(0) {
+                row[0] = op.clone();
+            }
+            if session.reorder_responses {
+                if let Some(row_id) = source_row.get(1) {
+                    if session.output_row_len > 1 {
+                        row[1] = row_id.clone();
+                    }
                 }
             }
-        }
 
-        let output_name_set: HashSet<&str> = session
-            .output_names
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        for (idx, field) in session.post_fields.iter().enumerate() {
-            let pos = session.post_field_positions[idx];
-            if field.name == "__op" {
-                out_row[pos] = out_row[0].clone();
-                continue;
-            }
-            if field.name == "__rowId" {
-                if session.reorder_responses && session.output_row_len > 1 {
-                    out_row[pos] = out_row[1].clone();
+            for source in &session.post_field_sources {
+                match source.kind {
+                    PostFieldSourceKind::Op => {
+                        if source.pos < row.len() {
+                            row[source.pos] = row[0].clone();
+                        }
+                    }
+                    PostFieldSourceKind::RowId => {
+                        if session.reorder_responses && source.pos < row.len() {
+                            let row_id = row.get(1).cloned().unwrap_or(Value::Nil);
+                            row[source.pos] = row_id;
+                        }
+                    }
+                    PostFieldSourceKind::InputPos(pre_pos) => {
+                        if source.pos < row.len() {
+                            row[source.pos] = source_row
+                                .get(pre_pos)
+                                .cloned()
+                                .unwrap_or(Value::Nil);
+                        }
+                    }
+                    PostFieldSourceKind::Output => {}
                 }
-                continue;
             }
-            if let Some(pre_pos) = session.pre_name_to_pos.get(&field.name).copied() {
-                out_row[pos] = source_row
-                    .get(pre_pos)
-                    .cloned()
-                    .unwrap_or(Value::Nil);
-                continue;
-            }
-            if !output_name_set.contains(field.name.as_str()) {
-                bail!("postField {} not found in preFields", field.name);
-            }
-        }
+
+            row
+        };
 
         if output_columns.len() < session.output_positions.len() {
             bail!(

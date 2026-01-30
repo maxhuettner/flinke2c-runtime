@@ -15,10 +15,13 @@ use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, TimeUnit};
 use clap::Parser;
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use rmpv::decode as msgpack_decode;
+use rmpv::encode as msgpack_encode;
+use rmpv::{Utf8String, Value};
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
@@ -36,6 +39,8 @@ struct Args {
 
     #[arg(long, default_value = "262144")]
     buf_size: usize,
+    #[arg(long, default_value_t = 1024)]
+    batch_size: usize,
     #[arg(long, default_value_t = num_cpus::get())]
     workers: usize,
     #[arg(long, default_value_t = 0)]
@@ -85,6 +90,46 @@ struct ConfigMessage {
     function_args: Vec<FunctionArg>,
     #[serde(default)]
     function_results: Vec<FunctionResult>,
+    #[serde(default)]
+    reorder_responses: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FieldType {
+    String,
+    Boolean,
+    Int64,
+    Int32,
+    Int16,
+    Int8,
+    Float64,
+    Float32,
+    Decimal { precision: Option<u8>, scale: i8 },
+    Timestamp { unit: TimeUnit },
+    Date,
+    Unknown(String),
+}
+
+impl FieldType {
+    fn decimal_scale(&self) -> Option<i8> {
+        match self {
+            FieldType::Decimal { scale, .. } => Some(*scale),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SessionConfig {
+    reorder_responses: bool,
+    arg_positions: Vec<usize>,
+    arg_names: Vec<String>,
+    arg_types: Vec<FieldType>,
+    output_positions: Vec<usize>,
+    output_names: Vec<String>,
+    output_types: Vec<FieldType>,
+    expected_input_len: usize,
+    output_row_len: usize,
 }
 
 fn main() -> Result<()> {
@@ -174,6 +219,56 @@ fn accept_pair(
     Ok((pre_stream, pre_cfg, post_stream, post_cfg))
 }
 
+fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
+    let reorder_responses = pre_cfg.reorder_responses;
+    let arg_offset = if reorder_responses { 2 } else { 1 };
+
+    let mut arg_positions = Vec::with_capacity(pre_cfg.function_args.len());
+    let mut arg_names = Vec::with_capacity(pre_cfg.function_args.len());
+    let mut arg_types = Vec::with_capacity(pre_cfg.function_args.len());
+    for (idx, arg) in pre_cfg.function_args.iter().enumerate() {
+        let pos = arg_offset + idx;
+        arg_positions.push(pos);
+        arg_names.push(arg.name.clone());
+        arg_types.push(parse_field_type(&arg.arg_type));
+    }
+
+    let mut output_positions = Vec::with_capacity(pre_cfg.function_results.len());
+    let mut output_names = Vec::with_capacity(pre_cfg.function_results.len());
+    let mut output_types = Vec::with_capacity(pre_cfg.function_results.len());
+    for (idx, result) in pre_cfg.function_results.iter().enumerate() {
+        let pos = arg_offset + idx;
+        output_positions.push(pos);
+        output_names.push(result.output_name.clone());
+        let output_type = result
+            .output_type
+            .as_deref()
+            .map(parse_field_type)
+            .with_context(|| {
+                format!(
+                    "functionResult outputType missing for {}",
+                    result.output_name
+                )
+            })?;
+        output_types.push(output_type);
+    }
+
+    let expected_input_len = arg_offset + pre_cfg.function_args.len();
+    let output_row_len = arg_offset + pre_cfg.function_results.len();
+
+    Ok(SessionConfig {
+        reorder_responses,
+        arg_positions,
+        arg_names,
+        arg_types,
+        output_positions,
+        output_names,
+        output_types,
+        expected_input_len,
+        output_row_len,
+    })
+}
+
 fn run_session(
     pre: TcpStream,
     pre_cfg: ConfigMessage,
@@ -202,6 +297,20 @@ fn run_session(
         post_cfg.function_args.len(),
         post_cfg.function_results.len()
     );
+
+    let session_cfg = build_session_config(&pre_cfg)?;
+    println!(
+        "Resolved {} UDF args at positions {:?}",
+        session_cfg.arg_positions.len(),
+        session_cfg.arg_positions
+    );
+    if !session_cfg.output_positions.is_empty() {
+        println!(
+            "Resolved {} UDF results at positions {:?}",
+            session_cfg.output_positions.len(),
+            session_cfg.output_positions
+        );
+    }
 
     let desired_udf_class = pre_cfg
         .function_class
@@ -236,36 +345,6 @@ fn run_session(
         *current_udf_types = Some(desired_udf_types);
     }
 
-    let mut out = BufWriter::with_capacity(args.buf_size, post);
-    let reader = StreamReader::try_new(pre, None).context("create Arrow IPC reader")?;
-    let schema = reader.schema();
-    let arg_indices = resolve_function_arg_indices(schema.as_ref(), &pre_cfg)?;
-    println!("Resolved {} UDF args at indices {:?}", arg_indices.len(), arg_indices);
-    let result_indices = resolve_function_result_indices(schema.as_ref(), &pre_cfg)?;
-    if let Some(indices) = &result_indices {
-        println!(
-            "Resolved {} UDF results at indices {:?}",
-            indices.len(),
-            indices
-        );
-    }
-    let result_names: Option<Vec<String>> = if pre_cfg.function_results.is_empty() {
-        None
-    } else {
-        Some(
-            pre_cfg
-                .function_results
-                .iter()
-                .map(|result| result.output_name.clone())
-                .collect(),
-        )
-    };
-    let arg_names: Vec<String> = pre_cfg
-        .function_args
-        .iter()
-        .map(|arg| arg.name.clone())
-        .collect();
-
     let worker_count = args.workers.max(1);
     if worker_count == 1 {
         if class_changed || types_changed || udf.is_none() {
@@ -295,29 +374,48 @@ fn run_session(
         }
 
         let mut debug_batches_remaining = args.debug_sample_batches;
-        let mut writer =
-            StreamWriter::try_new(&mut out, schema.as_ref()).context("create Arrow IPC writer")?;
+        let mut reader = BufReader::with_capacity(args.buf_size, pre);
+        let mut writer = BufWriter::with_capacity(args.buf_size, post);
+        let batch_size = args.batch_size.max(1);
+        let mut batch_rows: Vec<Vec<Value>> = Vec::with_capacity(batch_size);
 
-        for maybe_batch in reader {
-            let batch = maybe_batch.context("read Arrow record batch")?;
-            let new_batch = apply_udf_to_batch(
-                &batch,
-                schema.as_ref(),
-                &arg_indices,
-                &arg_names,
-                result_indices.as_deref(),
-                result_names.as_deref(),
+        loop {
+            match read_msgpack_row(&mut reader)? {
+                Some(row) => {
+                    validate_row_len(&row, session_cfg.expected_input_len)?;
+                    batch_rows.push(row);
+                    if batch_rows.len() >= batch_size {
+                        let out_rows = apply_udf_to_rows(
+                            &batch_rows,
+                            &session_cfg,
+                            udf_handle,
+                            &args.udf_method,
+                            args.debug_sample_rows,
+                            &mut debug_batches_remaining,
+                        )?;
+                        write_msgpack_rows(&mut writer, &out_rows)?;
+                        writer.flush().ok();
+                        batch_rows.clear();
+                    }
+                }
+                None => break,
+            }
+        }
+
+        if !batch_rows.is_empty() {
+            let out_rows = apply_udf_to_rows(
+                &batch_rows,
+                &session_cfg,
                 udf_handle,
                 &args.udf_method,
                 args.debug_sample_rows,
                 &mut debug_batches_remaining,
             )?;
-            writer.write(&new_batch).context("write Arrow record batch")?;
+            write_msgpack_rows(&mut writer, &out_rows)?;
+            writer.flush().ok();
         }
 
-        writer.finish().context("finish Arrow IPC writer")?;
-        drop(writer);
-        out.flush().ok();
+        writer.flush().ok();
         return Ok(());
     }
 
@@ -341,11 +439,7 @@ fn run_session(
         senders.push(tx);
 
         let result_tx = result_tx.clone();
-        let schema = Arc::clone(&schema);
-        let arg_indices = arg_indices.clone();
-        let arg_names = arg_names.clone();
-        let result_indices = result_indices.clone();
-        let result_names = result_names.clone();
+        let session_cfg = session_cfg.clone();
         let udf_jars = args.udf_jars.clone();
         let udf_adapter = args.udf_adapter_class.clone();
         let udf_method = args.udf_method.clone();
@@ -381,13 +475,9 @@ fn run_session(
                 let Some(work) = msg else {
                     break;
                 };
-                let result = apply_udf_to_batch(
-                    &work.batch,
-                    schema.as_ref(),
-                    &arg_indices,
-                    &arg_names,
-                    result_indices.as_deref(),
-                    result_names.as_deref(),
+                let result = apply_udf_to_rows(
+                    &work.rows,
+                    &session_cfg,
                     &udf_handle,
                     &udf_method,
                     0,
@@ -402,29 +492,27 @@ fn run_session(
     }
     drop(result_tx);
 
-    let schema_for_writer = Arc::clone(&schema);
     let inflight_writer = Arc::clone(&inflight);
+    let writer_buf_size = args.buf_size;
     let writer_handle = thread::spawn(move || -> Result<()> {
-        let mut writer =
-            StreamWriter::try_new(&mut out, schema_for_writer.as_ref())
-                .context("create Arrow IPC writer")?;
-        let mut pending: BTreeMap<usize, RecordBatch> = BTreeMap::new();
+        let mut writer = BufWriter::with_capacity(writer_buf_size, post);
+        let mut pending: BTreeMap<usize, Vec<Vec<Value>>> = BTreeMap::new();
         let mut next_seq = 0usize;
 
         while let Ok(work) = result_rx.recv() {
             let WorkResult { seq, result } = work;
-            let batch = result?;
+            let rows = result?;
             if seq == next_seq {
-                writer.write(&batch).context("write Arrow record batch")?;
+                write_msgpack_rows(&mut writer, &rows)?;
+                writer.flush().ok();
                 next_seq += 1;
-                while let Some(next_batch) = pending.remove(&next_seq) {
-                    writer
-                        .write(&next_batch)
-                        .context("write Arrow record batch")?;
+                while let Some(next_rows) = pending.remove(&next_seq) {
+                    write_msgpack_rows(&mut writer, &next_rows)?;
+                    writer.flush().ok();
                     next_seq += 1;
                 }
             } else {
-                pending.insert(seq, batch);
+                pending.insert(seq, rows);
             }
 
             let (lock, cvar) = &*inflight_writer;
@@ -437,16 +525,33 @@ fn run_session(
             bail!("writer ended with {} pending batches", pending.len());
         }
 
-        writer.finish().context("finish Arrow IPC writer")?;
-        drop(writer);
-        out.flush().ok();
+        writer.flush().ok();
         Ok(())
     });
 
     let mut dispatched = 0usize;
     let mut send_index = 0usize;
-    for maybe_batch in reader {
-        let batch = maybe_batch.context("read Arrow record batch")?;
+    let mut reader = BufReader::with_capacity(args.buf_size, pre);
+    let batch_size = args.batch_size.max(1);
+    let mut batch_rows: Vec<Vec<Value>> = Vec::with_capacity(batch_size);
+
+    loop {
+        match read_msgpack_row(&mut reader)? {
+            Some(row) => {
+                    validate_row_len(&row, session_cfg.expected_input_len)?;
+                    batch_rows.push(row);
+                    if batch_rows.len() < batch_size {
+                        continue;
+                    }
+            }
+            None => {
+                if batch_rows.is_empty() {
+                    break;
+                }
+            }
+        }
+
+        let rows = std::mem::take(&mut batch_rows);
         let (lock, cvar) = &*inflight;
         let mut count = lock.lock().expect("lock inflight");
         while *count >= max_in_flight {
@@ -457,7 +562,7 @@ fn run_session(
 
         let sender = &senders[send_index % senders.len()];
         sender
-            .send(Some(WorkItem { seq: dispatched, batch }))
+            .send(Some(WorkItem { seq: dispatched, rows }))
             .context("dispatch batch to worker")?;
         dispatched += 1;
         send_index += 1;
@@ -539,14 +644,801 @@ fn resolve_function_result_indices(
 
 struct WorkItem {
     seq: usize,
-    batch: RecordBatch,
+    rows: Vec<Vec<Value>>,
 }
 
 struct WorkResult {
     seq: usize,
-    result: Result<RecordBatch>,
+    result: Result<Vec<Vec<Value>>>,
 }
 
+fn read_msgpack_row<R: Read>(reader: &mut R) -> Result<Option<Vec<Value>>> {
+    match msgpack_decode::read_value(reader) {
+        Ok(value) => match value {
+            Value::Array(values) => Ok(Some(values)),
+            other => bail!("expected msgpack array row, got {:?}", other),
+        },
+        Err(err) => {
+            if is_msgpack_eof(&err) {
+                Ok(None)
+            } else {
+                Err(err.into())
+            }
+        }
+    }
+}
+
+fn is_msgpack_eof(err: &msgpack_decode::Error) -> bool {
+    match err {
+        msgpack_decode::Error::InvalidMarkerRead(inner)
+        | msgpack_decode::Error::InvalidDataRead(inner) => inner.kind() == ErrorKind::UnexpectedEof,
+        _ => false,
+    }
+}
+
+fn write_msgpack_rows<W: Write>(writer: &mut W, rows: &[Vec<Value>]) -> Result<()> {
+    for row in rows {
+        let value = Value::Array(row.clone());
+        msgpack_encode::write_value(writer, &value).context("write msgpack row")?;
+    }
+    Ok(())
+}
+
+fn validate_row_len(row: &[Value], expected_min: usize) -> Result<()> {
+    if row.len() < expected_min {
+        bail!(
+            "msgpack row has {} values but expected at least {}",
+            row.len(),
+            expected_min
+        );
+    }
+    Ok(())
+}
+
+fn apply_udf_to_rows(
+    rows: &[Vec<Value>],
+    session: &SessionConfig,
+    udf: &UdfHandle,
+    method: &str,
+    debug_sample_rows: usize,
+    debug_batches_remaining: &mut usize,
+) -> Result<Vec<Vec<Value>>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let input_columns = build_input_columns(rows, &session.arg_positions, &session.arg_types)?;
+    let output_columns = call_udf_to_columns(udf, method, &input_columns)?;
+
+    let mut out_rows = Vec::with_capacity(rows.len());
+    for row_idx in 0..rows.len() {
+        let mut out_row = vec![Value::Nil; session.output_row_len];
+        if let Some(source_row) = rows.get(row_idx) {
+            if let Some(op) = source_row.get(0) {
+                out_row[0] = op.clone();
+            }
+            if session.reorder_responses {
+                if let Some(row_id) = source_row.get(1) {
+                    if session.output_row_len > 1 {
+                        out_row[1] = row_id.clone();
+                    }
+                }
+            }
+        }
+
+        if output_columns.len() != session.output_positions.len() {
+            bail!(
+                "UDF returned {} columns but functionResults resolved {} targets",
+                output_columns.len(),
+                session.output_positions.len()
+            );
+        }
+
+        for (idx, pos) in session.output_positions.iter().enumerate() {
+            if *pos >= out_row.len() {
+                bail!("functionResult outputIndex {} is out of range", pos);
+            }
+            let value = output_column_to_value(
+                &output_columns[idx],
+                row_idx,
+                session
+                    .output_types
+                    .get(idx)
+                    .unwrap_or(&FieldType::String),
+            )?;
+            out_row[*pos] = value;
+        }
+        out_rows.push(out_row);
+    }
+
+    maybe_print_debug_rows(
+        rows,
+        session,
+        &out_rows,
+        debug_sample_rows,
+        debug_batches_remaining,
+    );
+
+    Ok(out_rows)
+}
+
+fn build_input_columns(
+    rows: &[Vec<Value>],
+    arg_positions: &[usize],
+    arg_types: &[FieldType],
+) -> Result<Vec<InputColumn>> {
+    let mut columns = Vec::with_capacity(arg_positions.len());
+    for (idx, arg_index) in arg_positions.iter().enumerate() {
+        let target_type = arg_types
+            .get(idx)
+            .with_context(|| format!("missing arg type at {}", idx))?;
+        let column = build_input_column(rows, *arg_index, target_type)?;
+        columns.push(column);
+    }
+    Ok(columns)
+}
+
+fn build_input_column(
+    rows: &[Vec<Value>],
+    index: usize,
+    target_type: &FieldType,
+) -> Result<InputColumn> {
+    match target_type {
+        FieldType::String | FieldType::Unknown(_) => {
+            let mut values = Vec::with_capacity(rows.len());
+            for row in rows {
+                let value = row.get(index).unwrap_or(&Value::Nil);
+                if matches!(value, Value::Nil) {
+                    values.push(None);
+                } else {
+                    values.push(Some(value_to_string(value)?));
+                }
+            }
+            Ok(InputColumn::String(values))
+        }
+        FieldType::Boolean => {
+            let mut values = Vec::with_capacity(rows.len());
+            let mut nulls: Option<Vec<bool>> = None;
+            for row in rows {
+                let value = row.get(index).unwrap_or(&Value::Nil);
+                let prev_len = values.len();
+                if matches!(value, Value::Nil) {
+                    values.push(false);
+                    push_null(&mut nulls, prev_len, true);
+                } else {
+                    values.push(value_to_bool(value)?);
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(false);
+                    }
+                }
+            }
+            Ok(InputColumn::Bool { values, is_null: nulls })
+        }
+        FieldType::Int64 | FieldType::Timestamp { .. } | FieldType::Date => {
+            let mut values = Vec::with_capacity(rows.len());
+            let mut nulls: Option<Vec<bool>> = None;
+            for row in rows {
+                let value = row.get(index).unwrap_or(&Value::Nil);
+                let prev_len = values.len();
+                if matches!(value, Value::Nil) {
+                    values.push(0);
+                    push_null(&mut nulls, prev_len, true);
+                } else {
+                    let parsed = match target_type {
+                        FieldType::Timestamp { unit } => value_to_timestamp_millis(value, unit)?,
+                        FieldType::Date => value_to_date_millis(value)?,
+                        _ => value_to_i64(value)?,
+                    };
+                    values.push(parsed);
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(false);
+                    }
+                }
+            }
+            Ok(InputColumn::I64 { values, is_null: nulls })
+        }
+        FieldType::Int32 | FieldType::Int16 | FieldType::Int8 => {
+            let mut values = Vec::with_capacity(rows.len());
+            let mut nulls: Option<Vec<bool>> = None;
+            for row in rows {
+                let value = row.get(index).unwrap_or(&Value::Nil);
+                let prev_len = values.len();
+                if matches!(value, Value::Nil) {
+                    values.push(0);
+                    push_null(&mut nulls, prev_len, true);
+                } else {
+                    let parsed = value_to_i64(value)?;
+                    let casted = i32::try_from(parsed)
+                        .map_err(|_| anyhow::anyhow!("value {} overflows i32", parsed))?;
+                    values.push(casted);
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(false);
+                    }
+                }
+            }
+            Ok(InputColumn::I32 { values, is_null: nulls })
+        }
+        FieldType::Float64 => {
+            let mut values = Vec::with_capacity(rows.len());
+            let mut nulls: Option<Vec<bool>> = None;
+            for row in rows {
+                let value = row.get(index).unwrap_or(&Value::Nil);
+                let prev_len = values.len();
+                if matches!(value, Value::Nil) {
+                    values.push(0.0);
+                    push_null(&mut nulls, prev_len, true);
+                } else {
+                    values.push(value_to_f64(value)?);
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(false);
+                    }
+                }
+            }
+            Ok(InputColumn::F64 { values, is_null: nulls })
+        }
+        FieldType::Float32 => {
+            let mut values = Vec::with_capacity(rows.len());
+            let mut nulls: Option<Vec<bool>> = None;
+            for row in rows {
+                let value = row.get(index).unwrap_or(&Value::Nil);
+                let prev_len = values.len();
+                if matches!(value, Value::Nil) {
+                    values.push(0.0);
+                    push_null(&mut nulls, prev_len, true);
+                } else {
+                    values.push(value_to_f64(value)? as f32);
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(false);
+                    }
+                }
+            }
+            Ok(InputColumn::F32 { values, is_null: nulls })
+        }
+        FieldType::Decimal { scale, .. } => {
+            let mut values = Vec::with_capacity(rows.len());
+            let mut nulls: Option<Vec<bool>> = None;
+            for row in rows {
+                let value = row.get(index).unwrap_or(&Value::Nil);
+                let prev_len = values.len();
+                if matches!(value, Value::Nil) {
+                    values.push(0);
+                    push_null(&mut nulls, prev_len, true);
+                } else {
+                    values.push(value_to_decimal_i128(value, *scale)?);
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.push(false);
+                    }
+                }
+            }
+            Ok(InputColumn::Decimal128 { values, is_null: nulls })
+        }
+    }
+}
+
+fn push_null(nulls: &mut Option<Vec<bool>>, previous_len: usize, is_null: bool) {
+    if let Some(nulls) = nulls.as_mut() {
+        nulls.push(is_null);
+        return;
+    }
+    if is_null {
+        let mut vec = vec![false; previous_len];
+        vec.push(true);
+        *nulls = Some(vec);
+    }
+}
+
+fn input_column_to_value(
+    column: &InputColumn,
+    row: usize,
+    source_type: &FieldType,
+    target_type: &FieldType,
+) -> Result<Value> {
+    if column_is_null(column, row) {
+        return Ok(Value::Nil);
+    }
+
+    match target_type {
+        FieldType::String | FieldType::Unknown(_) => {
+            let s = input_column_to_string(column, row, source_type)?;
+            Ok(Value::String(Utf8String::from(s)))
+        }
+        FieldType::Boolean => Ok(Value::Boolean(input_column_to_bool(
+            column, row, source_type,
+        )?)),
+        FieldType::Int64 => {
+            let v = input_column_to_i64(column, row, source_type)?;
+            Ok(Value::Integer(v.into()))
+        }
+        FieldType::Int32 | FieldType::Int16 | FieldType::Int8 => {
+            let v = input_column_to_i64(column, row, source_type)?;
+            let casted = match target_type {
+                FieldType::Int32 => i32::try_from(v).map(|v| v as i64),
+                FieldType::Int16 => i16::try_from(v).map(|v| v as i64),
+                FieldType::Int8 => i8::try_from(v).map(|v| v as i64),
+                _ => Ok(v),
+            }
+            .map_err(|_| anyhow::anyhow!("value {} overflows target int", v))?;
+            Ok(Value::Integer(casted.into()))
+        }
+        FieldType::Float64 => {
+            let v = input_column_to_f64(column, row, source_type)?;
+            Ok(Value::F64(v))
+        }
+        FieldType::Float32 => {
+            let v = input_column_to_f64(column, row, source_type)?;
+            Ok(Value::F32(v as f32))
+        }
+        FieldType::Decimal { scale, .. } => {
+            let mut value = input_column_to_decimal(column, row, source_type)?;
+            let source_scale = source_type.decimal_scale().unwrap_or(0);
+            if source_scale != *scale {
+                value = convert_decimal_scale(value, source_scale, *scale)?;
+            }
+            let s = decimal_to_string(value, *scale);
+            Ok(Value::String(Utf8String::from(s)))
+        }
+        FieldType::Timestamp { unit } => {
+            let millis = input_column_to_i64(column, row, source_type)?;
+            let value = timestamp_from_millis(millis, unit)?;
+            Ok(Value::Integer(value.into()))
+        }
+        FieldType::Date => {
+            let millis = input_column_to_i64(column, row, source_type)?;
+            Ok(Value::Integer(millis.into()))
+        }
+    }
+}
+
+fn output_column_to_value(
+    column: &InputColumn,
+    row: usize,
+    output_type: &FieldType,
+) -> Result<Value> {
+    let source_type = infer_source_type(column, output_type);
+    input_column_to_value(column, row, &source_type, output_type)
+}
+
+fn infer_source_type(column: &InputColumn, output_type: &FieldType) -> FieldType {
+    match column {
+        InputColumn::String(_) => FieldType::String,
+        InputColumn::Bool { .. } => FieldType::Boolean,
+        InputColumn::I64 { .. } => FieldType::Int64,
+        InputColumn::I32 { .. } => FieldType::Int32,
+        InputColumn::F64 { .. } => FieldType::Float64,
+        InputColumn::F32 { .. } => FieldType::Float32,
+        InputColumn::Decimal128 { .. } => {
+            let scale = output_type.decimal_scale().unwrap_or(0);
+            FieldType::Decimal {
+                precision: None,
+                scale,
+            }
+        }
+    }
+}
+
+fn column_is_null(column: &InputColumn, row: usize) -> bool {
+    match column {
+        InputColumn::String(values) => values
+            .get(row)
+            .map(|v| v.is_none())
+            .unwrap_or(true),
+        InputColumn::I64 { is_null, .. }
+        | InputColumn::I32 { is_null, .. }
+        | InputColumn::F64 { is_null, .. }
+        | InputColumn::F32 { is_null, .. }
+        | InputColumn::Bool { is_null, .. }
+        | InputColumn::Decimal128 { is_null, .. } => is_null_at(is_null.as_deref(), row),
+    }
+}
+
+fn input_column_to_string(
+    column: &InputColumn,
+    row: usize,
+    source_type: &FieldType,
+) -> Result<String> {
+    match column {
+        InputColumn::String(values) => values
+            .get(row)
+            .and_then(|v| v.clone())
+            .ok_or_else(|| anyhow::anyhow!("null string value")),
+        InputColumn::Bool { values, .. } => Ok(values
+            .get(row)
+            .map(|v| v.to_string())
+            .unwrap_or_default()),
+        InputColumn::I64 { values, .. } => Ok(values
+            .get(row)
+            .map(|v| v.to_string())
+            .unwrap_or_default()),
+        InputColumn::I32 { values, .. } => Ok(values
+            .get(row)
+            .map(|v| v.to_string())
+            .unwrap_or_default()),
+        InputColumn::F64 { values, .. } => Ok(values
+            .get(row)
+            .map(|v| v.to_string())
+            .unwrap_or_default()),
+        InputColumn::F32 { values, .. } => Ok(values
+            .get(row)
+            .map(|v| v.to_string())
+            .unwrap_or_default()),
+        InputColumn::Decimal128 { values, .. } => {
+            let scale = source_type.decimal_scale().unwrap_or(0);
+            let value = values.get(row).copied().unwrap_or(0);
+            Ok(decimal_to_string(value, scale))
+        }
+    }
+}
+
+fn input_column_to_bool(
+    column: &InputColumn,
+    row: usize,
+    source_type: &FieldType,
+) -> Result<bool> {
+    match column {
+        InputColumn::Bool { values, .. } => Ok(*values.get(row).unwrap_or(&false)),
+        InputColumn::I64 { values, .. } => Ok(values.get(row).copied().unwrap_or(0) != 0),
+        InputColumn::I32 { values, .. } => Ok(values.get(row).copied().unwrap_or(0) != 0),
+        InputColumn::F64 { values, .. } => Ok(values.get(row).copied().unwrap_or(0.0) != 0.0),
+        InputColumn::F32 { values, .. } => Ok(values.get(row).copied().unwrap_or(0.0) != 0.0),
+        InputColumn::Decimal128 { values, .. } => {
+            let scale = source_type.decimal_scale().unwrap_or(0);
+            let value = values.get(row).copied().unwrap_or(0);
+            Ok(decimal_to_i64(value, scale)? != 0)
+        }
+        InputColumn::String(values) => values
+            .get(row)
+            .and_then(|v| v.as_deref())
+            .map(|v| parse_bool_string(v))
+            .unwrap_or(Ok(false)),
+    }
+}
+
+fn input_column_to_i64(
+    column: &InputColumn,
+    row: usize,
+    source_type: &FieldType,
+) -> Result<i64> {
+    match column {
+        InputColumn::I64 { values, .. } => Ok(*values.get(row).unwrap_or(&0)),
+        InputColumn::I32 { values, .. } => Ok(*values.get(row).unwrap_or(&0) as i64),
+        InputColumn::F64 { values, .. } => Ok(*values.get(row).unwrap_or(&0.0) as i64),
+        InputColumn::F32 { values, .. } => Ok(*values.get(row).unwrap_or(&0.0) as i64),
+        InputColumn::Bool { values, .. } => Ok(if *values.get(row).unwrap_or(&false) { 1 } else { 0 }),
+        InputColumn::Decimal128 { values, .. } => {
+            let scale = source_type.decimal_scale().unwrap_or(0);
+            let value = values.get(row).copied().unwrap_or(0);
+            decimal_to_i64(value, scale)
+        }
+        InputColumn::String(values) => {
+            let value = values
+                .get(row)
+                .and_then(|v| v.as_deref())
+                .ok_or_else(|| anyhow::anyhow!("null string value"))?;
+            parse_with(value, "i64")
+        }
+    }
+}
+
+fn input_column_to_f64(
+    column: &InputColumn,
+    row: usize,
+    source_type: &FieldType,
+) -> Result<f64> {
+    match column {
+        InputColumn::F64 { values, .. } => Ok(*values.get(row).unwrap_or(&0.0)),
+        InputColumn::F32 { values, .. } => Ok(*values.get(row).unwrap_or(&0.0) as f64),
+        InputColumn::I64 { values, .. } => Ok(*values.get(row).unwrap_or(&0) as f64),
+        InputColumn::I32 { values, .. } => Ok(*values.get(row).unwrap_or(&0) as f64),
+        InputColumn::Bool { values, .. } => Ok(if *values.get(row).unwrap_or(&false) { 1.0 } else { 0.0 }),
+        InputColumn::Decimal128 { values, .. } => {
+            let scale = source_type.decimal_scale().unwrap_or(0);
+            let value = values.get(row).copied().unwrap_or(0);
+            Ok(decimal_to_f64(value, scale))
+        }
+        InputColumn::String(values) => {
+            let value = values
+                .get(row)
+                .and_then(|v| v.as_deref())
+                .ok_or_else(|| anyhow::anyhow!("null string value"))?;
+            parse_with(value, "f64")
+        }
+    }
+}
+
+fn input_column_to_decimal(
+    column: &InputColumn,
+    row: usize,
+    source_type: &FieldType,
+) -> Result<i128> {
+    match column {
+        InputColumn::Decimal128 { values, .. } => Ok(values.get(row).copied().unwrap_or(0)),
+        InputColumn::I64 { values, .. } => {
+            let factor = pow10_i128(source_type.decimal_scale().unwrap_or(0))?;
+            let base = *values.get(row).unwrap_or(&0) as i128;
+            base.checked_mul(factor)
+                .context("decimal scale overflow")
+        }
+        InputColumn::I32 { values, .. } => {
+            let factor = pow10_i128(source_type.decimal_scale().unwrap_or(0))?;
+            let base = *values.get(row).unwrap_or(&0) as i128;
+            base.checked_mul(factor)
+                .context("decimal scale overflow")
+        }
+        InputColumn::F64 { values, .. } => {
+            let value = values.get(row).copied().unwrap_or(0.0);
+            parse_decimal_to_i128(&value.to_string(), source_type.decimal_scale().unwrap_or(0))
+        }
+        InputColumn::F32 { values, .. } => {
+            let value = values.get(row).copied().unwrap_or(0.0);
+            parse_decimal_to_i128(&value.to_string(), source_type.decimal_scale().unwrap_or(0))
+        }
+        InputColumn::Bool { values, .. } => {
+            let value = if *values.get(row).unwrap_or(&false) { 1 } else { 0 };
+            let factor = pow10_i128(source_type.decimal_scale().unwrap_or(0))?;
+            (value as i128)
+                .checked_mul(factor)
+                .context("decimal scale overflow")
+        }
+        InputColumn::String(values) => {
+            let value = values
+                .get(row)
+                .and_then(|v| v.as_deref())
+                .ok_or_else(|| anyhow::anyhow!("null string value"))?;
+            parse_decimal_to_i128(value, source_type.decimal_scale().unwrap_or(0))
+        }
+    }
+}
+
+fn maybe_print_debug_rows(
+    input_rows: &[Vec<Value>],
+    session: &SessionConfig,
+    output_rows: &[Vec<Value>],
+    debug_sample_rows: usize,
+    debug_batches_remaining: &mut usize,
+) {
+    if debug_sample_rows == 0 || *debug_batches_remaining == 0 || input_rows.is_empty() {
+        return;
+    }
+
+    let sample_rows = debug_sample_rows.min(input_rows.len());
+    println!(
+        "Debug sample ({} of {} rows):",
+        sample_rows,
+        input_rows.len()
+    );
+    for row_idx in 0..sample_rows {
+        let row = &input_rows[row_idx];
+        let mut input_parts = Vec::with_capacity(session.arg_names.len());
+        for (arg_pos, name) in session.arg_names.iter().enumerate() {
+            let idx = session.arg_positions.get(arg_pos).copied().unwrap_or(0);
+            let value = row.get(idx).unwrap_or(&Value::Nil);
+            input_parts.push(format!("{}={}", name, debug_value(value)));
+        }
+
+        let mut output_parts = Vec::new();
+        if !session.output_positions.is_empty() {
+            for (idx, name) in session.output_names.iter().enumerate() {
+                let pos = session.output_positions.get(idx).copied().unwrap_or(0);
+                let value = output_rows
+                    .get(row_idx)
+                    .and_then(|row| row.get(pos))
+                    .unwrap_or(&Value::Nil);
+                output_parts.push(format!("{}={}", name, debug_value(value)));
+            }
+        }
+
+        println!(
+            "  row {}: {} -> {}",
+            row_idx,
+            input_parts.join(", "),
+            output_parts.join(", ")
+        );
+    }
+
+    *debug_batches_remaining = debug_batches_remaining.saturating_sub(1);
+}
+
+fn debug_value(value: &Value) -> String {
+    match value {
+        Value::Nil => "<null>".to_string(),
+        Value::Boolean(v) => v.to_string(),
+        Value::Integer(v) => v.to_string(),
+        Value::F32(v) => v.to_string(),
+        Value::F64(v) => v.to_string(),
+        Value::String(s) => s.as_str().unwrap_or("").to_string(),
+        Value::Binary(b) => format!("{:?}", b),
+        Value::Array(_) => "<array>".to_string(),
+        Value::Map(_) => "<map>".to_string(),
+        Value::Ext(_, _) => "<ext>".to_string(),
+    }
+}
+
+fn value_to_string(value: &Value) -> Result<String> {
+    match value {
+        Value::String(s) => Ok(s.as_str().unwrap_or("").to_string()),
+        Value::Binary(b) => Ok(String::from_utf8_lossy(b).to_string()),
+        Value::Integer(v) => Ok(v.to_string()),
+        Value::Boolean(v) => Ok(v.to_string()),
+        Value::F32(v) => Ok(v.to_string()),
+        Value::F64(v) => Ok(v.to_string()),
+        Value::Nil => bail!("value is null"),
+        other => Ok(format!("{other:?}")),
+    }
+}
+
+fn value_to_bool(value: &Value) -> Result<bool> {
+    match value {
+        Value::Boolean(v) => Ok(*v),
+        Value::Integer(v) => Ok(v.as_i64().unwrap_or(0) != 0),
+        Value::F32(v) => Ok(*v != 0.0),
+        Value::F64(v) => Ok(*v != 0.0),
+        Value::String(s) => parse_bool_string(s.as_str().unwrap_or("")),
+        Value::Binary(b) => parse_bool_string(&String::from_utf8_lossy(b)),
+        Value::Nil => bail!("value is null"),
+        _ => bail!("unsupported boolean value {:?}", value),
+    }
+}
+
+fn parse_bool_string(value: &str) -> Result<bool> {
+    let normalized = value.trim().to_lowercase();
+    match normalized.as_str() {
+        "true" | "t" | "1" | "yes" | "y" => Ok(true),
+        "false" | "f" | "0" | "no" | "n" => Ok(false),
+        _ => bail!("failed to parse boolean from {}", value),
+    }
+}
+
+fn value_to_i64(value: &Value) -> Result<i64> {
+    match value {
+        Value::Integer(v) => {
+            if let Some(signed) = v.as_i64() {
+                return Ok(signed);
+            }
+            if let Some(unsigned) = v.as_u64() {
+                if unsigned > i64::MAX as u64 {
+                    bail!("integer out of range for i64");
+                }
+                return Ok(unsigned as i64);
+            }
+            bail!("integer out of range for i64")
+        }
+        Value::Boolean(v) => Ok(if *v { 1 } else { 0 }),
+        Value::F32(v) => Ok(*v as i64),
+        Value::F64(v) => Ok(*v as i64),
+        Value::String(s) => parse_with(s.as_str().unwrap_or(""), "i64"),
+        Value::Binary(b) => parse_with(&String::from_utf8_lossy(b), "i64"),
+        Value::Nil => bail!("value is null"),
+        _ => bail!("unsupported integer value {:?}", value),
+    }
+}
+
+fn value_to_f64(value: &Value) -> Result<f64> {
+    match value {
+        Value::Integer(v) => v
+            .as_i64()
+            .map(|v| v as f64)
+            .or_else(|| v.as_u64().map(|v| v as f64))
+            .context("integer out of range for f64"),
+        Value::Boolean(v) => Ok(if *v { 1.0 } else { 0.0 }),
+        Value::F32(v) => Ok(*v as f64),
+        Value::F64(v) => Ok(*v),
+        Value::String(s) => parse_with(s.as_str().unwrap_or(""), "f64"),
+        Value::Binary(b) => parse_with(&String::from_utf8_lossy(b), "f64"),
+        Value::Nil => bail!("value is null"),
+        _ => bail!("unsupported float value {:?}", value),
+    }
+}
+
+fn value_to_decimal_i128(value: &Value, scale: i8) -> Result<i128> {
+    match value {
+        Value::String(s) => parse_decimal_to_i128(s.as_str().unwrap_or(""), scale),
+        Value::Binary(b) => parse_decimal_to_i128(&String::from_utf8_lossy(b), scale),
+        Value::Nil => bail!("value is null"),
+        _ => bail!("decimal must be encoded as string in msgpack"),
+    }
+}
+
+fn value_to_timestamp_millis(value: &Value, unit: &TimeUnit) -> Result<i64> {
+    match value {
+        Value::Integer(_) | Value::Boolean(_) | Value::F32(_) | Value::F64(_) => {
+            let raw = value_to_i64(value)?;
+            Ok(timestamp_to_millis(raw, unit)?)
+        }
+        Value::String(s) => {
+            let raw = timestamp_string_to_value(s.as_str().unwrap_or(""), unit)?;
+            Ok(timestamp_to_millis(raw, unit)?)
+        }
+        Value::Binary(b) => {
+            let raw = timestamp_string_to_value(&String::from_utf8_lossy(b), unit)?;
+            Ok(timestamp_to_millis(raw, unit)?)
+        }
+        Value::Nil => bail!("value is null"),
+        _ => bail!("unsupported timestamp value {:?}", value),
+    }
+}
+
+fn value_to_date_millis(value: &Value) -> Result<i64> {
+    match value {
+        Value::Integer(_) | Value::Boolean(_) | Value::F32(_) | Value::F64(_) => value_to_i64(value),
+        Value::String(s) => parse_date_string(s.as_str().unwrap_or("")),
+        Value::Binary(b) => parse_date_string(&String::from_utf8_lossy(b)),
+        Value::Nil => bail!("value is null"),
+        _ => bail!("unsupported date value {:?}", value),
+    }
+}
+
+fn parse_date_string(value: &str) -> Result<i64> {
+    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .with_context(|| format!("failed to parse date from {value}"))?;
+    let dt = date
+        .and_hms_opt(0, 0, 0)
+        .context("invalid date")?;
+    Ok(DateTime::<Utc>::from_utc(dt, Utc).timestamp_millis())
+}
+
+fn timestamp_to_millis(value: i64, unit: &TimeUnit) -> Result<i64> {
+    match unit {
+        TimeUnit::Second => value
+            .checked_mul(1_000)
+            .context("timestamp second overflow"),
+        TimeUnit::Millisecond => Ok(value),
+        TimeUnit::Microsecond => Ok(value / 1_000),
+        TimeUnit::Nanosecond => Ok(value / 1_000_000),
+    }
+}
+
+fn timestamp_from_millis(value: i64, unit: &TimeUnit) -> Result<i64> {
+    match unit {
+        TimeUnit::Second => Ok(value / 1_000),
+        TimeUnit::Millisecond => Ok(value),
+        TimeUnit::Microsecond => value
+            .checked_mul(1_000)
+            .context("timestamp microsecond overflow"),
+        TimeUnit::Nanosecond => value
+            .checked_mul(1_000_000)
+            .context("timestamp nanosecond overflow"),
+    }
+}
+
+fn pow10_i128(scale: i8) -> Result<i128> {
+    if scale <= 0 {
+        return Ok(1);
+    }
+    let mut value: i128 = 1;
+    for _ in 0..scale {
+        value = value
+            .checked_mul(10)
+            .context("decimal scale overflow")?;
+    }
+    Ok(value)
+}
+
+fn convert_decimal_scale(value: i128, source_scale: i8, target_scale: i8) -> Result<i128> {
+    if source_scale == target_scale {
+        return Ok(value);
+    }
+    if source_scale < target_scale {
+        let factor = pow10_i128(target_scale - source_scale)?;
+        return value
+            .checked_mul(factor)
+            .context("decimal scale overflow");
+    }
+    let factor = pow10_i128(source_scale - target_scale)?;
+    Ok(value / factor)
+}
+
+fn decimal_to_i64(value: i128, scale: i8) -> Result<i64> {
+    let scaled = convert_decimal_scale(value, scale, 0)?;
+    i64::try_from(scaled).map_err(|_| anyhow::anyhow!("decimal overflow for i64"))
+}
+
+fn decimal_to_f64(value: i128, scale: i8) -> f64 {
+    if scale == 0 {
+        return value as f64;
+    }
+    let factor = 10f64.powi(scale as i32);
+    (value as f64) / factor
+}
 #[derive(Clone, Copy, Debug)]
 struct OutputTarget {
     target_idx: usize,
@@ -626,10 +1518,10 @@ fn call_udf_to_columns(
     method: &str,
     input_columns: &[InputColumn],
 ) -> Result<Vec<InputColumn>> {
-    let columns_method = if method.ends_with("ToColumnsTypedOut") {
+    let columns_method = if method.ends_with("Fast") || method.ends_with("ToColumnsTypedOut") {
         method.to_string()
     } else {
-        format!("{method}ToColumnsTypedOut")
+        format!("{method}Fast")
     };
 
     udf.call_typed_columns_to_typed_results(&columns_method, input_columns)
@@ -2059,6 +2951,68 @@ fn parse_timestamp(value: &str) -> Result<NaiveDateTime> {
     NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
         .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S"))
         .with_context(|| format!("failed to parse timestamp from {value}"))
+}
+
+fn parse_field_type(type_str: &str) -> FieldType {
+    let base = base_type(type_str);
+    match base.as_str() {
+        "STRING" | "VARCHAR" | "CHAR" | "TEXT" => FieldType::String,
+        "BOOLEAN" | "BOOL" => FieldType::Boolean,
+        "BIGINT" | "LONG" => FieldType::Int64,
+        "INT" | "INTEGER" => FieldType::Int32,
+        "SMALLINT" => FieldType::Int16,
+        "TINYINT" => FieldType::Int8,
+        "DOUBLE" => FieldType::Float64,
+        "FLOAT" | "REAL" => FieldType::Float32,
+        "DECIMAL" | "NUMERIC" => {
+            let (precision, scale) = parse_decimal_precision_scale(type_str);
+            FieldType::Decimal { precision, scale }
+        }
+        "TIMESTAMP" => {
+            let unit = parse_timestamp_unit(type_str);
+            FieldType::Timestamp { unit }
+        }
+        "DATE" => FieldType::Date,
+        other => FieldType::Unknown(other.to_string()),
+    }
+}
+
+fn parse_decimal_precision_scale(type_str: &str) -> (Option<u8>, i8) {
+    let trimmed = type_str.trim();
+    let start = trimmed.find('(');
+    let end = trimmed.find(')');
+    if let (Some(start), Some(end)) = (start, end) {
+        let inner = &trimmed[start + 1..end];
+        let mut parts = inner.split(',');
+        let precision = parts
+            .next()
+            .and_then(|p| p.trim().parse::<u8>().ok());
+        let scale = parts
+            .next()
+            .and_then(|s| s.trim().parse::<i8>().ok())
+            .unwrap_or(0);
+        (precision, scale)
+    } else {
+        (None, 0)
+    }
+}
+
+fn parse_timestamp_unit(type_str: &str) -> TimeUnit {
+    let trimmed = type_str.trim();
+    let start = trimmed.find('(');
+    let end = trimmed.find(')');
+    let scale = if let (Some(start), Some(end)) = (start, end) {
+        trimmed[start + 1..end].trim().parse::<u8>().ok()
+    } else {
+        None
+    };
+    match scale.unwrap_or(3) {
+        0 => TimeUnit::Second,
+        3 => TimeUnit::Millisecond,
+        6 => TimeUnit::Microsecond,
+        9 => TimeUnit::Nanosecond,
+        _ => TimeUnit::Millisecond,
+    }
 }
 
 fn base_type(type_str: &str) -> String {

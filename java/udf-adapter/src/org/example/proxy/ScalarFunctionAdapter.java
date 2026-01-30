@@ -343,6 +343,51 @@ public final class ScalarFunctionAdapter {
         return new ColumnarResult(out, outNulls);
     }
 
+    public ColumnarResult evalBatchFast(Object[] columns, boolean[][] nulls) throws Exception {
+        if (columns == null || columns.length == 0) {
+            return new ColumnarResult(new Object[0], new boolean[0][0]);
+        }
+
+        if (argCount == 1 && !rowReturn && columns[0] instanceof byte[]) {
+            int rowCount = validateTypedColumns(columns, nulls);
+            byte[] values = (byte[]) columns[0];
+            boolean[] isNull = nulls != null && nulls.length > 0 ? nulls[0] : null;
+            Object outputArray = allocateOutputArray(evalMethod.getReturnType(), rowCount);
+            boolean[][] outputNulls = new boolean[1][rowCount];
+            int scale = decimalScales[0];
+
+            if (isNull == null) {
+                for (int row = 0; row < rowCount; row++) {
+                    BigDecimal input = decimalFromBytes(values, row, scale);
+                    Object result = invokeEvalSingle(input);
+                    if (result == null) {
+                        outputNulls[0][row] = true;
+                        continue;
+                    }
+                    writeOutputValue(outputArray, result, row);
+                }
+            } else {
+                for (int row = 0; row < rowCount; row++) {
+                    if (isNull[row]) {
+                        outputNulls[0][row] = true;
+                        continue;
+                    }
+                    BigDecimal input = decimalFromBytes(values, row, scale);
+                    Object result = invokeEvalSingle(input);
+                    if (result == null) {
+                        outputNulls[0][row] = true;
+                        continue;
+                    }
+                    writeOutputValue(outputArray, result, row);
+                }
+            }
+
+            return new ColumnarResult(new Object[] { outputArray }, outputNulls);
+        }
+
+        return evalBatchToColumnsTypedOut(columns, nulls);
+    }
+
     private int validateColumns(String[][] columns) {
         int argCount = this.argCount;
         if (columns.length != argCount) {

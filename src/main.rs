@@ -39,7 +39,7 @@ struct Args {
 
     #[arg(long, default_value = "262144")]
     buf_size: usize,
-    #[arg(long, default_value_t = 1024)]
+    #[arg(long, default_value_t = 512)]
     batch_size: usize,
     #[arg(long, default_value_t = num_cpus::get())]
     workers: usize,

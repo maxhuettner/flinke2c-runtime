@@ -146,6 +146,7 @@ struct SessionConfig {
     post_field_positions: Vec<usize>,
     post_field_sources: Vec<PostFieldSource>,
     passthrough_identity: bool,
+    output_slots: Vec<OutputSlotKind>,
     arg_positions: Vec<usize>,
     arg_names: Vec<String>,
     arg_types: Vec<FieldType>,
@@ -166,6 +167,15 @@ enum PostFieldSourceKind {
 struct PostFieldSource {
     pos: usize,
     kind: PostFieldSourceKind,
+}
+
+#[derive(Clone, Debug)]
+enum OutputSlotKind {
+    Op,
+    RowId,
+    InputPos(usize),
+    Output(usize),
+    Nil,
 }
 
 fn main() -> Result<()> {
@@ -354,35 +364,87 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
 
     let output_name_set: HashSet<&str> = output_names.iter().map(|s| s.as_str()).collect();
     let mut post_field_sources = Vec::with_capacity(pre_cfg.post_fields.len());
+    let mut output_slots = vec![OutputSlotKind::Nil; output_row_len];
+    if output_row_len > 0 {
+        output_slots[0] = OutputSlotKind::Op;
+    }
+    if reorder_responses && output_row_len > 1 {
+        output_slots[1] = OutputSlotKind::RowId;
+    }
+
+    let mut output_pos_to_idx = vec![None; output_row_len];
+    for (idx, pos) in output_positions.iter().enumerate() {
+        if *pos >= output_row_len {
+            bail!("functionResult outputIndex {} is out of range", pos);
+        }
+        if output_pos_to_idx[*pos].replace(idx).is_some() {
+            bail!("duplicate functionResult target at position {}", pos);
+        }
+    }
+
     let mut passthrough_identity = true;
     for (idx, field) in pre_cfg.post_fields.iter().enumerate() {
         let pos = post_field_positions[idx];
-        let kind = if field.name == "__op" {
+        let (kind, slot) = if field.name == "__op" {
             if pos != 0 {
                 passthrough_identity = false;
             }
-            PostFieldSourceKind::Op
+            (PostFieldSourceKind::Op, OutputSlotKind::Op)
         } else if field.name == "__rowId" {
             if !reorder_responses || pos != 1 {
                 passthrough_identity = false;
             }
-            PostFieldSourceKind::RowId
+            (PostFieldSourceKind::RowId, OutputSlotKind::RowId)
         } else if let Some(pre_pos) = pre_name_to_pos.get(&field.name).copied() {
             if pre_pos != pos {
                 passthrough_identity = false;
             }
-            PostFieldSourceKind::InputPos(pre_pos)
+            (
+                PostFieldSourceKind::InputPos(pre_pos),
+                OutputSlotKind::InputPos(pre_pos),
+            )
         } else if output_name_set.contains(field.name.as_str()) {
             passthrough_identity = false;
-            PostFieldSourceKind::Output
+            let output_idx = output_pos_to_idx[pos]
+                .with_context(|| format!("missing output column for postField {}", field.name))?;
+            (
+                PostFieldSourceKind::Output,
+                OutputSlotKind::Output(output_idx),
+            )
         } else {
             bail!("postField {} not found in preFields", field.name);
         };
         post_field_sources.push(PostFieldSource { pos, kind });
+        output_slots[pos] = slot;
     }
 
     if expected_input_len != output_row_len {
         passthrough_identity = false;
+    }
+
+    for (pos, slot) in output_slots.iter().enumerate() {
+        match slot {
+            OutputSlotKind::Nil => {
+                passthrough_identity = false;
+                bail!("output position {} not mapped by postFields", pos);
+            }
+            OutputSlotKind::InputPos(pre_pos) => {
+                if *pre_pos != pos {
+                    passthrough_identity = false;
+                }
+            }
+            OutputSlotKind::Op => {
+                if pos != 0 {
+                    passthrough_identity = false;
+                }
+            }
+            OutputSlotKind::RowId => {
+                if !reorder_responses || pos != 1 {
+                    passthrough_identity = false;
+                }
+            }
+            OutputSlotKind::Output(_) => {}
+        }
     }
 
     Ok(SessionConfig {
@@ -394,6 +456,7 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
         post_field_positions,
         post_field_sources,
         passthrough_identity,
+        output_slots,
         arg_positions,
         arg_names,
         arg_types,
@@ -540,7 +603,8 @@ fn run_session(
                     validate_row_len(&row, session_cfg.expected_input_len)?;
                     batch_rows.push(row);
                     if batch_rows.len() >= batch_size {
-                        let out_rows = apply_udf_to_rows(
+                        apply_udf_to_rows_stream(
+                            &mut writer,
                             &batch_rows,
                             &session_cfg,
                             udf_handle,
@@ -548,7 +612,6 @@ fn run_session(
                             args.debug_sample_rows,
                             &mut debug_batches_remaining,
                         )?;
-                        write_msgpack_rows(&mut writer, &out_rows)?;
                         writer.flush().ok();
                         batch_rows.clear();
                     }
@@ -558,7 +621,8 @@ fn run_session(
         }
 
         if !batch_rows.is_empty() {
-            let out_rows = apply_udf_to_rows(
+            apply_udf_to_rows_stream(
+                &mut writer,
                 &batch_rows,
                 &session_cfg,
                 udf_handle,
@@ -566,7 +630,6 @@ fn run_session(
                 args.debug_sample_rows,
                 &mut debug_batches_remaining,
             )?;
-            write_msgpack_rows(&mut writer, &out_rows)?;
             writer.flush().ok();
         }
 
@@ -833,8 +896,60 @@ fn is_msgpack_eof(err: &msgpack_decode::Error) -> bool {
 
 fn write_msgpack_rows<W: Write>(writer: &mut W, rows: &[Vec<Value>]) -> Result<()> {
     for row in rows {
-        let value = Value::Array(row.clone());
-        msgpack_encode::write_value(writer, &value).context("write msgpack row")?;
+        write_msgpack_row_values(writer, row)?;
+    }
+    Ok(())
+}
+
+fn write_msgpack_row_values<W: Write>(writer: &mut W, row: &[Value]) -> Result<()> {
+    rmp::encode::write_array_len(writer, row.len() as u32)
+        .context("write msgpack row header")?;
+    for value in row {
+        msgpack_encode::write_value(writer, value).context("write msgpack value")?;
+    }
+    Ok(())
+}
+
+fn write_output_rows_streaming<W: Write>(
+    writer: &mut W,
+    rows: &[Vec<Value>],
+    session: &SessionConfig,
+    output_columns: &[InputColumn],
+) -> Result<()> {
+    let row_len = session.output_row_len as u32;
+    for (row_idx, source_row) in rows.iter().enumerate() {
+        rmp::encode::write_array_len(writer, row_len)
+            .context("write msgpack row header")?;
+        for slot in &session.output_slots {
+            match slot {
+                OutputSlotKind::Op => {
+                    let value = source_row.get(0).unwrap_or(&Value::Nil);
+                    msgpack_encode::write_value(writer, value)?;
+                }
+                OutputSlotKind::RowId => {
+                    let value = source_row.get(1).unwrap_or(&Value::Nil);
+                    msgpack_encode::write_value(writer, value)?;
+                }
+                OutputSlotKind::InputPos(pre_pos) => {
+                    let value = source_row.get(*pre_pos).unwrap_or(&Value::Nil);
+                    msgpack_encode::write_value(writer, value)?;
+                }
+                OutputSlotKind::Output(output_idx) => {
+                    let value = output_column_to_value(
+                        &output_columns[*output_idx],
+                        row_idx,
+                        session
+                            .output_types
+                            .get(*output_idx)
+                            .unwrap_or(&FieldType::String),
+                    )?;
+                    msgpack_encode::write_value(writer, &value)?;
+                }
+                OutputSlotKind::Nil => {
+                    msgpack_encode::write_value(writer, &Value::Nil)?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -950,6 +1065,47 @@ fn apply_udf_to_rows(
     );
 
     Ok(out_rows)
+}
+
+fn apply_udf_to_rows_stream<W: Write>(
+    writer: &mut W,
+    rows: &[Vec<Value>],
+    session: &SessionConfig,
+    udf: &UdfHandle,
+    method: &str,
+    debug_sample_rows: usize,
+    debug_batches_remaining: &mut usize,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    if debug_sample_rows > 0 && *debug_batches_remaining > 0 {
+        let out_rows = apply_udf_to_rows(
+            rows,
+            session,
+            udf,
+            method,
+            debug_sample_rows,
+            debug_batches_remaining,
+        )?;
+        write_msgpack_rows(writer, &out_rows)?;
+        return Ok(());
+    }
+
+    let input_columns = build_input_columns(rows, &session.arg_positions, &session.arg_types)?;
+    let output_columns = call_udf_to_columns(udf, method, &input_columns, &session.output_names)?;
+
+    if output_columns.len() < session.output_positions.len() {
+        bail!(
+            "UDF returned {} columns but functionResults resolved {} targets",
+            output_columns.len(),
+            session.output_positions.len()
+        );
+    }
+
+    write_output_rows_streaming(writer, rows, session, &output_columns)?;
+    Ok(())
 }
 
 fn build_input_columns(

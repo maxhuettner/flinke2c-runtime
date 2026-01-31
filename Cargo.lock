@@ -705,6 +705,7 @@ dependencies = [
  "clap",
  "jni",
  "num_cpus",
+ "rmp",
  "rmpv",
  "serde",
  "serde_json",

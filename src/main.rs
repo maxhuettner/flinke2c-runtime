@@ -1,6 +1,5 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use std::collections::{BTreeMap, HashSet};
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -60,12 +59,7 @@ struct FunctionArg {
 #[serde(rename_all = "camelCase")]
 struct FunctionResult {
     output_name: String,
-    #[serde(
-        default,
-        rename = "outputType",
-        alias = "outputWireType",
-        alias = "wireType"
-    )]
+    #[serde(default, rename = "outputType", alias = "outputWireType", alias = "wireType")]
     output_type: Option<String>,
 }
 
@@ -111,7 +105,7 @@ enum FieldType {
     DecimalUnscaledI64,
     DecimalUnscaledBytes,
     TimestampMillis, // on wire: int64 millis
-    Date,                         // on wire: int32 days (Flink), internally UDF uses millis
+    Date,            // on wire: int32 days (Flink), internally UDF uses millis
     Bytes,
     Unknown(String),
 }
@@ -123,12 +117,6 @@ impl FieldType {
             _ => None,
         }
     }
-    fn decimal_precision(&self) -> Option<u8> {
-        match self {
-            FieldType::Decimal { precision, .. } => *precision,
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -136,14 +124,8 @@ struct SessionConfig {
     reorder_responses: bool,
     expected_input_len: usize,
     output_row_len: usize,
-
-    pre_name_to_pos: std::collections::HashMap<String, usize>,
-
-    post_fields: Vec<FieldSpec>,
-    post_field_positions: Vec<usize>,
     post_field_sources: Vec<PostFieldSource>,
     passthrough_identity: bool,
-    output_slots: Vec<OutputSlotKind>,
 
     arg_positions: Vec<usize>,
     arg_names: Vec<String>,
@@ -179,7 +161,7 @@ enum OutputSlotKind {
     Op,
     RowId,
     InputPos(usize),
-    Output(usize),
+    Output,
     Nil,
 }
 
@@ -196,19 +178,39 @@ enum V {
     DecimalI128(i128), // unscaled
 }
 
+#[derive(Debug)]
+pub struct TcpSessionConfig<'a> {
+    pre: TcpStream,
+    pre_cfg: ConfigMessage,
+    post: TcpStream,
+    post_cfg: ConfigMessage,
+    udf: &'a mut Option<UdfHandle>,
+    current_udf_class: &'a mut Option<String>,
+    current_udf_types: &'a mut Option<Vec<String>>,
+    args: &'a Args,
+}
+
+#[derive(Debug)]
+struct UdfConfig<'a, W: Write> {
+    writer: &'a mut W,
+    rows: &'a [Vec<V>],
+    session: &'a SessionConfig,
+    udf: &'a UdfHandle,
+    method: &'a str,
+    debug_sample_rows: usize,
+    debug_batches_remaining: &'a mut usize,
+    max_frame_size: usize,
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let listener = TcpListener::bind((args.listen_host.as_str(), args.in_port))
-        .context("bind in-port")?;
+    let listener = TcpListener::bind((args.listen_host.as_str(), args.in_port)).context("bind in-port")?;
     let mut current_udf_class: Option<String> = None;
     let mut current_udf_types: Option<Vec<String>> = None;
     let mut udf: Option<UdfHandle> = None;
 
-    println!(
-        "Waiting for PRE/POST on {}:{} ...",
-        args.listen_host, args.in_port
-    );
+    println!("Waiting for PRE/POST on {}:{} ...", args.listen_host, args.in_port);
 
     loop {
         let session = match accept_pair(&listener) {
@@ -221,14 +223,16 @@ fn main() -> Result<()> {
 
         let (pre, pre_cfg, post, post_cfg) = session;
         if let Err(err) = run_session(
-            pre,
-            pre_cfg,
-            post,
-            post_cfg,
-            &mut udf,
-            &mut current_udf_class,
-            &mut current_udf_types,
-            &args,
+            TcpSessionConfig {
+                pre,
+                pre_cfg,
+                post,
+                post_cfg,
+                udf: &mut udf,
+                current_udf_class: &mut current_udf_class,
+                current_udf_types: &mut current_udf_types,
+                args: &args,
+            }
         ) {
             eprintln!("Session ended with error: {err:#}");
         }
@@ -248,9 +252,7 @@ fn read_config(stream: &mut TcpStream) -> Result<ConfigMessage> {
     Ok(cfg)
 }
 
-fn accept_pair(
-    listener: &TcpListener,
-) -> Result<(TcpStream, ConfigMessage, TcpStream, ConfigMessage)> {
+fn accept_pair(listener: &TcpListener) -> Result<(TcpStream, ConfigMessage, TcpStream, ConfigMessage)> {
     let mut pre: Option<(TcpStream, ConfigMessage)> = None;
     let mut post: Option<(TcpStream, ConfigMessage)> = None;
 
@@ -282,19 +284,16 @@ fn accept_pair(
 }
 
 fn run_session(
-    pre: TcpStream,
-    pre_cfg: ConfigMessage,
-    post: TcpStream,
-    post_cfg: ConfigMessage,
-    udf: &mut Option<UdfHandle>,
-    current_udf_class: &mut Option<String>,
-    current_udf_types: &mut Option<Vec<String>>,
-    args: &Args,
+    config: TcpSessionConfig,
 ) -> Result<()> {
-    let pre_fn = pre_cfg.function_class.as_deref().unwrap_or("<none>");
-    let post_fn = post_cfg.function_class.as_deref().unwrap_or("<none>");
-    let pre_kind = pre_cfg.function_kind.as_deref().unwrap_or("<none>");
-    let post_kind = post_cfg.function_kind.as_deref().unwrap_or("<none>");
+    let pre_fn = config.pre_cfg.function_class.as_deref().unwrap_or("<none>");
+    let post_fn = config.post_cfg.function_class.as_deref().unwrap_or("<none>");
+    let pre_kind = config.pre_cfg.function_kind.as_deref().unwrap_or("<none>");
+    let pre_cfg = &config.pre_cfg;
+    let post_kind = config.post_cfg.function_kind.as_deref().unwrap_or("<none>");
+    let post_cfg = &config.post_cfg;
+    let pre = config.pre;
+    let post = config.post;
     println!(
         "PRE config: functionKind={}, functionClass={}, functionArgs={}, functionResults={}",
         pre_kind,
@@ -310,7 +309,7 @@ fn run_session(
         post_cfg.function_results.len()
     );
 
-    let session_cfg = build_session_config(&pre_cfg)?;
+    let session_cfg = build_session_config(pre_cfg)?;
     println!(
         "Resolved {} UDF args at positions {:?}",
         session_cfg.arg_positions.len(),
@@ -335,18 +334,18 @@ fn run_session(
         .map(|arg| arg.arg_type.clone().unwrap_or_else(|| "<missing>".to_string()))
         .collect();
 
-    let class_changed = current_udf_class
+    let class_changed = config.current_udf_class
         .as_deref()
         .map(|current| current != desired_udf_class)
         .unwrap_or(true);
-    let types_changed = current_udf_types
+    let types_changed = config.current_udf_types
         .as_ref()
         .map(|current| current != &desired_udf_types)
         .unwrap_or(true);
 
     if class_changed || types_changed {
-        let current_class_display = current_udf_class.as_deref().unwrap_or("<unset>");
-        let current_types_display = current_udf_types
+        let current_class_display = config.current_udf_class.as_deref().unwrap_or("<unset>");
+        let current_types_display = config.current_udf_types
             .as_ref()
             .map(|v| format!("{v:?}"))
             .unwrap_or_else(|| "<unset>".to_string());
@@ -354,81 +353,74 @@ fn run_session(
             "Switching UDF config: class {} -> {}, types {} -> {:?}",
             current_class_display, desired_udf_class, current_types_display, desired_udf_types
         );
-        *current_udf_class = Some(desired_udf_class);
-        *current_udf_types = Some(desired_udf_types);
+        *config.current_udf_class = Some(desired_udf_class);
+        *config.current_udf_types = Some(desired_udf_types);
     }
 
-    let worker_count = args.workers.max(1);
+    let worker_count = config.args.workers.max(1);
 
     // ------------------------------------------------------------------
     // Single-thread mode
     // ------------------------------------------------------------------
     if worker_count == 1 {
-        if class_changed || types_changed || udf.is_none() {
-            *udf = Some(UdfHandle::new_with_args(
-                &args.udf_jars,
-                &args.udf_adapter_class,
+        if class_changed || types_changed || config.udf.is_none() {
+            *config.udf = Some(UdfHandle::new_with_args(
+                &config.args.udf_jars,
+                &config.args.udf_adapter_class,
                 "(Ljava/lang/String;[Ljava/lang/String;)V",
                 &[
-                    JavaArg::String(
-                        current_udf_class.as_ref().context("missing UDF class")?.clone(),
-                    ),
-                    JavaArg::StringArray(
-                        current_udf_types.as_ref().context("missing UDF types")?.clone(),
-                    ),
+                    JavaArg::String(config.current_udf_class.as_ref().context("missing UDF class")?.clone()),
+                    JavaArg::StringArray(config.current_udf_types.as_ref().context("missing UDF types")?.clone()),
                 ],
             )?);
         }
 
-        let udf_handle = udf.as_mut().context("UDF handle not initialized")?;
+        let udf_handle = config.udf.as_mut().context("UDF handle not initialized")?;
         if udf_handle.reload_if_changed()? {
             println!("Reloaded UDF classes after jar change");
         }
 
-        let mut debug_batches_remaining = args.debug_sample_batches;
-        let mut reader = BufReader::with_capacity(args.buf_size, pre);
-        let mut writer = BufWriter::with_capacity(args.buf_size, post);
+        let mut debug_batches_remaining = config.args.debug_sample_batches;
+        let mut reader = BufReader::with_capacity(config.args.buf_size, pre);
+        let mut writer = BufWriter::with_capacity(config.args.buf_size, post);
 
-        let batch_size = args.batch_size.max(1);
+        let batch_size = config.args.batch_size.max(1);
         let mut batch_rows: Vec<Vec<V>> = Vec::with_capacity(batch_size);
 
         let mut scratch = Vec::<u8>::new();
 
-        loop {
-            match read_framed_row(&mut reader, &session_cfg, args.max_frame_size, &mut scratch)? {
-                Some(row) => {
-                    validate_row_len(&row, session_cfg.expected_input_len)?;
-                    batch_rows.push(row);
-                    if batch_rows.len() >= batch_size {
-                        apply_udf_to_rows_stream(
-                            &mut writer,
-                            &batch_rows,
-                            &session_cfg,
-                            udf_handle,
-                            &args.udf_method,
-                            args.debug_sample_rows,
-                            &mut debug_batches_remaining,
-                            args.max_frame_size,
-                        )?;
-                        writer.flush().ok();
-                        batch_rows.clear();
-                    }
-                }
-                None => break,
+        while let Some(row) = read_framed_row(&mut reader, &session_cfg, config.args.max_frame_size, &mut scratch)? {
+            validate_row_len(&row, session_cfg.expected_input_len)?;
+            batch_rows.push(row);
+            if batch_rows.len() >= batch_size {
+                let mut udf_config = UdfConfig {
+                    writer: &mut writer,
+                    rows: &batch_rows,
+                    session: &session_cfg,
+                    udf: udf_handle,
+                    method: &config.args.udf_method,
+                    debug_sample_rows: config.args.debug_sample_rows,
+                    debug_batches_remaining: &mut debug_batches_remaining,
+                    max_frame_size: config.args.max_frame_size,
+                };
+                apply_udf_to_rows_stream(&mut udf_config)?;
+                writer.flush().ok();
+                batch_rows.clear();
             }
         }
 
         if !batch_rows.is_empty() {
-            apply_udf_to_rows_stream(
-                &mut writer,
-                &batch_rows,
-                &session_cfg,
-                udf_handle,
-                &args.udf_method,
-                args.debug_sample_rows,
-                &mut debug_batches_remaining,
-                args.max_frame_size,
-            )?;
+            let mut udf_config = UdfConfig {
+                writer: &mut writer,
+                rows: &batch_rows,
+                session: &session_cfg,
+                udf: udf_handle,
+                method: &config.args.udf_method,
+                debug_sample_rows: config.args.debug_sample_rows,
+                debug_batches_remaining: &mut debug_batches_remaining,
+                max_frame_size: config.args.max_frame_size,
+            };
+            apply_udf_to_rows_stream(&mut udf_config)?;
             writer.flush().ok();
         }
 
@@ -439,14 +431,14 @@ fn run_session(
     // ------------------------------------------------------------------
     // Parallel mode
     // ------------------------------------------------------------------
-    if args.debug_sample_rows > 0 {
+    if config.args.debug_sample_rows > 0 {
         eprintln!("Debug sampling disabled in parallel mode");
     }
 
-    let max_in_flight = if args.max_in_flight == 0 {
+    let max_in_flight = if config.args.max_in_flight == 0 {
         worker_count * 2
     } else {
-        args.max_in_flight
+        config.args.max_in_flight
     };
 
     let (result_tx, result_rx) = mpsc::channel::<WorkResult>();
@@ -460,11 +452,11 @@ fn run_session(
 
         let result_tx = result_tx.clone();
         let session_cfg = session_cfg.clone();
-        let udf_jars = args.udf_jars.clone();
-        let udf_adapter = args.udf_adapter_class.clone();
-        let udf_method = args.udf_method.clone();
-        let udf_class = current_udf_class.as_ref().context("missing UDF class")?.clone();
-        let udf_types = current_udf_types.as_ref().context("missing UDF types")?.clone();
+        let udf_jars = config.args.udf_jars.clone();
+        let udf_adapter = config.args.udf_adapter_class.clone();
+        let udf_method = config.args.udf_method.clone();
+        let udf_class = config.current_udf_class.as_ref().context("missing UDF class")?.clone();
+        let udf_types = config.current_udf_types.as_ref().context("missing UDF types")?.clone();
 
         let handle = thread::spawn(move || {
             let udf_handle = UdfHandle::new_with_args(
@@ -476,7 +468,10 @@ fn run_session(
             let udf_handle = match udf_handle {
                 Ok(handle) => handle,
                 Err(err) => {
-                    let _ = result_tx.send(WorkResult { seq: 0, result: Err(err) });
+                    let _ = result_tx.send(WorkResult {
+                        seq: 0,
+                        result: Err(err),
+                    });
                     return;
                 }
             };
@@ -502,9 +497,9 @@ fn run_session(
     drop(result_tx);
 
     let inflight_writer = Arc::clone(&inflight);
-    let writer_buf_size = args.buf_size;
+    let writer_buf_size = config.args.buf_size;
     let writer_session = session_cfg.clone();
-    let writer_max_frame = args.max_frame_size;
+    let writer_max_frame = config.args.max_frame_size;
     let writer_handle = thread::spawn(move || -> Result<()> {
         let mut writer = BufWriter::with_capacity(writer_buf_size, post);
         let mut pending: BTreeMap<usize, Vec<Vec<V>>> = BTreeMap::new();
@@ -542,14 +537,14 @@ fn run_session(
 
     let mut dispatched = 0usize;
     let mut send_index = 0usize;
-    let mut reader = BufReader::with_capacity(args.buf_size, pre);
+    let mut reader = BufReader::with_capacity(config.args.buf_size, pre);
 
-    let batch_size = args.batch_size.max(1);
+    let batch_size = config.args.batch_size.max(1);
     let mut batch_rows: Vec<Vec<V>> = Vec::with_capacity(batch_size);
     let mut scratch = Vec::<u8>::new();
 
     loop {
-        match read_framed_row(&mut reader, &session_cfg, args.max_frame_size, &mut scratch)? {
+        match read_framed_row(&mut reader, &session_cfg, config.args.max_frame_size, &mut scratch)? {
             Some(row) => {
                 validate_row_len(&row, session_cfg.expected_input_len)?;
                 batch_rows.push(row);
@@ -705,21 +700,14 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
         let pos = post_name_to_pos
             .get(&result.output_name)
             .copied()
-            .with_context(|| {
-                format!("functionResult {} not found in postFields", result.output_name)
-            })?;
+            .with_context(|| format!("functionResult {} not found in postFields", result.output_name))?;
         output_positions.push(pos);
         output_names.push(result.output_name.clone());
         let output_type = result
             .output_type
             .as_deref()
             .map(parse_field_type)
-            .with_context(|| {
-                format!(
-                    "functionResult outputType/wireType missing for {}",
-                    result.output_name
-                )
-            })?;
+            .with_context(|| format!("functionResult outputType/wireType missing for {}", result.output_name))?;
         output_types.push(output_type);
     }
 
@@ -767,12 +755,9 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
             )
         } else if output_name_set.contains(field.name.as_str()) {
             passthrough_identity = false;
-            let output_idx = output_pos_to_idx[pos]
+            output_pos_to_idx[pos]
                 .with_context(|| format!("missing output column for postField {}", field.name))?;
-            (
-                PostFieldSourceKind::Output,
-                OutputSlotKind::Output(output_idx),
-            )
+            (PostFieldSourceKind::Output, OutputSlotKind::Output)
         } else {
             bail!("postField {} not found in preFields", field.name);
         };
@@ -787,7 +772,6 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
     for (pos, slot) in output_slots.iter().enumerate() {
         match slot {
             OutputSlotKind::Nil => {
-                passthrough_identity = false;
                 bail!("output position {} not mapped by postFields", pos);
             }
             OutputSlotKind::InputPos(pre_pos) => {
@@ -805,7 +789,7 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
                     passthrough_identity = false;
                 }
             }
-            OutputSlotKind::Output(_) => {}
+            OutputSlotKind::Output => {}
         }
     }
 
@@ -813,12 +797,8 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
         reorder_responses,
         expected_input_len,
         output_row_len,
-        pre_name_to_pos,
-        post_fields: pre_cfg.post_fields.clone(),
-        post_field_positions,
         post_field_sources,
         passthrough_identity,
-        output_slots,
         arg_positions,
         arg_names,
         arg_types,
@@ -952,9 +932,7 @@ fn decode_field(buf: &[u8], p: &mut usize, t: &FieldType) -> Result<V> {
         FieldType::Date => {
             // wire: int32 days since epoch (Flink); internally store millis for UDF convenience
             let days = read_i32_be(buf, p)? as i64;
-            let millis = days
-                .checked_mul(86_400_000)
-                .context("DATE days->millis overflow")?;
+            let millis = days.checked_mul(86_400_000).context("DATE days->millis overflow")?;
             Ok(V::I64(millis))
         }
         FieldType::Decimal { precision, .. } => {
@@ -964,8 +942,7 @@ fn decode_field(buf: &[u8], p: &mut usize, t: &FieldType) -> Result<V> {
                 Ok(V::DecimalI128(unscaled))
             } else {
                 let bytes = read_len_bytes(buf, p)?;
-                let unscaled = twos_complement_be_to_i128(&bytes)
-                    .context("decimal bytes too large for i128")?;
+                let unscaled = twos_complement_be_to_i128(&bytes).context("decimal bytes too large for i128")?;
                 Ok(V::DecimalI128(unscaled))
             }
         }
@@ -975,8 +952,7 @@ fn decode_field(buf: &[u8], p: &mut usize, t: &FieldType) -> Result<V> {
         }
         FieldType::DecimalUnscaledBytes => {
             let bytes = read_len_bytes(buf, p)?;
-            let unscaled =
-                twos_complement_be_to_i128(&bytes).context("decimal bytes too large for i128")?;
+            let unscaled = twos_complement_be_to_i128(&bytes).context("decimal bytes too large for i128")?;
             Ok(V::DecimalI128(unscaled))
         }
     }
@@ -1004,7 +980,7 @@ fn write_framed_row<W: Write>(
     let mut payload: Vec<u8> = Vec::with_capacity(256);
 
     // __op
-    let op = match output_row.get(0) {
+    let op = match output_row.first() {
         Some(V::I32(v)) => *v,
         Some(V::I64(v)) => *v as i32,
         _ => 0,
@@ -1104,8 +1080,7 @@ fn encode_field(out: &mut Vec<u8>, v: &V, t: &FieldType) -> Result<()> {
             let unscaled = v_to_decimal_i128(v)?;
             let prec = precision.unwrap_or(38);
             if prec <= 18 {
-                let as_i64 = i64::try_from(unscaled)
-                    .map_err(|_| anyhow::anyhow!("DECIMAL_UNSCALED_I64 overflow"))?;
+                let as_i64 = i64::try_from(unscaled).map_err(|_| anyhow::anyhow!("DECIMAL_UNSCALED_I64 overflow"))?;
                 write_i64_be_vec(out, as_i64);
             } else {
                 let bytes = i128_to_twos_complement_be_minimal(unscaled);
@@ -1115,8 +1090,7 @@ fn encode_field(out: &mut Vec<u8>, v: &V, t: &FieldType) -> Result<()> {
         }
         FieldType::DecimalUnscaledI64 => {
             let unscaled = v_to_decimal_i128(v)?;
-            let as_i64 = i64::try_from(unscaled)
-                .map_err(|_| anyhow::anyhow!("DECIMAL_UNSCALED_I64 overflow"))?;
+            let as_i64 = i64::try_from(unscaled).map_err(|_| anyhow::anyhow!("DECIMAL_UNSCALED_I64 overflow"))?;
             write_i64_be_vec(out, as_i64);
         }
         FieldType::DecimalUnscaledBytes => {
@@ -1179,7 +1153,11 @@ fn read_len_bytes(buf: &[u8], p: &mut usize) -> Result<Vec<u8>> {
     }
     let len = len as usize;
     if *p + len > buf.len() {
-        bail!("truncated len-bytes: need {}, have {}", len, buf.len().saturating_sub(*p));
+        bail!(
+            "truncated len-bytes: need {}, have {}",
+            len,
+            buf.len().saturating_sub(*p)
+        );
     }
     let out = buf[*p..*p + len].to_vec();
     *p += len;
@@ -1253,11 +1231,7 @@ fn twos_complement_be_to_i128(bytes: &[u8]) -> Result<i128> {
 
 fn validate_row_len(row: &[V], expected_min: usize) -> Result<()> {
     if row.len() < expected_min {
-        bail!(
-            "row has {} values but expected at least {}",
-            row.len(),
-            expected_min
-        );
+        bail!("row has {} values but expected at least {}", row.len(), expected_min);
     }
     Ok(())
 }
@@ -1285,12 +1259,11 @@ fn apply_udf_to_rows(
     for row_idx in 0..rows.len() {
         let source_row = rows.get(row_idx).context("missing source row")?;
 
-        let mut out_row = if session.passthrough_identity && source_row.len() == session.output_row_len
-        {
+        let mut out_row = if session.passthrough_identity && source_row.len() == session.output_row_len {
             source_row.clone()
         } else {
             let mut row = vec![V::Null; session.output_row_len];
-            if let Some(op) = source_row.get(0) {
+            if let Some(op) = source_row.first() {
                 row[0] = op.clone();
             }
             if session.reorder_responses {
@@ -1354,15 +1327,17 @@ fn apply_udf_to_rows(
 }
 
 fn apply_udf_to_rows_stream<W: Write>(
-    writer: &mut W,
-    rows: &[Vec<V>],
-    session: &SessionConfig,
-    udf: &UdfHandle,
-    method: &str,
-    debug_sample_rows: usize,
-    debug_batches_remaining: &mut usize,
-    max_frame_size: usize,
+    config: &mut UdfConfig<W>,
 ) -> Result<()> {
+    let rows = config.rows;
+    let session = config.session;
+    let udf = config.udf;
+    let method = config.method;
+    let writer = &mut *config.writer;
+    let max_frame_size = config.max_frame_size;
+    let debug_sample_rows = config.debug_sample_rows;
+    let debug_batches_remaining = &mut *config.debug_batches_remaining;
+
     if rows.is_empty() {
         return Ok(());
     }
@@ -1386,13 +1361,11 @@ fn apply_udf_to_rows_stream<W: Write>(
     }
 
     // Streaming encoder: fill each post payload field by consulting output_slots.
-    for row_idx in 0..rows.len() {
-        let source_row = &rows[row_idx];
-
+    for (row_idx, source_row) in rows.iter().enumerate() {
         // Build the output row (only as a shallow vec) to make slot mapping simple.
         // This is still much cheaper than msgpack, and keeps behavior identical.
         let mut out_row = vec![V::Null; session.output_row_len];
-        if let Some(op) = source_row.get(0) {
+        if let Some(op) = source_row.first() {
             out_row[0] = op.clone();
         }
         if session.reorder_responses && session.output_row_len > 1 {
@@ -1467,14 +1440,12 @@ fn call_udf_to_columns(
 // Build input columns from decoded rows
 // -----------------------------------------------------------------------------
 
-fn build_input_columns(
-    rows: &[Vec<V>],
-    arg_positions: &[usize],
-    arg_types: &[FieldType],
-) -> Result<Vec<InputColumn>> {
+fn build_input_columns(rows: &[Vec<V>], arg_positions: &[usize], arg_types: &[FieldType]) -> Result<Vec<InputColumn>> {
     let mut columns = Vec::with_capacity(arg_positions.len());
     for (idx, arg_index) in arg_positions.iter().enumerate() {
-        let target_type = arg_types.get(idx).with_context(|| format!("missing arg type at {}", idx))?;
+        let target_type = arg_types
+            .get(idx)
+            .with_context(|| format!("missing arg type at {}", idx))?;
         let column = build_input_column(rows, *arg_index, target_type)?;
         columns.push(column);
     }
@@ -1604,9 +1575,7 @@ fn build_input_column(rows: &[Vec<V>], index: usize, target_type: &FieldType) ->
             }
             Ok(InputColumn::F32 { values, is_null: nulls })
         }
-        FieldType::Decimal { .. }
-        | FieldType::DecimalUnscaledI64
-        | FieldType::DecimalUnscaledBytes => {
+        FieldType::Decimal { .. } | FieldType::DecimalUnscaledI64 | FieldType::DecimalUnscaledBytes => {
             let mut values = Vec::with_capacity(rows.len());
             let mut nulls: Option<Vec<bool>> = None;
             for row in rows {
@@ -1652,7 +1621,9 @@ fn column_is_null(column: &InputColumn, row: usize) -> bool {
 }
 
 fn is_null_at(nulls: Option<&[bool]>, idx: usize) -> bool {
-    nulls.map(|vals| vals.get(idx).copied().unwrap_or(false)).unwrap_or(false)
+    nulls
+        .map(|vals| vals.get(idx).copied().unwrap_or(false))
+        .unwrap_or(false)
 }
 
 fn output_column_to_v(column: &InputColumn, row: usize, output_type: &FieldType) -> Result<V> {
@@ -1663,13 +1634,15 @@ fn output_column_to_v(column: &InputColumn, row: usize, output_type: &FieldType)
         FieldType::String | FieldType::Unknown(_) => Ok(V::String(input_column_to_string(column, row, output_type)?)),
         FieldType::Bytes => Ok(V::Bytes(input_column_to_string(column, row, output_type)?.into_bytes())),
         FieldType::Boolean => Ok(V::Bool(input_column_to_bool(column, row, output_type)?)),
-        FieldType::Int64 | FieldType::TimestampMillis | FieldType::Date => Ok(V::I64(input_column_to_i64(column, row, output_type)?)),
-        FieldType::Int32 | FieldType::Int16 | FieldType::Int8 => Ok(V::I32(input_column_to_i64(column, row, output_type)? as i32)),
+        FieldType::Int64 | FieldType::TimestampMillis | FieldType::Date => {
+            Ok(V::I64(input_column_to_i64(column, row, output_type)?))
+        }
+        FieldType::Int32 | FieldType::Int16 | FieldType::Int8 => {
+            Ok(V::I32(input_column_to_i64(column, row, output_type)? as i32))
+        }
         FieldType::Float64 => Ok(V::F64(input_column_to_f64(column, row, output_type)?)),
         FieldType::Float32 => Ok(V::F32(input_column_to_f64(column, row, output_type)? as f32)),
-        FieldType::Decimal { .. }
-        | FieldType::DecimalUnscaledI64
-        | FieldType::DecimalUnscaledBytes => {
+        FieldType::Decimal { .. } | FieldType::DecimalUnscaledI64 | FieldType::DecimalUnscaledBytes => {
             Ok(V::DecimalI128(input_column_to_decimal(column, row, output_type)?))
         }
     }
@@ -1763,11 +1736,18 @@ fn input_column_to_decimal(column: &InputColumn, row: usize, _source_type: &Fiel
         InputColumn::Decimal128 { values, .. } => Ok(values.get(row).copied().unwrap_or(0)),
         InputColumn::I64 { values, .. } => Ok(*values.get(row).unwrap_or(&0) as i128),
         InputColumn::I32 { values, .. } => Ok(*values.get(row).unwrap_or(&0) as i128),
-        InputColumn::F64 { values, .. } => parse_decimal_to_i128(&values.get(row).copied().unwrap_or(0.0).to_string(), 0),
-        InputColumn::F32 { values, .. } => parse_decimal_to_i128(&values.get(row).copied().unwrap_or(0.0).to_string(), 0),
+        InputColumn::F64 { values, .. } => {
+            parse_decimal_to_i128(&values.get(row).copied().unwrap_or(0.0).to_string(), 0)
+        }
+        InputColumn::F32 { values, .. } => {
+            parse_decimal_to_i128(&values.get(row).copied().unwrap_or(0.0).to_string(), 0)
+        }
         InputColumn::Bool { values, .. } => Ok(if *values.get(row).unwrap_or(&false) { 1 } else { 0 }),
         InputColumn::String(values) => {
-            let s = values.get(row).and_then(|v| v.as_deref()).ok_or_else(|| anyhow::anyhow!("null string value"))?;
+            let s = values
+                .get(row)
+                .and_then(|v| v.as_deref())
+                .ok_or_else(|| anyhow::anyhow!("null string value"))?;
             parse_decimal_to_i128(s, 0)
         }
     }
@@ -1861,8 +1841,7 @@ fn maybe_print_debug_rows(
 
     let sample_rows = debug_sample_rows.min(input_rows.len());
     println!("Debug sample ({} of {} rows):", sample_rows, input_rows.len());
-    for row_idx in 0..sample_rows {
-        let row = &input_rows[row_idx];
+    for (row_idx, row) in input_rows.iter().take(sample_rows).enumerate() {
         let mut input_parts = Vec::with_capacity(session.arg_names.len());
         for (arg_pos, name) in session.arg_names.iter().enumerate() {
             let idx = session.arg_positions.get(arg_pos).copied().unwrap_or(0);
@@ -1879,7 +1858,12 @@ fn maybe_print_debug_rows(
             }
         }
 
-        println!("  row {}: {} -> {}", row_idx, input_parts.join(", "), output_parts.join(", "));
+        println!(
+            "  row {}: {} -> {}",
+            row_idx,
+            input_parts.join(", "),
+            output_parts.join(", ")
+        );
     }
 
     *debug_batches_remaining = debug_batches_remaining.saturating_sub(1);
@@ -2005,26 +1989,16 @@ fn decimal_to_string(value: i128, scale: i8) -> String {
         let split = digits.len() - scale;
         let (int_part, frac_part) = digits.split_at(split);
         let s = format!("{}.{}", int_part, frac_part);
-        if negative { format!("-{}", s) } else { s }
+        if negative {
+            format!("-{}", s)
+        } else {
+            s
+        }
     } else if negative {
         format!("-{}", digits)
     } else {
         digits
     }
-}
-
-// Keep timestamp parsing (for any fallback text conversions)
-fn parse_timestamp(value: &str) -> Result<NaiveDateTime> {
-    NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
-        .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S"))
-        .with_context(|| format!("failed to parse timestamp from {value}"))
-}
-
-fn parse_date_string(value: &str) -> Result<i64> {
-    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .with_context(|| format!("failed to parse date from {value}"))?;
-    let dt = date.and_hms_opt(0, 0, 0).context("invalid date")?;
-    Ok(DateTime::<Utc>::from_utc(dt, Utc).timestamp_millis())
 }
 
 fn parse_field_type(type_str: &str) -> FieldType {
@@ -2059,10 +2033,7 @@ fn parse_decimal_precision_scale(type_str: &str) -> (Option<u8>, i8) {
         let inner = &trimmed[start + 1..end];
         let mut parts = inner.split(',');
         let precision = parts.next().and_then(|p| p.trim().parse::<u8>().ok());
-        let scale = parts
-            .next()
-            .and_then(|s| s.trim().parse::<i8>().ok())
-            .unwrap_or(0);
+        let scale = parts.next().and_then(|s| s.trim().parse::<i8>().ok()).unwrap_or(0);
         (precision, scale)
     } else {
         (None, 0)

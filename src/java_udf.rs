@@ -51,6 +51,7 @@ impl InputColumn {
     }
 }
 
+#[derive(Debug)]
 pub struct UdfHandle {
     classpath_jars: Vec<PathBuf>,
     class_name: String,

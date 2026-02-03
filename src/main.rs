@@ -4,8 +4,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::udf::{InputColumn, UdfHandle, UdfLanguage};
 
@@ -14,6 +16,74 @@ mod rust_udf;
 mod udf;
 
 const DEFAULT_MAX_FRAME_SIZE: usize = 64 * 1024 * 1024; // 64 MiB hard safety cap
+
+#[derive(Clone, Debug)]
+struct ReloadSignal {
+    version: Arc<AtomicU64>,
+    last_paths: Arc<Mutex<Vec<PathBuf>>>,
+}
+
+impl ReloadSignal {
+    fn new() -> Self {
+        Self {
+            version: Arc::new(AtomicU64::new(0)),
+            last_paths: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn bump(&self, paths: Vec<PathBuf>) {
+        if let Ok(mut guard) = self.last_paths.lock() {
+            *guard = paths;
+        }
+        self.version.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn current(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    fn take_paths(&self) -> Vec<PathBuf> {
+        if let Ok(mut guard) = self.last_paths.lock() {
+            return std::mem::take(&mut *guard);
+        }
+        Vec::new()
+    }
+}
+
+struct ReloadWatcher {
+    _watcher: RecommendedWatcher,
+    signal: ReloadSignal,
+}
+
+impl ReloadWatcher {
+    fn new(paths: Vec<PathBuf>) -> Result<Self> {
+        let signal = ReloadSignal::new();
+        let signal_cb = signal.clone();
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(event) = res {
+                signal_cb.bump(event.paths);
+            }
+        })?;
+
+        for path in &paths {
+            println!("UDF watcher: watching {}", path.display());
+        }
+        for path in paths {
+            if let Err(err) = watcher.watch(&path, RecursiveMode::NonRecursive) {
+                eprintln!("Failed to watch {}: {}", path.display(), err);
+            }
+        }
+
+        Ok(Self {
+            _watcher: watcher,
+            signal,
+        })
+    }
+
+    fn signal(&self) -> ReloadSignal {
+        self.signal.clone()
+    }
+}
 
 fn default_rust_udf_lib() -> PathBuf {
     PathBuf::from("lib")
@@ -84,6 +154,68 @@ fn resolve_rust_udf_lib(base: &Path, udf_class: &str) -> PathBuf {
     }
 }
 
+fn udf_reload_watch_paths(args: &Args, udf_class: &str) -> Vec<PathBuf> {
+    let mut paths = HashSet::new();
+
+    for jar in &args.udf_jars {
+        if let Some(parent) = jar.parent() {
+            paths.insert(parent.to_path_buf());
+        } else {
+            paths.insert(jar.to_path_buf());
+        }
+    }
+
+    let rust_base = &args.rust_udf_lib;
+    let rust_watch = if rust_base.is_dir() || rust_base.extension().is_none() {
+        rust_base.clone()
+    } else {
+        rust_base.parent().unwrap_or(Path::new(".")).to_path_buf()
+    };
+    paths.insert(rust_watch);
+
+    // Also watch the resolved class-specific path if it has a parent dir.
+    let class_path = resolve_rust_udf_lib(&args.rust_udf_lib, udf_class);
+    if let Some(parent) = class_path.parent() {
+        paths.insert(parent.to_path_buf());
+    }
+
+    paths.into_iter().collect()
+}
+
+fn maybe_reload_udf(
+    udf: &mut UdfHandle,
+    udf_class: &str,
+    reload_signal: Option<&ReloadSignal>,
+    last_version: &mut u64,
+) -> Result<()> {
+    if let Some(signal) = reload_signal {
+        let version = signal.current();
+        if version != *last_version {
+            *last_version = version;
+            let paths = signal.take_paths();
+            if !paths.is_empty() {
+                let list = paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("UDF change detected for {}: {}", udf_class, list);
+            } else {
+                println!("UDF change detected for {}", udf_class);
+            }
+            if udf.reload_if_changed()? {
+                println!("UDF reloaded for {} (updated version running)", udf_class);
+            }
+        }
+        return Ok(());
+    }
+
+    if udf.reload_if_changed()? {
+        println!("Reloaded UDF after change");
+    }
+    Ok(())
+}
+
 #[derive(Parser, Debug)]
 struct Args {
     #[arg(long, default_value = "0.0.0.0")]
@@ -99,6 +231,9 @@ struct Args {
     workers: usize,
     #[arg(long, default_value_t = 0)]
     max_in_flight: usize,
+
+    #[arg(long, default_value_t = true)]
+    udf_reload_watch: bool,
 
     #[arg(long, default_value_t = DEFAULT_MAX_FRAME_SIZE)]
     max_frame_size: usize,
@@ -443,6 +578,24 @@ fn run_session(
         *config.current_udf_types = Some(desired_udf_types);
     }
 
+    let mut reload_signal: Option<ReloadSignal> = None;
+    let _reload_watcher = if config.args.udf_reload_watch {
+        let udf_class = config.current_udf_class.as_ref().context("missing UDF class")?;
+        let watch_paths = udf_reload_watch_paths(config.args, udf_class);
+        match ReloadWatcher::new(watch_paths) {
+            Ok(watcher) => {
+                reload_signal = Some(watcher.signal());
+                Some(watcher)
+            }
+            Err(err) => {
+                eprintln!("Failed to initialize UDF watcher: {err:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let worker_count = config.args.workers.max(1);
 
     // ------------------------------------------------------------------
@@ -474,6 +627,8 @@ fn run_session(
         let mut writer = BufWriter::with_capacity(config.args.buf_size, post);
 
         let batch_size = config.args.batch_size.max(1);
+        let mut last_reload_version = reload_signal.as_ref().map(|s| s.current()).unwrap_or(0);
+        let udf_class = config.current_udf_class.as_ref().context("missing UDF class")?.clone();
         let mut batch_rows: Vec<Vec<V>> = Vec::with_capacity(batch_size);
 
         let mut scratch = Vec::<u8>::new();
@@ -482,6 +637,12 @@ fn run_session(
             validate_row_len(&row, session_cfg.expected_input_len)?;
             batch_rows.push(row);
             if batch_rows.len() >= batch_size {
+                maybe_reload_udf(
+                    udf_handle,
+                    &udf_class,
+                    reload_signal.as_ref(),
+                    &mut last_reload_version,
+                )?;
                 let mut udf_config = UdfConfig {
                     writer: &mut writer,
                     rows: &batch_rows,
@@ -499,6 +660,12 @@ fn run_session(
         }
 
         if !batch_rows.is_empty() {
+            maybe_reload_udf(
+                udf_handle,
+                &udf_class,
+                reload_signal.as_ref(),
+                &mut last_reload_version,
+            )?;
             let mut udf_config = UdfConfig {
                 writer: &mut writer,
                 rows: &batch_rows,
@@ -548,6 +715,7 @@ fn run_session(
         let udf_class = config.current_udf_class.as_ref().context("missing UDF class")?.clone();
         let udf_types = config.current_udf_types.as_ref().context("missing UDF types")?.clone();
         let rust_udf_lib = resolve_rust_udf_lib(&config.args.rust_udf_lib, &udf_class);
+        let reload_signal = reload_signal.clone();
 
         let handle = thread::spawn(move || {
             let udf_handle = UdfHandle::new(
@@ -570,8 +738,18 @@ fn run_session(
             };
 
             let mut debug_batches_remaining = 0usize;
+            let mut last_reload_version = reload_signal.as_ref().map(|s| s.current()).unwrap_or(0);
             for msg in rx {
                 let Some(work) = msg else { break };
+                if let Err(err) = maybe_reload_udf(
+                    &mut udf_handle,
+                    &udf_class,
+                    reload_signal.as_ref(),
+                    &mut last_reload_version,
+                ) {
+                    let _ = result_tx.send(WorkResult { seq: work.seq, result: Err(err) });
+                    continue;
+                }
                 let result = apply_udf_to_rows(
                     &work.rows,
                     &session_cfg,

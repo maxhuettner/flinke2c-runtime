@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use jni::objects::{GlobalRef, JClass, JObject, JObjectArray, JString, JValue, JValueOwned};
+use jni::objects::{GlobalRef, JClass, JObject, JObjectArray, JString, JValue};
 use jni::sys::{jboolean, jbyte};
 use jni::{InitArgsBuilder, JNIVersion, JNIEnv, JavaVM};
 use std::fs;
@@ -60,6 +60,12 @@ pub struct UdfHandle {
     jar_state: Vec<JarState>,
     class_loader: GlobalRef,
     udf_obj: GlobalRef,
+    /// True once setContextClassLoader has been called on the owning thread.
+    /// Avoids Thread.currentThread() + setContextClassLoader() on every batch.
+    context_loader_set: bool,
+    /// Cached Java String[] for the output-column names; rebuilt only when
+    /// the names vector changes between sessions.
+    cached_output_names: Option<(Vec<String>, GlobalRef)>,
 }
 
 impl UdfHandle {
@@ -88,188 +94,14 @@ impl UdfHandle {
             jar_state,
             class_loader,
             udf_obj,
+            context_loader_set: false,
+            cached_output_names: None,
         })
-    }
-
-    /// Call a method on the cached UDF and return its result via `toString`.
-    pub fn call_to_string(
-        &self,
-        method: &str,
-        method_sig: &str,
-        args: &[JavaArg],
-    ) -> Result<Option<String>> {
-        let jvm = get_or_create_jvm()?;
-        let mut env = jvm
-            .attach_current_thread()
-            .context("attach JVM thread")?;
-        set_context_class_loader(&mut env, self.class_loader.as_obj())?;
-
-        let mut keepalive = Vec::new();
-        let jargs = build_jargs(&mut env, args, &mut keepalive)?;
-        let ret = env.call_method(self.udf_obj.as_obj(), method, method_sig, &jargs)?;
-        check_exception(&mut env, "invoke method")?;
-        jvalue_to_string(&mut env, ret)
-    }
-
-    /// Call a method that takes a single String[] argument and returns void.
-    pub fn call_string_array(
-        &self,
-        method: &str,
-        method_sig: &str,
-        values: &[Option<String>],
-    ) -> Result<()> {
-        let jvm = get_or_create_jvm()?;
-        let mut env = jvm
-            .attach_current_thread()
-            .context("attach JVM thread")?;
-        set_context_class_loader(&mut env, self.class_loader.as_obj())?;
-
-        let array = new_string_array(&mut env, values)?;
-        let ret = env.call_method(
-            self.udf_obj.as_obj(),
-            method,
-            method_sig,
-            &[JValue::Object(&array)],
-        )?;
-        check_exception(&mut env, "invoke method")?;
-        if !matches!(ret, JValueOwned::Void) {
-            let _ = jvalue_to_string(&mut env, ret)?;
-        }
-        Ok(())
-    }
-
-    /// Call a method that takes a single String[] argument and returns String[][].
-    pub fn call_string_array_to_columns(
-        &self,
-        method: &str,
-        method_sig: &str,
-        values: &[Option<String>],
-    ) -> Result<Vec<Vec<Option<String>>>> {
-        let jvm = get_or_create_jvm()?;
-        let mut env = jvm
-            .attach_current_thread()
-            .context("attach JVM thread")?;
-        set_context_class_loader(&mut env, self.class_loader.as_obj())?;
-
-        let array = new_string_array(&mut env, values)?;
-        let ret = env.call_method(
-            self.udf_obj.as_obj(),
-            method,
-            method_sig,
-            &[JValue::Object(&array)],
-        )?;
-        check_exception(&mut env, "invoke method")?;
-        let obj = ret.l()?;
-        string_matrix_to_vec(&mut env, obj)
-    }
-
-    /// Call a method that takes a single String[][] argument and returns void.
-    /// The matrix is column-major: columns[arg_index][row_index].
-    pub fn call_string_matrix(
-        &self,
-        method: &str,
-        method_sig: &str,
-        columns: &[Vec<Option<String>>],
-    ) -> Result<()> {
-        if columns.is_empty() {
-            return Ok(());
-        }
-        let row_count = columns[0].len();
-        if columns.iter().any(|col| col.len() != row_count) {
-            bail!("string matrix columns have mismatched lengths");
-        }
-
-        let jvm = get_or_create_jvm()?;
-        let mut env = jvm
-            .attach_current_thread()
-            .context("attach JVM thread")?;
-        set_context_class_loader(&mut env, self.class_loader.as_obj())?;
-
-        let matrix = new_string_matrix(&mut env, columns)?;
-        let ret = env.call_method(
-            self.udf_obj.as_obj(),
-            method,
-            method_sig,
-            &[JValue::Object(&matrix)],
-        )?;
-        check_exception(&mut env, "invoke method")?;
-        if !matches!(ret, JValueOwned::Void) {
-            let _ = jvalue_to_string(&mut env, ret)?;
-        }
-        Ok(())
-    }
-
-    /// Call a method that takes a single String[][] argument and returns String[][].
-    pub fn call_string_matrix_to_columns(
-        &self,
-        method: &str,
-        method_sig: &str,
-        columns: &[Vec<Option<String>>],
-    ) -> Result<Vec<Vec<Option<String>>>> {
-        if columns.is_empty() {
-            return Ok(Vec::new());
-        }
-        let row_count = columns[0].len();
-        if columns.iter().any(|col| col.len() != row_count) {
-            bail!("string matrix columns have mismatched lengths");
-        }
-
-        let jvm = get_or_create_jvm()?;
-        let mut env = jvm
-            .attach_current_thread()
-            .context("attach JVM thread")?;
-        set_context_class_loader(&mut env, self.class_loader.as_obj())?;
-
-        let matrix = new_string_matrix(&mut env, columns)?;
-        let ret = env.call_method(
-            self.udf_obj.as_obj(),
-            method,
-            method_sig,
-            &[JValue::Object(&matrix)],
-        )?;
-        check_exception(&mut env, "invoke method")?;
-        let obj = ret.l()?;
-        string_matrix_to_vec(&mut env, obj)
-    }
-
-    /// Call a method that takes Object[] columns + boolean[][] nulls and returns String[][].
-    pub fn call_typed_columns_to_columns(
-        &self,
-        method: &str,
-        columns: &[InputColumn],
-    ) -> Result<Vec<Vec<Option<String>>>> {
-        if columns.is_empty() {
-            return Ok(Vec::new());
-        }
-        let row_count = columns[0].len();
-        if columns.iter().any(|col| col.len() != row_count) {
-            bail!("typed columns have mismatched lengths");
-        }
-
-        let jvm = get_or_create_jvm()?;
-        let mut env = jvm
-            .attach_current_thread()
-            .context("attach JVM thread")?;
-        set_context_class_loader(&mut env, self.class_loader.as_obj())?;
-
-        let (columns_obj, nulls_obj) = new_typed_columns(&mut env, columns)?;
-        let ret = env.call_method(
-            self.udf_obj.as_obj(),
-            method,
-            "([Ljava/lang/Object;[[Z)[[Ljava/lang/String;",
-            &[
-                JValue::Object(&columns_obj),
-                JValue::Object(&nulls_obj),
-            ],
-        )?;
-        check_exception(&mut env, "invoke method")?;
-        let obj = ret.l()?;
-        string_matrix_to_vec(&mut env, obj)
     }
 
     /// Call a method that takes Object[] columns + boolean[][] nulls and returns ColumnarResult.
     pub fn call_typed_columns_to_typed_results(
-        &self,
+        &mut self,
         method: &str,
         columns: &[InputColumn],
     ) -> Result<Vec<InputColumn>> {
@@ -285,7 +117,10 @@ impl UdfHandle {
         let mut env = jvm
             .attach_current_thread()
             .context("attach JVM thread")?;
-        set_context_class_loader(&mut env, self.class_loader.as_obj())?;
+        if !self.context_loader_set {
+            set_context_class_loader(&mut env, self.class_loader.as_obj())?;
+            self.context_loader_set = true;
+        }
 
         let (columns_obj, nulls_obj) = new_typed_columns(&mut env, columns)?;
         let ret = env.call_method(
@@ -324,7 +159,7 @@ impl UdfHandle {
     /// Call a method that takes Object[] columns + boolean[][] nulls + String[] outputNames
     /// and returns ColumnarResult.
     pub fn call_typed_columns_to_named_results(
-        &self,
+        &mut self,
         method: &str,
         columns: &[InputColumn],
         output_names: &[String],
@@ -341,10 +176,19 @@ impl UdfHandle {
         let mut env = jvm
             .attach_current_thread()
             .context("attach JVM thread")?;
-        set_context_class_loader(&mut env, self.class_loader.as_obj())?;
+        if !self.context_loader_set {
+            set_context_class_loader(&mut env, self.class_loader.as_obj())?;
+            self.context_loader_set = true;
+        }
 
         let (columns_obj, nulls_obj) = new_typed_columns(&mut env, columns)?;
-        let names_obj = new_string_array_from_strings(&mut env, output_names)?;
+        // Cache the output-names String[] across batches; rebuild only when names change.
+        if self.cached_output_names.as_ref().is_none_or(|(names, _)| names != output_names) {
+            let new_obj = new_string_array_from_strings(&mut env, output_names)?;
+            let global = env.new_global_ref(&new_obj)?;
+            self.cached_output_names = Some((output_names.to_vec(), global));
+        }
+        let names_ref = self.cached_output_names.as_ref().unwrap().1.as_obj();
         let ret = env.call_method(
             self.udf_obj.as_obj(),
             method,
@@ -352,7 +196,7 @@ impl UdfHandle {
             &[
                 JValue::Object(&columns_obj),
                 JValue::Object(&nulls_obj),
-                JValue::Object(&names_obj),
+                JValue::Object(names_ref),
             ],
         )?;
         check_exception(&mut env, "invoke method")?;
@@ -412,15 +256,9 @@ impl UdfHandle {
         self.jar_state = jar_state;
         self.udf_obj = udf_obj;
         self.class_loader = class_loader;
+        self.context_loader_set = false;
+        self.cached_output_names = None;
         Ok(())
-    }
-
-    pub fn classpath(&self) -> &[PathBuf] {
-        &self.classpath_jars
-    }
-
-    pub fn class_name(&self) -> &str {
-        &self.class_name
     }
 
     fn close_class_loader(&self) {
@@ -436,72 +274,6 @@ impl Drop for UdfHandle {
     fn drop(&mut self) {
         self.close_class_loader();
     }
-}
-
-/// Call any Java method and return the result as a string via `toString`.
-/// This creates a new classloader each call; use `UdfHandle` for hot code paths.
-/// Provide the exact JNI method signature (e.g. "(Ljava/lang/String;)I").
-pub fn call_udf_to_string(
-    classpath_jars: &[PathBuf],
-    class_name: &str,
-    method: &str,
-    method_sig: &str,
-    args: &[JavaArg],
-) -> Result<Option<String>> {
-    let jvm = get_or_create_jvm()?;
-    let mut env = jvm
-        .attach_current_thread()
-        .context("attach JVM thread")?;
-
-    let classpath = normalize_classpath(classpath_jars)?;
-
-    // Create a fresh classloader each call so updated jars can be picked up.
-    let (udf_obj, class_loader) = load_udf_instance(&mut env, &classpath, class_name)?;
-    let mut keepalive = Vec::new();
-    let jargs = build_jargs(&mut env, args, &mut keepalive)?;
-
-    let ret = env.call_method(udf_obj, method, method_sig, &jargs)?;
-    check_exception(&mut env, "invoke method")?;
-    let out = jvalue_to_string(&mut env, ret)?;
-
-    let _ = env.call_method(&class_loader, "close", "()V", &[]);
-    Ok(out)
-}
-
-/// Evaluate the Flink UDF inside the jar and return the result as a string.
-/// Pass decimals as strings to avoid float precision loss.
-pub fn eval_currency_conversion(
-    jar_path: impl AsRef<Path>,
-    price: Option<&str>,
-) -> Result<Option<String>> {
-    let jars = vec![jar_path.as_ref().to_path_buf()];
-    call_decimal_udf(
-        &jars,
-        "org.example.flinke2c.CurrencyConversionFunction",
-        "eval",
-        price,
-    )
-}
-
-/// Invoke a Java method that takes/returns BigDecimal.
-/// `classpath_jars` can include extra jars if your UDF depends on them.
-pub fn call_decimal_udf(
-    classpath_jars: &[PathBuf],
-    class_name: &str,
-    method: &str,
-    price: Option<&str>,
-) -> Result<Option<String>> {
-    let args = match price {
-        Some(v) => vec![JavaArg::BigDecimal(v.to_string())],
-        None => vec![JavaArg::Null],
-    };
-    call_udf_to_string(
-        classpath_jars,
-        class_name,
-        method,
-        "(Ljava/math/BigDecimal;)Ljava/math/BigDecimal;",
-        &args,
-    )
 }
 
 fn get_or_create_jvm() -> Result<&'static JavaVM> {
@@ -578,18 +350,6 @@ fn create_udf_instance(
     let class_loader = env.new_global_ref(class_loader)?;
 
     Ok((udf_obj, class_loader))
-}
-
-fn load_udf_instance<'local>(
-    env: &mut JNIEnv<'local>,
-    classpath_jars: &[PathBuf],
-    class_name: &str,
-) -> Result<(JObject<'local>, JObject<'local>)> {
-    let (class_obj, class_loader) = load_udf_class(env, classpath_jars, class_name)?;
-    let udf_obj = env.call_method(class_obj, "newInstance", "()Ljava/lang/Object;", &[])?;
-    check_exception(env, "Class.newInstance")?;
-
-    Ok((udf_obj.l()?, class_loader))
 }
 
 fn load_udf_instance_with_args<'local>(
@@ -810,56 +570,6 @@ fn new_string_array_from_strings<'local>(
     Ok(JObject::from(array))
 }
 
-fn new_string_matrix<'local>(
-    env: &mut JNIEnv<'local>,
-    columns: &[Vec<Option<String>>],
-) -> Result<JObject<'local>> {
-    let string_array_class = env.find_class("[Ljava/lang/String;")?;
-    let outer: JObjectArray =
-        env.new_object_array(columns.len() as i32, string_array_class, JObject::null())?;
-
-    for (idx, column) in columns.iter().enumerate() {
-        let inner = new_string_array(env, column)?;
-        env.set_object_array_element(&outer, idx as i32, inner)?;
-    }
-
-    Ok(JObject::from(outer))
-}
-
-fn string_matrix_to_vec(
-    env: &mut JNIEnv<'_>,
-    matrix_obj: JObject<'_>,
-) -> Result<Vec<Vec<Option<String>>>> {
-    if matrix_obj.is_null() {
-        return Ok(Vec::new());
-    }
-
-    let outer = JObjectArray::from(matrix_obj);
-    let outer_len = env.get_array_length(&outer)?;
-    let mut columns = Vec::with_capacity(outer_len as usize);
-    let mut expected_rows: Option<usize> = None;
-
-    for idx in 0..outer_len {
-        let inner_obj = env.get_object_array_element(&outer, idx)?;
-        let column = string_array_to_vec(env, inner_obj)?;
-        if let Some(rows) = expected_rows {
-            if column.len() != rows {
-                bail!(
-                    "returned column {} has {} rows but expected {}",
-                    idx,
-                    column.len(),
-                    rows
-                );
-            }
-        } else {
-            expected_rows = Some(column.len());
-        }
-        columns.push(column);
-    }
-
-    Ok(columns)
-}
-
 fn typed_columns_to_vec(
     env: &mut JNIEnv<'_>,
     columns_obj: JObjectArray<'_>,
@@ -957,13 +667,14 @@ fn nulls_matrix_to_vec(
     };
 
     let outer_len = env.get_array_length(&nulls_obj)? as usize;
-    for idx in 0..outer_len.min(col_len) {
+    let num_cols = outer_len.min(col_len);
+    for (idx, out) in out.iter_mut().take(num_cols).enumerate() {
         let inner_obj = env.get_object_array_element(&nulls_obj, idx as i32)?;
         if inner_obj.is_null() {
             continue;
         }
         let values = boolean_array_to_vec(env, inner_obj)?;
-        out[idx] = Some(values);
+        *out = Some(values);
     }
     Ok(out)
 }
@@ -1011,7 +722,7 @@ fn boolean_array_to_vec(env: &mut JNIEnv<'_>, obj: JObject<'_>) -> Result<Vec<bo
 fn byte_array_to_i128_vec(env: &mut JNIEnv<'_>, obj: JObject<'_>) -> Result<Vec<i128>> {
     let array = jni::objects::JByteArray::from(obj);
     let len = env.get_array_length(&array)? as usize;
-    if len % 16 != 0 {
+    if !len.is_multiple_of(16) {
         bail!("decimal byte array length {} is not divisible by 16", len);
     }
     let mut raw = vec![0_i8; len];
@@ -1093,7 +804,7 @@ fn input_column_to_java<'local>(
     match column {
         InputColumn::String(values) => {
             let array = new_string_array(env, values)?;
-            Ok((JObject::from(array), None))
+            Ok((array, None))
         }
         InputColumn::I64 { values, is_null } => {
             let array = env.new_long_array(values.len() as i32)?;
@@ -1157,29 +868,6 @@ fn build_nulls_array<'local>(
         .collect();
     env.set_boolean_array_region(&array, 0, &raw)?;
     Ok(Some(JObject::from(array)))
-}
-
-fn jvalue_to_string(env: &mut JNIEnv<'_>, value: JValueOwned<'_>) -> Result<Option<String>> {
-    match value {
-        JValueOwned::Void => Ok(None),
-        JValueOwned::Object(obj) => {
-            if obj.is_null() {
-                return Ok(None);
-            }
-            let s = env.call_method(obj, "toString", "()Ljava/lang/String;", &[])?;
-            check_exception(env, "Object.toString")?;
-            let s: String = env.get_string(&JString::from(s.l()?))?.into();
-            Ok(Some(s))
-        }
-        JValueOwned::Bool(v) => Ok(Some((v != 0).to_string())),
-        JValueOwned::Byte(v) => Ok(Some(v.to_string())),
-        JValueOwned::Char(v) => Ok(Some((v as u32).to_string())),
-        JValueOwned::Short(v) => Ok(Some(v.to_string())),
-        JValueOwned::Int(v) => Ok(Some(v.to_string())),
-        JValueOwned::Long(v) => Ok(Some(v.to_string())),
-        JValueOwned::Float(v) => Ok(Some(v.to_string())),
-        JValueOwned::Double(v) => Ok(Some(v.to_string())),
-    }
 }
 
 fn augment_classpath(classpath_jars: &[PathBuf]) -> Vec<PathBuf> {

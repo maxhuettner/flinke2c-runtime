@@ -140,6 +140,8 @@ struct SessionConfig {
     pre_payload_types: Vec<FieldType>,
     post_payload_positions: Vec<usize>,
     post_payload_types: Vec<FieldType>,
+    /// Direct columnar source for each post-payload field (parallel to post_payload_positions/types).
+    post_payload_sources: Vec<PayloadSource>,
 }
 
 #[derive(Clone, Debug)]
@@ -154,6 +156,15 @@ enum PostFieldSourceKind {
 struct PostFieldSource {
     pos: usize,
     kind: PostFieldSourceKind,
+}
+
+/// Maps each post-payload slot to its data source for zero-alloc columnar encode.
+#[derive(Clone, Debug)]
+enum PayloadSource {
+    /// Value comes from the input row at the given position.
+    InputAt(usize),
+    /// Value comes from the UDF output column at the given index.
+    OutputAt(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -195,7 +206,7 @@ struct UdfConfig<'a, W: Write> {
     writer: &'a mut W,
     rows: &'a [Vec<V>],
     session: &'a SessionConfig,
-    udf: &'a UdfHandle,
+    udf: &'a mut UdfHandle,
     method: &'a str,
     debug_sample_rows: usize,
     debug_batches_remaining: &'a mut usize,
@@ -465,7 +476,7 @@ fn run_session(
                 "(Ljava/lang/String;[Ljava/lang/String;)V",
                 &[JavaArg::String(udf_class), JavaArg::StringArray(udf_types)],
             );
-            let udf_handle = match udf_handle {
+            let mut udf_handle = match udf_handle {
                 Ok(handle) => handle,
                 Err(err) => {
                     let _ = result_tx.send(WorkResult {
@@ -482,7 +493,7 @@ fn run_session(
                 let result = apply_udf_to_rows(
                     &work.rows,
                     &session_cfg,
-                    &udf_handle,
+                    &mut udf_handle,
                     &udf_method,
                     0,
                     &mut debug_batches_remaining,
@@ -504,16 +515,17 @@ fn run_session(
         let mut writer = BufWriter::with_capacity(writer_buf_size, post);
         let mut pending: BTreeMap<usize, Vec<Vec<V>>> = BTreeMap::new();
         let mut next_seq = 0usize;
+        let mut payload_buf = Vec::with_capacity(256);
 
         while let Ok(work) = result_rx.recv() {
             let WorkResult { seq, result } = work;
             let rows = result?;
             if seq == next_seq {
-                write_framed_rows(&mut writer, &rows, &writer_session, writer_max_frame)?;
+                write_framed_rows(&mut writer, &rows, &writer_session, writer_max_frame, &mut payload_buf)?;
                 writer.flush().ok();
                 next_seq += 1;
                 while let Some(next_rows) = pending.remove(&next_seq) {
-                    write_framed_rows(&mut writer, &next_rows, &writer_session, writer_max_frame)?;
+                    write_framed_rows(&mut writer, &next_rows, &writer_session, writer_max_frame, &mut payload_buf)?;
                     writer.flush().ok();
                     next_seq += 1;
                 }
@@ -793,6 +805,25 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
         }
     }
 
+    // Build per-payload-slot source map for direct columnar encode.
+    let mut output_name_to_idx = std::collections::HashMap::new();
+    for (i, name) in output_names.iter().enumerate() {
+        output_name_to_idx.insert(name.as_str(), i);
+    }
+    let mut post_payload_sources = Vec::with_capacity(post_payload_positions.len());
+    for field in &pre_cfg.post_fields {
+        if field.name == "__op" || field.name == "__rowId" {
+            continue;
+        }
+        if let Some(&out_idx) = output_name_to_idx.get(field.name.as_str()) {
+            post_payload_sources.push(PayloadSource::OutputAt(out_idx));
+        } else if let Some(&pre_pos) = pre_name_to_pos.get(&field.name) {
+            post_payload_sources.push(PayloadSource::InputAt(pre_pos));
+        } else {
+            bail!("postField {} has no source", field.name);
+        }
+    }
+
     Ok(SessionConfig {
         reorder_responses,
         expected_input_len,
@@ -809,6 +840,7 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
         pre_payload_types,
         post_payload_positions,
         post_payload_types,
+        post_payload_sources,
     })
 }
 
@@ -963,9 +995,10 @@ fn write_framed_rows<W: Write>(
     rows: &[Vec<V>],
     session: &SessionConfig,
     max_frame_size: usize,
+    payload: &mut Vec<u8>,
 ) -> Result<()> {
     for row in rows {
-        write_framed_row(writer, row, session, max_frame_size)?;
+        write_framed_row(writer, row, session, max_frame_size, payload)?;
     }
     Ok(())
 }
@@ -975,9 +1008,9 @@ fn write_framed_row<W: Write>(
     output_row: &[V],
     session: &SessionConfig,
     max_frame_size: usize,
+    payload: &mut Vec<u8>,
 ) -> Result<()> {
-    // Build payload into a Vec<u8> (reused in higher layer could be even better; kept simple here).
-    let mut payload: Vec<u8> = Vec::with_capacity(256);
+    payload.clear();
 
     // __op
     let op = match output_row.first() {
@@ -985,7 +1018,7 @@ fn write_framed_row<W: Write>(
         Some(V::I64(v)) => *v as i32,
         _ => 0,
     };
-    write_i32_be_vec(&mut payload, op);
+    write_i32_be_vec(payload, op);
 
     // __rowId
     if session.reorder_responses {
@@ -994,7 +1027,7 @@ fn write_framed_row<W: Write>(
             Some(V::I32(v)) => *v as i64,
             _ => 0,
         };
-        write_i64_be_vec(&mut payload, row_id);
+        write_i64_be_vec(payload, row_id);
     }
 
     // null bitmap for payload fields (post payload only)
@@ -1015,7 +1048,7 @@ fn write_framed_row<W: Write>(
             set_null_bit(&mut payload[null_pos..null_pos + null_bytes], i);
             continue;
         }
-        encode_field(&mut payload, v, ftype)
+        encode_field(payload, v, ftype)
             .with_context(|| format!("encode post field {} at row_pos {}", i, row_pos))?;
     }
 
@@ -1029,7 +1062,7 @@ fn write_framed_row<W: Write>(
 
     // frame: [len][payload]
     write_i32_be_stream(writer, payload.len() as i32)?;
-    writer.write_all(&payload).context("write payload")?;
+    writer.write_all(payload.as_slice()).context("write payload")?;
     Ok(())
 }
 
@@ -1101,6 +1134,77 @@ fn encode_field(out: &mut Vec<u8>, v: &V, t: &FieldType) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Encodes the value at `row` from an InputColumn directly into the wire buffer.
+/// Returns `true` if the value is null.
+fn encode_input_column_at(out: &mut Vec<u8>, col: &InputColumn, row: usize, ftype: &FieldType) -> Result<bool> {
+    if column_is_null(col, row) {
+        return Ok(true);
+    }
+    match ftype {
+        FieldType::Boolean => {
+            let b = input_column_to_bool(col, row, ftype)?;
+            out.push(if b { 1 } else { 0 });
+        }
+        FieldType::Int64 | FieldType::TimestampMillis => {
+            let x = input_column_to_i64(col, row, ftype)?;
+            write_i64_be_vec(out, x);
+        }
+        FieldType::Int32 | FieldType::Int16 | FieldType::Int8 => {
+            let x = input_column_to_i64(col, row, ftype)?;
+            write_i32_be_vec(out, x as i32);
+        }
+        FieldType::Float32 => {
+            let x = input_column_to_f64(col, row, ftype)? as f32;
+            write_u32_be_vec(out, x.to_bits());
+        }
+        FieldType::Float64 => {
+            let x = input_column_to_f64(col, row, ftype)?;
+            write_u64_be_vec(out, x.to_bits());
+        }
+        FieldType::String | FieldType::Unknown(_) => {
+            let s = input_column_to_string(col, row, ftype)?;
+            let bytes = s.as_bytes();
+            write_i32_be_vec(out, bytes.len() as i32);
+            out.extend_from_slice(bytes);
+        }
+        FieldType::Bytes => {
+            let s = input_column_to_string(col, row, ftype)?;
+            let bytes = s.into_bytes();
+            write_i32_be_vec(out, bytes.len() as i32);
+            out.extend_from_slice(&bytes);
+        }
+        FieldType::Date => {
+            let millis = input_column_to_i64(col, row, ftype)?;
+            let days = (millis / 86_400_000) as i32;
+            write_i32_be_vec(out, days);
+        }
+        FieldType::Decimal { precision, .. } => {
+            let unscaled = input_column_to_decimal(col, row, ftype)?;
+            let prec = precision.unwrap_or(38);
+            if prec <= 18 {
+                let as_i64 = i64::try_from(unscaled).map_err(|_| anyhow::anyhow!("DECIMAL_UNSCALED_I64 overflow"))?;
+                write_i64_be_vec(out, as_i64);
+            } else {
+                let bytes = i128_to_twos_complement_be_minimal(unscaled);
+                write_i32_be_vec(out, bytes.len() as i32);
+                out.extend_from_slice(&bytes);
+            }
+        }
+        FieldType::DecimalUnscaledI64 => {
+            let unscaled = input_column_to_decimal(col, row, ftype)?;
+            let as_i64 = i64::try_from(unscaled).map_err(|_| anyhow::anyhow!("DECIMAL_UNSCALED_I64 overflow"))?;
+            write_i64_be_vec(out, as_i64);
+        }
+        FieldType::DecimalUnscaledBytes => {
+            let unscaled = input_column_to_decimal(col, row, ftype)?;
+            let bytes = i128_to_twos_complement_be_minimal(unscaled);
+            write_i32_be_vec(out, bytes.len() as i32);
+            out.extend_from_slice(&bytes);
+        }
+    }
+    Ok(false)
 }
 
 // bitmap helpers (LSB-first)
@@ -1243,7 +1347,7 @@ fn validate_row_len(row: &[V], expected_min: usize) -> Result<()> {
 fn apply_udf_to_rows(
     rows: &[Vec<V>],
     session: &SessionConfig,
-    udf: &UdfHandle,
+    udf: &mut UdfHandle,
     method: &str,
     debug_sample_rows: usize,
     debug_batches_remaining: &mut usize,
@@ -1331,26 +1435,27 @@ fn apply_udf_to_rows_stream<W: Write>(
 ) -> Result<()> {
     let rows = config.rows;
     let session = config.session;
-    let udf = config.udf;
     let method = config.method;
-    let writer = &mut *config.writer;
     let max_frame_size = config.max_frame_size;
     let debug_sample_rows = config.debug_sample_rows;
-    let debug_batches_remaining = &mut *config.debug_batches_remaining;
 
     if rows.is_empty() {
         return Ok(());
     }
 
     // Debug path uses materialized output rows.
-    if debug_sample_rows > 0 && *debug_batches_remaining > 0 {
-        let out_rows = apply_udf_to_rows(rows, session, udf, method, debug_sample_rows, debug_batches_remaining)?;
-        write_framed_rows(writer, &out_rows, session, max_frame_size)?;
+    if debug_sample_rows > 0 && *config.debug_batches_remaining > 0 {
+        let out_rows = apply_udf_to_rows(
+            rows, session, &mut *config.udf, method,
+            debug_sample_rows, &mut *config.debug_batches_remaining,
+        )?;
+        let mut payload_buf = Vec::with_capacity(256);
+        write_framed_rows(&mut *config.writer, &out_rows, session, max_frame_size, &mut payload_buf)?;
         return Ok(());
     }
 
     let input_columns = build_input_columns(rows, &session.arg_positions, &session.arg_types)?;
-    let output_columns = call_udf_to_columns(udf, method, &input_columns, &session.output_names)?;
+    let output_columns = call_udf_to_columns(&mut *config.udf, method, &input_columns, &session.output_names)?;
 
     if output_columns.len() < session.output_positions.len() {
         bail!(
@@ -1360,60 +1465,76 @@ fn apply_udf_to_rows_stream<W: Write>(
         );
     }
 
-    // Streaming encoder: fill each post payload field by consulting output_slots.
+    // Zero-alloc streaming encoder: encode each row directly from input/output columns.
+    let n_fields = session.post_payload_positions.len();
+    let null_bytes = (n_fields + 7) >> 3;
+    let mut payload = Vec::with_capacity(256);
+    let writer = &mut *config.writer;
+
     for (row_idx, source_row) in rows.iter().enumerate() {
-        // Build the output row (only as a shallow vec) to make slot mapping simple.
-        // This is still much cheaper than msgpack, and keeps behavior identical.
-        let mut out_row = vec![V::Null; session.output_row_len];
-        if let Some(op) = source_row.first() {
-            out_row[0] = op.clone();
+        payload.clear();
+
+        // __op
+        let op = match source_row.first() {
+            Some(V::I32(v)) => *v,
+            Some(V::I64(v)) => *v as i32,
+            _ => 0,
+        };
+        write_i32_be_vec(&mut payload, op);
+
+        // __rowId
+        if session.reorder_responses {
+            let row_id = match source_row.get(1) {
+                Some(V::I64(v)) => *v,
+                Some(V::I32(v)) => *v as i64,
+                _ => 0,
+            };
+            write_i64_be_vec(&mut payload, row_id);
         }
-        if session.reorder_responses && session.output_row_len > 1 {
-            if let Some(row_id) = source_row.get(1) {
-                out_row[1] = row_id.clone();
+
+        // null bitmap placeholder
+        let null_pos = payload.len();
+        payload.resize(null_pos + null_bytes, 0);
+
+        // encode payload fields directly from columnar sources
+        for (i, source) in session.post_payload_sources.iter().enumerate() {
+            let ftype = &session.post_payload_types[i];
+            let is_null = match source {
+                PayloadSource::InputAt(pre_pos) => {
+                    let v = source_row.get(*pre_pos).unwrap_or(&V::Null);
+                    if matches!(v, V::Null) {
+                        true
+                    } else {
+                        encode_field(&mut payload, v, ftype)?;
+                        false
+                    }
+                }
+                PayloadSource::OutputAt(col_idx) => {
+                    encode_input_column_at(&mut payload, &output_columns[*col_idx], row_idx, ftype)?
+                }
+            };
+            if is_null {
+                set_null_bit(&mut payload[null_pos..null_pos + null_bytes], i);
             }
         }
 
-        for source in &session.post_field_sources {
-            match source.kind {
-                PostFieldSourceKind::Op => {
-                    if source.pos < out_row.len() {
-                        out_row[source.pos] = out_row[0].clone();
-                    }
-                }
-                PostFieldSourceKind::RowId => {
-                    if session.reorder_responses && source.pos < out_row.len() {
-                        out_row[source.pos] = out_row.get(1).cloned().unwrap_or(V::Null);
-                    }
-                }
-                PostFieldSourceKind::InputPos(pre_pos) => {
-                    if source.pos < out_row.len() {
-                        out_row[source.pos] = source_row.get(pre_pos).cloned().unwrap_or(V::Null);
-                    }
-                }
-                PostFieldSourceKind::Output => {}
-            }
+        if payload.len() > max_frame_size {
+            bail!(
+                "row payload exceeds max_frame_size: {} > {}",
+                payload.len(),
+                max_frame_size
+            );
         }
 
-        for (idx, pos) in session.output_positions.iter().enumerate() {
-            let v = output_column_to_v(
-                &output_columns[idx],
-                row_idx,
-                session.output_types.get(idx).unwrap_or(&FieldType::String),
-            )?;
-            if *pos < out_row.len() {
-                out_row[*pos] = v;
-            }
-        }
-
-        write_framed_row(writer, &out_row, session, max_frame_size)?;
+        write_i32_be_stream(writer, payload.len() as i32)?;
+        writer.write_all(payload.as_slice()).context("write payload")?;
     }
 
     Ok(())
 }
 
 fn call_udf_to_columns(
-    udf: &UdfHandle,
+    udf: &mut UdfHandle,
     method: &str,
     input_columns: &[InputColumn],
     output_names: &[String],

@@ -206,7 +206,7 @@ public final class ScalarFunctionAdapter {
             return new ColumnarResult(outputColumns, outputNulls);
         }
 
-        Object[] out = new Object[] { null };
+        Object[] out = new Object[] { allocateOutputArray(returnType, rowCount) };
         boolean[][] outNulls = new boolean[1][rowCount];
 
         for (int row = 0; row < rowCount; row++) {
@@ -218,12 +218,7 @@ public final class ScalarFunctionAdapter {
                 outNulls[0][row] = true;
                 continue;
             }
-            out[0] = ensureOutputArray(out[0], result, rowCount);
             writeOutputValue(out[0], result, row);
-        }
-
-        if (out[0] == null) {
-            out[0] = new String[rowCount];
         }
 
         return new ColumnarResult(out, outNulls);
@@ -309,7 +304,13 @@ public final class ScalarFunctionAdapter {
         Object[] out = new Object[outputArity];
         boolean[][] outNulls = new boolean[outputArity][rowCount];
 
-        OutputAccessor[] accessors = buildPojoAccessors(evalMethod.getReturnType(), outputNames);
+        Class<?>[] fieldTypes = new Class<?>[outputArity];
+        OutputAccessor[] accessors = buildPojoAccessors(evalMethod.getReturnType(), outputNames, fieldTypes);
+
+        // Pre-allocate all output arrays from field types — avoids ensureOutputArray per row.
+        for (int col = 0; col < outputArity; col++) {
+            out[col] = allocateOutputArray(fieldTypes[col], rowCount);
+        }
 
         for (int row = 0; row < rowCount; row++) {
             for (int arg = 0; arg < argCount; arg++) {
@@ -329,14 +330,7 @@ public final class ScalarFunctionAdapter {
                     outNulls[col][row] = true;
                     continue;
                 }
-                out[col] = ensureOutputArray(out[col], value, rowCount);
                 writeOutputValue(out[col], value, row);
-            }
-        }
-
-        for (int col = 0; col < out.length; col++) {
-            if (out[col] == null) {
-                out[col] = new String[rowCount];
             }
         }
 
@@ -574,37 +568,6 @@ public final class ScalarFunctionAdapter {
         return null;
     }
 
-    private static Object ensureOutputArray(Object current, Object value, int rowCount) {
-        if (current != null) {
-            return current;
-        }
-        if (value == null) {
-            return null;
-        }
-        if (value instanceof Boolean) {
-            return new boolean[rowCount];
-        }
-        if (value instanceof Float || value instanceof Double) {
-            return new double[rowCount];
-        }
-        if (value instanceof BigDecimal) {
-            return new byte[rowCount * DECIMAL_BYTES];
-        }
-        if (value instanceof String) {
-            return new String[rowCount];
-        }
-        if (value instanceof Timestamp
-                || value instanceof LocalDateTime
-                || value instanceof Date
-                || value instanceof Time) {
-            return new long[rowCount];
-        }
-        if (value instanceof Number) {
-            return new long[rowCount];
-        }
-        return new String[rowCount];
-    }
-
     private static Object allocateOutputArray(Class<?> returnType, int rowCount) {
         if (returnType == null) {
             return new String[rowCount];
@@ -777,7 +740,7 @@ public final class ScalarFunctionAdapter {
         }
     }
 
-    private OutputAccessor[] buildPojoAccessors(Class<?> returnType, String[] outputNames)
+    private OutputAccessor[] buildPojoAccessors(Class<?> returnType, String[] outputNames, Class<?>[] outFieldTypes)
             throws Exception {
         Map<String, Field> fields = new HashMap<>();
         for (Field field : returnType.getDeclaredFields()) {
@@ -803,11 +766,13 @@ public final class ScalarFunctionAdapter {
             Field field = fields.get(key);
             if (field != null) {
                 accessors[i] = result -> field.get(result);
+                outFieldTypes[i] = field.getType();
                 continue;
             }
             Method getter = getters.get(key);
             if (getter != null) {
                 accessors[i] = result -> getter.invoke(result);
+                outFieldTypes[i] = getter.getReturnType();
                 continue;
             }
             throw new IllegalArgumentException(

@@ -1,0 +1,12 @@
+[package]
+name = "org-example-flinke2c-currency-conversion-function"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+name = "org_example_flinke2c_currency_conversion_function"
+
+[dependencies]
+anyhow = "1.0"
+udf-abi = { path = "../../udf-abi" }

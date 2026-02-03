@@ -10,7 +10,7 @@ use std::time::SystemTime;
 static JVM: OnceLock<JavaVM> = OnceLock::new();
 static JVM_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub enum JavaArg {
     Null,
     String(String),
@@ -52,7 +52,7 @@ impl InputColumn {
 }
 
 #[derive(Debug)]
-pub struct UdfHandle {
+pub struct JavaUdfHandle {
     classpath_jars: Vec<PathBuf>,
     class_name: String,
     ctor_sig: String,
@@ -68,12 +68,7 @@ pub struct UdfHandle {
     cached_output_names: Option<(Vec<String>, GlobalRef)>,
 }
 
-impl UdfHandle {
-    /// Load the jar(s) once and keep the UDF instance cached for fast calls.
-    pub fn new(classpath_jars: &[PathBuf], class_name: &str) -> Result<Self> {
-        Self::new_with_args(classpath_jars, class_name, "()V", &[])
-    }
-
+impl JavaUdfHandle {
     /// Load the jar(s) once with constructor arguments and cache the instance.
     pub fn new_with_args(
         classpath_jars: &[PathBuf],
@@ -270,7 +265,7 @@ impl UdfHandle {
     }
 }
 
-impl Drop for UdfHandle {
+impl Drop for JavaUdfHandle {
     fn drop(&mut self) {
         self.close_class_loader();
     }

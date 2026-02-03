@@ -3,15 +3,86 @@ use clap::Parser;
 use std::collections::{BTreeMap, HashSet};
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::thread;
 
-use crate::java_udf::{InputColumn, JavaArg, UdfHandle};
+use crate::udf::{InputColumn, UdfHandle, UdfLanguage};
 
 mod java_udf;
+mod rust_udf;
+mod udf;
 
 const DEFAULT_MAX_FRAME_SIZE: usize = 64 * 1024 * 1024; // 64 MiB hard safety cap
+
+fn default_rust_udf_lib() -> PathBuf {
+    PathBuf::from("lib")
+}
+
+fn rust_udf_lib_name_class(udf_class: &str) -> String {
+    let stem = udf_class.replace('.', "_");
+    rust_udf_lib_name_from_stem(&stem)
+}
+
+fn rust_udf_lib_name_snake(udf_class: &str) -> String {
+    let mut out = String::with_capacity(udf_class.len());
+    let mut prev_is_lower = false;
+    for ch in udf_class.chars() {
+        if ch == '.' {
+            out.push('_');
+            prev_is_lower = false;
+            continue;
+        }
+        if ch.is_ascii_uppercase() {
+            if prev_is_lower {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+            prev_is_lower = false;
+        } else {
+            out.push(ch);
+            prev_is_lower = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+        }
+    }
+    rust_udf_lib_name_from_stem(&out)
+}
+
+fn rust_udf_lib_name_from_stem(stem: &str) -> String {
+    if cfg!(target_os = "windows") {
+        format!("{stem}.dll")
+    } else if cfg!(target_os = "macos") {
+        format!("lib{stem}.dylib")
+    } else {
+        format!("lib{stem}.so")
+    }
+}
+
+fn rust_udf_default_filename() -> String {
+    if cfg!(target_os = "windows") {
+        "rust_udf.dll".to_string()
+    } else if cfg!(target_os = "macos") {
+        "librust_udf.dylib".to_string()
+    } else {
+        "librust_udf.so".to_string()
+    }
+}
+
+fn resolve_rust_udf_lib(base: &Path, udf_class: &str) -> PathBuf {
+    let treat_as_dir = base.is_dir() || base.extension().is_none();
+    if treat_as_dir {
+        let class_path = base.join(rust_udf_lib_name_class(udf_class));
+        if class_path.exists() {
+            return class_path;
+        }
+        let snake_path = base.join(rust_udf_lib_name_snake(udf_class));
+        if snake_path.exists() {
+            return snake_path;
+        }
+        base.join(rust_udf_default_filename())
+    } else {
+        base.to_path_buf()
+    }
+}
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -40,6 +111,10 @@ struct Args {
     udf_method: String,
     #[arg(long, default_value = "([[Ljava/lang/String;)V")]
     udf_sig: String,
+    #[arg(long, value_enum, default_value_t = UdfLanguage::Java)]
+    udf_lang: UdfLanguage,
+    #[arg(long, default_value_os_t = default_rust_udf_lib())]
+    rust_udf_lib: PathBuf,
 
     #[arg(long, default_value_t = 0)]
     debug_sample_rows: usize,
@@ -375,14 +450,17 @@ fn run_session(
     // ------------------------------------------------------------------
     if worker_count == 1 {
         if class_changed || types_changed || config.udf.is_none() {
-            *config.udf = Some(UdfHandle::new_with_args(
+            let rust_udf_lib = resolve_rust_udf_lib(
+                &config.args.rust_udf_lib,
+                config.current_udf_class.as_ref().context("missing UDF class")?,
+            );
+            *config.udf = Some(UdfHandle::new(
+                config.args.udf_lang,
                 &config.args.udf_jars,
                 &config.args.udf_adapter_class,
-                "(Ljava/lang/String;[Ljava/lang/String;)V",
-                &[
-                    JavaArg::String(config.current_udf_class.as_ref().context("missing UDF class")?.clone()),
-                    JavaArg::StringArray(config.current_udf_types.as_ref().context("missing UDF types")?.clone()),
-                ],
+                config.current_udf_class.as_ref().context("missing UDF class")?,
+                config.current_udf_types.as_ref().context("missing UDF types")?,
+                &rust_udf_lib,
             )?);
         }
 
@@ -466,15 +544,19 @@ fn run_session(
         let udf_jars = config.args.udf_jars.clone();
         let udf_adapter = config.args.udf_adapter_class.clone();
         let udf_method = config.args.udf_method.clone();
+        let udf_lang = config.args.udf_lang;
         let udf_class = config.current_udf_class.as_ref().context("missing UDF class")?.clone();
         let udf_types = config.current_udf_types.as_ref().context("missing UDF types")?.clone();
+        let rust_udf_lib = resolve_rust_udf_lib(&config.args.rust_udf_lib, &udf_class);
 
         let handle = thread::spawn(move || {
-            let udf_handle = UdfHandle::new_with_args(
+            let udf_handle = UdfHandle::new(
+                udf_lang,
                 &udf_jars,
                 &udf_adapter,
-                "(Ljava/lang/String;[Ljava/lang/String;)V",
-                &[JavaArg::String(udf_class), JavaArg::StringArray(udf_types)],
+                &udf_class,
+                &udf_types,
+                &rust_udf_lib,
             );
             let mut udf_handle = match udf_handle {
                 Ok(handle) => handle,

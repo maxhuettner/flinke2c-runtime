@@ -15,7 +15,9 @@ mod java_udf;
 mod rust_udf;
 mod udf;
 
-const DEFAULT_MAX_FRAME_SIZE: usize = 64 * 1024 * 1024; // 64 MiB hard safety cap
+const DEFAULT_BATCH_SIZE: usize = 512;
+const DEFAULT_BUF_SIZE: usize = 64 * 1024; // 64 KiB
+const DEFAULT_MAX_FRAME_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
 #[derive(Clone, Debug)]
 struct ReloadSignal {
@@ -223,10 +225,6 @@ struct Args {
     #[arg(long)]
     in_port: u16,
 
-    #[arg(long, default_value = "262144")]
-    buf_size: usize,
-    #[arg(long, default_value_t = 512)]
-    batch_size: usize,
     #[arg(long, default_value_t = num_cpus::get())]
     workers: usize,
     #[arg(long, default_value_t = 0)]
@@ -234,9 +232,6 @@ struct Args {
 
     #[arg(long, default_value_t = true)]
     udf_reload_watch: bool,
-
-    #[arg(long, default_value_t = DEFAULT_MAX_FRAME_SIZE)]
-    max_frame_size: usize,
 
     #[arg(long, value_delimiter = ',', default_value = "jar/flinke2c.jar")]
     udf_jars: Vec<PathBuf>,
@@ -420,7 +415,6 @@ struct UdfConfig<'a, W: Write> {
     method: &'a str,
     debug_sample_rows: usize,
     debug_batches_remaining: &'a mut usize,
-    max_frame_size: usize,
 }
 
 fn main() -> Result<()> {
@@ -598,9 +592,6 @@ fn run_session(
 
     let worker_count = config.args.workers.max(1);
 
-    // ------------------------------------------------------------------
-    // Single-thread mode
-    // ------------------------------------------------------------------
     if worker_count == 1 {
         if class_changed || types_changed || config.udf.is_none() {
             let rust_udf_lib = resolve_rust_udf_lib(
@@ -623,17 +614,17 @@ fn run_session(
         }
 
         let mut debug_batches_remaining = config.args.debug_sample_batches;
-        let mut reader = BufReader::with_capacity(config.args.buf_size, pre);
-        let mut writer = BufWriter::with_capacity(config.args.buf_size, post);
+        let mut reader = BufReader::with_capacity(DEFAULT_BUF_SIZE, pre);
+        let mut writer = BufWriter::with_capacity(DEFAULT_BUF_SIZE, post);
 
-        let batch_size = config.args.batch_size.max(1);
+        let batch_size = DEFAULT_BATCH_SIZE;
         let mut last_reload_version = reload_signal.as_ref().map(|s| s.current()).unwrap_or(0);
         let udf_class = config.current_udf_class.as_ref().context("missing UDF class")?.clone();
         let mut batch_rows: Vec<Vec<V>> = Vec::with_capacity(batch_size);
 
         let mut scratch = Vec::<u8>::new();
 
-        while let Some(row) = read_framed_row(&mut reader, &session_cfg, config.args.max_frame_size, &mut scratch)? {
+        while let Some(row) = read_framed_row(&mut reader, &session_cfg, &mut scratch)? {
             validate_row_len(&row, session_cfg.expected_input_len)?;
             batch_rows.push(row);
             if batch_rows.len() >= batch_size {
@@ -651,7 +642,6 @@ fn run_session(
                     method: &config.args.udf_method,
                     debug_sample_rows: config.args.debug_sample_rows,
                     debug_batches_remaining: &mut debug_batches_remaining,
-                    max_frame_size: config.args.max_frame_size,
                 };
                 apply_udf_to_rows_stream(&mut udf_config)?;
                 writer.flush().ok();
@@ -674,7 +664,6 @@ fn run_session(
                 method: &config.args.udf_method,
                 debug_sample_rows: config.args.debug_sample_rows,
                 debug_batches_remaining: &mut debug_batches_remaining,
-                max_frame_size: config.args.max_frame_size,
             };
             apply_udf_to_rows_stream(&mut udf_config)?;
             writer.flush().ok();
@@ -768,9 +757,8 @@ fn run_session(
     drop(result_tx);
 
     let inflight_writer = Arc::clone(&inflight);
-    let writer_buf_size = config.args.buf_size;
+    let writer_buf_size = DEFAULT_BUF_SIZE;
     let writer_session = session_cfg.clone();
-    let writer_max_frame = config.args.max_frame_size;
     let writer_handle = thread::spawn(move || -> Result<()> {
         let mut writer = BufWriter::with_capacity(writer_buf_size, post);
         let mut pending: BTreeMap<usize, Vec<Vec<V>>> = BTreeMap::new();
@@ -781,11 +769,11 @@ fn run_session(
             let WorkResult { seq, result } = work;
             let rows = result?;
             if seq == next_seq {
-                write_framed_rows(&mut writer, &rows, &writer_session, writer_max_frame, &mut payload_buf)?;
+                write_framed_rows(&mut writer, &rows, &writer_session, &mut payload_buf)?;
                 writer.flush().ok();
                 next_seq += 1;
                 while let Some(next_rows) = pending.remove(&next_seq) {
-                    write_framed_rows(&mut writer, &next_rows, &writer_session, writer_max_frame, &mut payload_buf)?;
+                    write_framed_rows(&mut writer, &next_rows, &writer_session, &mut payload_buf)?;
                     writer.flush().ok();
                     next_seq += 1;
                 }
@@ -809,14 +797,14 @@ fn run_session(
 
     let mut dispatched = 0usize;
     let mut send_index = 0usize;
-    let mut reader = BufReader::with_capacity(config.args.buf_size, pre);
+    let mut reader = BufReader::with_capacity(DEFAULT_BUF_SIZE, pre);
 
-    let batch_size = config.args.batch_size.max(1);
+    let batch_size = DEFAULT_BATCH_SIZE;
     let mut batch_rows: Vec<Vec<V>> = Vec::with_capacity(batch_size);
     let mut scratch = Vec::<u8>::new();
 
     loop {
-        match read_framed_row(&mut reader, &session_cfg, config.args.max_frame_size, &mut scratch)? {
+        match read_framed_row(&mut reader, &session_cfg, &mut scratch)? {
             Some(row) => {
                 validate_row_len(&row, session_cfg.expected_input_len)?;
                 batch_rows.push(row);
@@ -1118,14 +1106,9 @@ struct WorkResult {
     result: Result<Vec<Vec<V>>>,
 }
 
-// -----------------------------------------------------------------------------
-// Binary framing + codec
-// -----------------------------------------------------------------------------
-
 fn read_framed_row<R: Read>(
     reader: &mut R,
     session: &SessionConfig,
-    max_frame_size: usize,
     scratch: &mut Vec<u8>,
 ) -> Result<Option<Vec<V>>> {
     let len = match read_i32_be_stream_opt(reader)? {
@@ -1135,9 +1118,10 @@ fn read_framed_row<R: Read>(
     if len < 0 {
         bail!("invalid negative frame length: {}", len);
     }
-    let len = len as usize;
-    if len > max_frame_size {
-        bail!("frame length {} exceeds max_frame_size {}", len, max_frame_size);
+
+    let len = len.try_into().context("frame length overflow")?;
+    if len > DEFAULT_MAX_FRAME_SIZE {
+        bail!("frame length {} exceeds max_frame_size {}", len, DEFAULT_MAX_FRAME_SIZE);
     }
 
     scratch.resize(len, 0);
@@ -1254,11 +1238,10 @@ fn write_framed_rows<W: Write>(
     writer: &mut W,
     rows: &[Vec<V>],
     session: &SessionConfig,
-    max_frame_size: usize,
     payload: &mut Vec<u8>,
 ) -> Result<()> {
     for row in rows {
-        write_framed_row(writer, row, session, max_frame_size, payload)?;
+        write_framed_row(writer, row, session, payload)?;
     }
     Ok(())
 }
@@ -1267,7 +1250,6 @@ fn write_framed_row<W: Write>(
     writer: &mut W,
     output_row: &[V],
     session: &SessionConfig,
-    max_frame_size: usize,
     payload: &mut Vec<u8>,
 ) -> Result<()> {
     payload.clear();
@@ -1312,11 +1294,11 @@ fn write_framed_row<W: Write>(
             .with_context(|| format!("encode post field {} at row_pos {}", i, row_pos))?;
     }
 
-    if payload.len() > max_frame_size {
+    if payload.len() > DEFAULT_MAX_FRAME_SIZE {
         bail!(
             "row payload exceeds max_frame_size: {} > {}",
             payload.len(),
-            max_frame_size
+            DEFAULT_MAX_FRAME_SIZE
         );
     }
 
@@ -1696,7 +1678,6 @@ fn apply_udf_to_rows_stream<W: Write>(
     let rows = config.rows;
     let session = config.session;
     let method = config.method;
-    let max_frame_size = config.max_frame_size;
     let debug_sample_rows = config.debug_sample_rows;
 
     if rows.is_empty() {
@@ -1710,7 +1691,7 @@ fn apply_udf_to_rows_stream<W: Write>(
             debug_sample_rows, &mut *config.debug_batches_remaining,
         )?;
         let mut payload_buf = Vec::with_capacity(256);
-        write_framed_rows(&mut *config.writer, &out_rows, session, max_frame_size, &mut payload_buf)?;
+        write_framed_rows(&mut *config.writer, &out_rows, session, &mut payload_buf)?;
         return Ok(());
     }
 
@@ -1778,11 +1759,11 @@ fn apply_udf_to_rows_stream<W: Write>(
             }
         }
 
-        if payload.len() > max_frame_size {
+        if payload.len() > DEFAULT_MAX_FRAME_SIZE {
             bail!(
                 "row payload exceeds max_frame_size: {} > {}",
                 payload.len(),
-                max_frame_size
+                DEFAULT_MAX_FRAME_SIZE
             );
         }
 
@@ -1816,10 +1797,6 @@ fn call_udf_to_columns(
     };
     udf.call_typed_columns_to_named_results(&named_method, input_columns, output_names)
 }
-
-// -----------------------------------------------------------------------------
-// Build input columns from decoded rows
-// -----------------------------------------------------------------------------
 
 fn build_input_columns(rows: &[Vec<V>], arg_positions: &[usize], arg_types: &[FieldType]) -> Result<Vec<InputColumn>> {
     let mut columns = Vec::with_capacity(arg_positions.len());

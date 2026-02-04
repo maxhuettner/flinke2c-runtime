@@ -218,12 +218,6 @@ impl JavaUdfHandle {
         typed_columns_to_vec(&mut env, columns_array, nulls_array)
     }
 
-    /// Force a reload of the jar(s) and rebuild the cached instance.
-    pub fn reload(&mut self) -> Result<()> {
-        let classpath = self.classpath_jars.clone();
-        self.reload_with_classpath(&classpath)
-    }
-
     /// Reload only if any jar file has changed.
     pub fn reload_if_changed(&mut self) -> Result<bool> {
         let classpath = self.classpath_jars.clone();

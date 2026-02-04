@@ -159,26 +159,31 @@ fn resolve_rust_udf_lib(base: &Path, udf_class: &str) -> PathBuf {
 fn udf_reload_watch_paths(args: &Args, udf_class: &str) -> Vec<PathBuf> {
     let mut paths = HashSet::new();
 
-    for jar in &args.udf_jars {
-        if let Some(parent) = jar.parent() {
-            paths.insert(parent.to_path_buf());
-        } else {
-            paths.insert(jar.to_path_buf());
+    match args.udf_lang {
+        UdfLanguage::Java => {
+            for jar in &args.udf_jars {
+                if let Some(parent) = jar.parent() {
+                    paths.insert(parent.to_path_buf());
+                } else {
+                    paths.insert(jar.to_path_buf());
+                }
+            }
         }
-    }
+        UdfLanguage::Rust => {
+            let rust_base = &args.rust_udf_lib;
+            let rust_watch = if rust_base.is_dir() || rust_base.extension().is_none() {
+                rust_base.clone()
+            } else {
+                rust_base.parent().unwrap_or(Path::new(".")).to_path_buf()
+            };
+            paths.insert(rust_watch);
 
-    let rust_base = &args.rust_udf_lib;
-    let rust_watch = if rust_base.is_dir() || rust_base.extension().is_none() {
-        rust_base.clone()
-    } else {
-        rust_base.parent().unwrap_or(Path::new(".")).to_path_buf()
-    };
-    paths.insert(rust_watch);
-
-    // Also watch the resolved class-specific path if it has a parent dir.
-    let class_path = resolve_rust_udf_lib(&args.rust_udf_lib, udf_class);
-    if let Some(parent) = class_path.parent() {
-        paths.insert(parent.to_path_buf());
+            // Also watch the resolved class-specific path if it has a parent dir.
+            let class_path = resolve_rust_udf_lib(&args.rust_udf_lib, udf_class);
+            if let Some(parent) = class_path.parent() {
+                paths.insert(parent.to_path_buf());
+            }
+        }
     }
 
     paths.into_iter().collect()
@@ -644,7 +649,6 @@ fn run_session(
                     debug_batches_remaining: &mut debug_batches_remaining,
                 };
                 apply_udf_to_rows_stream(&mut udf_config)?;
-                writer.flush().ok();
                 batch_rows.clear();
             }
         }
@@ -666,7 +670,6 @@ fn run_session(
                 debug_batches_remaining: &mut debug_batches_remaining,
             };
             apply_udf_to_rows_stream(&mut udf_config)?;
-            writer.flush().ok();
         }
 
         writer.flush().ok();

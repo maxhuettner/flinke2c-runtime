@@ -348,6 +348,8 @@ struct SessionConfig {
     // payload fields (excluding __op/__rowId), in config order, mapped to row positions
     pre_payload_positions: Vec<usize>,
     pre_payload_types: Vec<FieldType>,
+    /// Whether a pre-payload slot is required for UDF args or output passthrough.
+    pre_payload_needed: Vec<bool>,
     post_payload_positions: Vec<usize>,
     post_payload_types: Vec<FieldType>,
     /// Direct columnar source for each post-payload field (parallel to post_payload_positions/types).
@@ -368,12 +370,9 @@ struct PostFieldSource {
     kind: PostFieldSourceKind,
 }
 
-/// Maps each post-payload slot to its data source for zero-alloc columnar encode.
 #[derive(Clone, Debug)]
 enum PayloadSource {
-    /// Value comes from the input row at the given position.
     InputAt(usize),
-    /// Value comes from the UDF output column at the given index.
     OutputAt(usize),
 }
 
@@ -742,14 +741,22 @@ fn run_session(
                     let _ = result_tx.send(WorkResult { seq: work.seq, result: Err(err) });
                     continue;
                 }
-                let result = apply_udf_to_rows(
-                    &work.rows,
-                    &session_cfg,
-                    &mut udf_handle,
-                    &udf_method,
-                    0,
-                    &mut debug_batches_remaining,
-                );
+                let result = (|| {
+                    let mut rows = Vec::with_capacity(work.payloads.len());
+                    for payload in &work.payloads {
+                        let row = decode_payload_to_row(payload, &session_cfg)?;
+                        validate_row_len(&row, session_cfg.expected_input_len)?;
+                        rows.push(row);
+                    }
+                    apply_udf_to_rows(
+                        &rows,
+                        &session_cfg,
+                        &mut udf_handle,
+                        &udf_method,
+                        0,
+                        &mut debug_batches_remaining,
+                    )
+                })();
                 if result_tx.send(WorkResult { seq: work.seq, result }).is_err() {
                     break;
                 }
@@ -803,26 +810,24 @@ fn run_session(
     let mut reader = BufReader::with_capacity(DEFAULT_BUF_SIZE, pre);
 
     let batch_size = DEFAULT_BATCH_SIZE;
-    let mut batch_rows: Vec<Vec<V>> = Vec::with_capacity(batch_size);
-    let mut scratch = Vec::<u8>::new();
+    let mut batch_payloads: Vec<Vec<u8>> = Vec::with_capacity(batch_size);
 
     loop {
-        match read_framed_row(&mut reader, &session_cfg, &mut scratch)? {
-            Some(row) => {
-                validate_row_len(&row, session_cfg.expected_input_len)?;
-                batch_rows.push(row);
-                if batch_rows.len() < batch_size {
+        match read_framed_payload(&mut reader)? {
+            Some(payload) => {
+                batch_payloads.push(payload);
+                if batch_payloads.len() < batch_size {
                     continue;
                 }
             }
             None => {
-                if batch_rows.is_empty() {
+                if batch_payloads.is_empty() {
                     break;
                 }
             }
         }
 
-        let rows = std::mem::take(&mut batch_rows);
+        let payloads = std::mem::take(&mut batch_payloads);
         let (lock, cvar) = &*inflight;
         let mut count = lock.lock().expect("lock inflight");
         while *count >= max_in_flight {
@@ -833,7 +838,7 @@ fn run_session(
 
         let sender = &senders[send_index % senders.len()];
         sender
-            .send(Some(WorkItem { seq: dispatched, rows }))
+            .send(Some(WorkItem { seq: dispatched, payloads }))
             .context("dispatch batch to worker")?;
         dispatched += 1;
         send_index += 1;
@@ -1075,6 +1080,30 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
         }
     }
 
+    let pre_payload_needed = if passthrough_identity {
+        vec![true; pre_payload_positions.len()]
+    } else {
+        let mut needed_positions = HashSet::new();
+        for pos in &arg_positions {
+            needed_positions.insert(*pos);
+        }
+        for source in &post_field_sources {
+            if let PostFieldSourceKind::InputPos(pre_pos) = &source.kind {
+                needed_positions.insert(*pre_pos);
+            }
+        }
+        for source in &post_payload_sources {
+            if let PayloadSource::InputAt(pre_pos) = source {
+                needed_positions.insert(*pre_pos);
+            }
+        }
+
+        pre_payload_positions
+            .iter()
+            .map(|pos| needed_positions.contains(pos))
+            .collect()
+    };
+
     Ok(SessionConfig {
         reorder_responses,
         expected_input_len,
@@ -1089,6 +1118,7 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
         output_types,
         pre_payload_positions,
         pre_payload_types,
+        pre_payload_needed,
         post_payload_positions,
         post_payload_types,
         post_payload_sources,
@@ -1101,7 +1131,7 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
 
 struct WorkItem {
     seq: usize,
-    rows: Vec<Vec<V>>,
+    payloads: Vec<Vec<u8>>,
 }
 
 struct WorkResult {
@@ -1131,6 +1161,25 @@ fn read_framed_row<R: Read>(
     reader.read_exact(scratch).context("read frame payload")?;
 
     decode_payload_to_row(scratch, session).map(Some)
+}
+
+fn read_framed_payload<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
+    let len = match read_i32_be_stream_opt(reader)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    if len < 0 {
+        bail!("invalid negative frame length: {}", len);
+    }
+
+    let len: usize = len.try_into().context("frame length overflow")?;
+    if len > DEFAULT_MAX_FRAME_SIZE {
+        bail!("frame length {} exceeds max_frame_size {}", len, DEFAULT_MAX_FRAME_SIZE);
+    }
+
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload).context("read frame payload")?;
+    Ok(Some(payload))
 }
 
 fn decode_payload_to_row(payload: &[u8], session: &SessionConfig) -> Result<Vec<V>> {
@@ -1164,16 +1213,22 @@ fn decode_payload_to_row(payload: &[u8], session: &SessionConfig) -> Result<Vec<
         .zip(session.pre_payload_types.iter())
         .enumerate()
     {
+        let needed = session.pre_payload_needed.get(i).copied().unwrap_or(true);
         if is_null_bit_set(payload, null_pos, i) {
-            if row_pos < row.len() {
+            if needed && row_pos < row.len() {
                 row[row_pos] = V::Null;
             }
             continue;
         }
-        let v = decode_field(payload, &mut p, ftype)
-            .with_context(|| format!("decode field {} at row_pos {}", i, row_pos))?;
-        if row_pos < row.len() {
-            row[row_pos] = v;
+        if needed {
+            let v = decode_field(payload, &mut p, ftype)
+                .with_context(|| format!("decode field {} at row_pos {}", i, row_pos))?;
+            if row_pos < row.len() {
+                row[row_pos] = v;
+            }
+        } else {
+            skip_field(payload, &mut p, ftype)
+                .with_context(|| format!("skip field {} at row_pos {}", i, row_pos))?;
         }
     }
 
@@ -1181,6 +1236,65 @@ fn decode_payload_to_row(payload: &[u8], session: &SessionConfig) -> Result<Vec<
         bail!("payload decode overran buffer");
     }
     Ok(row)
+}
+
+fn skip_len_bytes(buf: &[u8], p: &mut usize, label: &str) -> Result<()> {
+    let len = read_i32_be(buf, p)?;
+    if len < 0 {
+        bail!("negative length for {}", label);
+    }
+    let len = len as usize;
+    if *p + len > buf.len() {
+        bail!(
+            "truncated {} len-bytes: need {}, have {}",
+            label,
+            len,
+            buf.len().saturating_sub(*p)
+        );
+    }
+    *p += len;
+    Ok(())
+}
+
+fn skip_field(buf: &[u8], p: &mut usize, t: &FieldType) -> Result<()> {
+    match t {
+        FieldType::Boolean => {
+            read_u8(buf, p)?;
+        }
+        FieldType::Int64 | FieldType::TimestampMillis => {
+            read_i64_be(buf, p)?;
+        }
+        FieldType::Int32 | FieldType::Int16 | FieldType::Int8 | FieldType::Date => {
+            read_i32_be(buf, p)?;
+        }
+        FieldType::Float32 => {
+            read_u32_be(buf, p)?;
+        }
+        FieldType::Float64 => {
+            read_u64_be(buf, p)?;
+        }
+        FieldType::String | FieldType::Bytes | FieldType::Unknown(_) => {
+            skip_len_bytes(buf, p, "string/bytes")?;
+        }
+        FieldType::Decimal { precision, .. } => {
+            let prec = precision.unwrap_or(38);
+            if prec <= 18 {
+                read_i64_be(buf, p)?;
+            } else {
+                skip_len_bytes(buf, p, "decimal bytes")?;
+            }
+        }
+        FieldType::DecimalUnscaledI64 => {
+            read_i64_be(buf, p)?;
+        }
+        FieldType::DecimalUnscaledBytes => {
+            skip_len_bytes(buf, p, "decimal bytes")?;
+        }
+    }
+    if *p > buf.len() {
+        bail!("skip overran buffer");
+    }
+    Ok(())
 }
 
 fn decode_field(buf: &[u8], p: &mut usize, t: &FieldType) -> Result<V> {

@@ -329,9 +329,33 @@ impl FieldType {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FunctionKind {
+    Scalar,
+    Filter,
+}
+
+impl FunctionKind {
+    fn parse(value: Option<&str>) -> Result<Self> {
+        let Some(raw) = value else {
+            return Ok(FunctionKind::Scalar);
+        };
+        let normalized = raw.trim().to_lowercase();
+        if normalized.is_empty() {
+            return Ok(FunctionKind::Scalar);
+        }
+        match normalized.as_str() {
+            "scalar" => Ok(FunctionKind::Scalar),
+            "filter" => Ok(FunctionKind::Filter),
+            other => bail!("unsupported functionKind {}", other),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SessionConfig {
     reorder_responses: bool,
+    function_kind: FunctionKind,
     expected_input_len: usize,
     output_row_len: usize,
     post_field_sources: Vec<PostFieldSource>,
@@ -771,7 +795,7 @@ fn run_session(
     let writer_session = session_cfg.clone();
     let writer_handle = thread::spawn(move || -> Result<()> {
         let mut writer = BufWriter::with_capacity(writer_buf_size, post);
-        let mut pending: BTreeMap<usize, Vec<Vec<V>>> = BTreeMap::new();
+        let mut pending: BTreeMap<usize, Vec<OutputBlock>> = BTreeMap::new();
         let mut next_seq = 0usize;
         let mut payload_buf = Vec::with_capacity(256);
 
@@ -779,11 +803,11 @@ fn run_session(
             let WorkResult { seq, result } = work;
             let rows = result?;
             if seq == next_seq {
-                write_framed_rows(&mut writer, &rows, &writer_session, &mut payload_buf)?;
+                write_output_blocks(&mut writer, &rows, &writer_session, &mut payload_buf)?;
                 writer.flush().ok();
                 next_seq += 1;
                 while let Some(next_rows) = pending.remove(&next_seq) {
-                    write_framed_rows(&mut writer, &next_rows, &writer_session, &mut payload_buf)?;
+                    write_output_blocks(&mut writer, &next_rows, &writer_session, &mut payload_buf)?;
                     writer.flush().ok();
                     next_seq += 1;
                 }
@@ -859,6 +883,11 @@ fn run_session(
 
 fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
     let reorder_responses = pre_cfg.reorder_responses;
+    let function_kind = FunctionKind::parse(pre_cfg.function_kind.as_deref())
+        .context("parse functionKind")?;
+    if function_kind == FunctionKind::Filter && !pre_cfg.function_results.is_empty() {
+        bail!("functionKind=filter requires empty functionResults");
+    }
 
     if pre_cfg.pre_fields.is_empty() {
         bail!("preFields missing from PRE config");
@@ -866,12 +895,14 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
     if pre_cfg.post_fields.is_empty() {
         bail!("postFields missing from PRE config");
     }
-    let base_offset = 1 + if reorder_responses { 1 } else { 0 };
+    // __op + __rowId are always present now.
+    let base_offset = 2;
 
     let mut pre_name_to_pos = std::collections::HashMap::new();
     let mut pre_payload_positions = Vec::new();
     let mut pre_payload_types = Vec::new();
     let mut pre_payload_idx = 0usize;
+    let mut saw_pre_row_id = false;
 
     for field in &pre_cfg.pre_fields {
         match field.name.as_str() {
@@ -881,9 +912,7 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
                 }
             }
             "__rowId" => {
-                if !reorder_responses {
-                    bail!("preFields contains __rowId but reorderResponses=false");
-                }
+                saw_pre_row_id = true;
                 if pre_name_to_pos.insert(field.name.clone(), 1).is_some() {
                     bail!("duplicate preField name {}", field.name);
                 }
@@ -908,14 +937,13 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
     let mut post_payload_positions = Vec::new();
     let mut post_payload_types = Vec::new();
     let mut post_payload_idx = 0usize;
+    let mut saw_post_row_id = false;
 
     for field in &pre_cfg.post_fields {
         let pos = match field.name.as_str() {
             "__op" => 0,
             "__rowId" => {
-                if !reorder_responses {
-                    bail!("postFields contains __rowId but reorderResponses=false");
-                }
+                saw_post_row_id = true;
                 1
             }
             _ => {
@@ -986,7 +1014,7 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
     if output_row_len > 0 {
         output_slots[0] = OutputSlotKind::Op;
     }
-    if reorder_responses && output_row_len > 1 {
+    if output_row_len > 1 {
         output_slots[1] = OutputSlotKind::RowId;
     }
 
@@ -1009,7 +1037,7 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
             }
             (PostFieldSourceKind::Op, OutputSlotKind::Op)
         } else if field.name == "__rowId" {
-            if !reorder_responses || pos != 1 {
+            if pos != 1 {
                 passthrough_identity = false;
             }
             (PostFieldSourceKind::RowId, OutputSlotKind::RowId)
@@ -1053,7 +1081,7 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
                 }
             }
             OutputSlotKind::RowId => {
-                if !reorder_responses || pos != 1 {
+                if pos != 1 {
                     passthrough_identity = false;
                 }
             }
@@ -1104,8 +1132,16 @@ fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
             .collect()
     };
 
+    if !saw_pre_row_id {
+        bail!("preFields must include __rowId");
+    }
+    if !saw_post_row_id {
+        bail!("postFields must include __rowId");
+    }
+
     Ok(SessionConfig {
         reorder_responses,
+        function_kind,
         expected_input_len,
         output_row_len,
         post_field_sources,
@@ -1134,9 +1170,15 @@ struct WorkItem {
     payloads: Vec<Vec<u8>>,
 }
 
+struct OutputBlock {
+    op: i32,
+    row_id: i64,
+    row: Option<Vec<V>>,
+}
+
 struct WorkResult {
     seq: usize,
-    result: Result<Vec<Vec<V>>>,
+    result: Result<Vec<OutputBlock>>,
 }
 
 fn read_framed_row<R: Read>(
@@ -1191,11 +1233,9 @@ fn decode_payload_to_row(payload: &[u8], session: &SessionConfig) -> Result<Vec<
     let mut row = vec![V::Null; session.expected_input_len];
     row[0] = V::I32(op);
 
-    if session.reorder_responses {
-        let row_id = read_i64_be(payload, &mut p)?;
-        if session.expected_input_len > 1 {
-            row[1] = V::I64(row_id);
-        }
+    let row_id = read_i64_be(payload, &mut p)?;
+    if session.expected_input_len > 1 {
+        row[1] = V::I64(row_id);
     }
 
     let n_fields = session.pre_payload_positions.len();
@@ -1351,14 +1391,18 @@ fn decode_field(buf: &[u8], p: &mut usize, t: &FieldType) -> Result<V> {
     }
 }
 
-fn write_framed_rows<W: Write>(
+fn write_output_blocks<W: Write>(
     writer: &mut W,
-    rows: &[Vec<V>],
+    blocks: &[OutputBlock],
     session: &SessionConfig,
     payload: &mut Vec<u8>,
 ) -> Result<()> {
-    for row in rows {
-        write_framed_row(writer, row, session, payload)?;
+    for block in blocks {
+        let count = if block.row.is_some() { 1 } else { 0 };
+        write_header_frame(writer, block.op, block.row_id, count, payload)?;
+        if let Some(row) = block.row.as_ref() {
+            write_framed_row(writer, row, session, payload)?;
+        }
     }
     Ok(())
 }
@@ -1372,22 +1416,12 @@ fn write_framed_row<W: Write>(
     payload.clear();
 
     // __op
-    let op = match output_row.first() {
-        Some(V::I32(v)) => *v,
-        Some(V::I64(v)) => *v as i32,
-        _ => 0,
-    };
+    let op = row_op(output_row);
     write_i32_be_vec(payload, op);
 
     // __rowId
-    if session.reorder_responses {
-        let row_id = match output_row.get(1) {
-            Some(V::I64(v)) => *v,
-            Some(V::I32(v)) => *v as i64,
-            _ => 0,
-        };
-        write_i64_be_vec(payload, row_id);
-    }
+    let row_id = row_row_id(output_row)?;
+    write_i64_be_vec(payload, row_id);
 
     // null bitmap for payload fields (post payload only)
     let n_fields = session.post_payload_positions.len();
@@ -1422,6 +1456,51 @@ fn write_framed_row<W: Write>(
     // frame: [len][payload]
     write_i32_be_stream(writer, payload.len() as i32)?;
     writer.write_all(payload.as_slice()).context("write payload")?;
+    Ok(())
+}
+
+fn row_op(row: &[V]) -> i32 {
+    match row.first() {
+        Some(V::I32(v)) => *v,
+        Some(V::I64(v)) => *v as i32,
+        _ => 0,
+    }
+}
+
+fn row_row_id(row: &[V]) -> Result<i64> {
+    match row.get(1) {
+        Some(V::I64(v)) => Ok(*v),
+        Some(V::I32(v)) => Ok(*v as i64),
+        Some(V::Null) | None => bail!("missing __rowId in row"),
+        Some(other) => bail!("unsupported __rowId type: {:?}", other),
+    }
+}
+
+fn write_header_frame<W: Write>(
+    writer: &mut W,
+    op: i32,
+    row_id: i64,
+    count: i32,
+    payload: &mut Vec<u8>,
+) -> Result<()> {
+    payload.clear();
+    write_i32_be_vec(payload, op);
+    write_i64_be_vec(payload, row_id);
+    // Header uses the same row framing: null-bitmap for payload fields.
+    // Header has exactly one payload field: __count.
+    payload.push(0u8);
+    write_i32_be_vec(payload, count);
+
+    if payload.len() > DEFAULT_MAX_FRAME_SIZE {
+        bail!(
+            "header payload exceeds max_frame_size: {} > {}",
+            payload.len(),
+            DEFAULT_MAX_FRAME_SIZE
+        );
+    }
+
+    write_i32_be_stream(writer, payload.len() as i32)?;
+    writer.write_all(payload.as_slice()).context("write header payload")?;
     Ok(())
 }
 
@@ -1710,17 +1789,57 @@ fn apply_udf_to_rows(
     method: &str,
     debug_sample_rows: usize,
     debug_batches_remaining: &mut usize,
-) -> Result<Vec<Vec<V>>> {
+) -> Result<Vec<OutputBlock>> {
     if rows.is_empty() {
         return Ok(Vec::new());
     }
 
+    let is_filter = session.function_kind == FunctionKind::Filter;
     let input_columns = build_input_columns(rows, &session.arg_positions, &session.arg_types)?;
     let output_columns = call_udf_to_columns(udf, method, &input_columns, &session.output_names)?;
+
+    if output_columns.len() < session.output_positions.len() {
+        bail!(
+            "UDF returned {} columns but functionResults resolved {} targets",
+            output_columns.len(),
+            session.output_positions.len()
+        );
+    }
+
+    let pred_col = if is_filter {
+        Some(
+            output_columns
+                .get(0)
+                .with_context(|| "filter UDF returned no columns")?,
+        )
+    } else {
+        None
+    };
 
     let mut out_rows = Vec::with_capacity(rows.len());
     for row_idx in 0..rows.len() {
         let source_row = rows.get(row_idx).context("missing source row")?;
+        let op = row_op(source_row);
+        let row_id = row_row_id(source_row)?;
+
+        let passes = if let Some(pred_col) = pred_col {
+            if column_is_null(pred_col, row_idx) {
+                false
+            } else {
+                input_column_to_bool(pred_col, row_idx, &FieldType::Boolean)?
+            }
+        } else {
+            true
+        };
+
+        if !passes {
+            out_rows.push(OutputBlock {
+                op,
+                row_id,
+                row: None,
+            });
+            continue;
+        }
 
         let mut out_row = if session.passthrough_identity && source_row.len() == session.output_row_len {
             source_row.clone()
@@ -1729,11 +1848,9 @@ fn apply_udf_to_rows(
             if let Some(op) = source_row.first() {
                 row[0] = op.clone();
             }
-            if session.reorder_responses {
-                if let Some(row_id) = source_row.get(1) {
-                    if session.output_row_len > 1 {
-                        row[1] = row_id.clone();
-                    }
+            if let Some(row_id) = source_row.get(1) {
+                if session.output_row_len > 1 {
+                    row[1] = row_id.clone();
                 }
             }
 
@@ -1745,7 +1862,7 @@ fn apply_udf_to_rows(
                         }
                     }
                     PostFieldSourceKind::RowId => {
-                        if session.reorder_responses && source.pos < row.len() {
+                        if source.pos < row.len() {
                             let row_id = row.get(1).cloned().unwrap_or(V::Null);
                             row[source.pos] = row_id;
                         }
@@ -1762,14 +1879,6 @@ fn apply_udf_to_rows(
             row
         };
 
-        if output_columns.len() < session.output_positions.len() {
-            bail!(
-                "UDF returned {} columns but functionResults resolved {} targets",
-                output_columns.len(),
-                session.output_positions.len()
-            );
-        }
-
         for (idx, pos) in session.output_positions.iter().enumerate() {
             if *pos >= out_row.len() {
                 bail!("functionResult outputIndex {} is out of range", pos);
@@ -1782,7 +1891,11 @@ fn apply_udf_to_rows(
             out_row[*pos] = v;
         }
 
-        out_rows.push(out_row);
+        out_rows.push(OutputBlock {
+            op,
+            row_id,
+            row: Some(out_row),
+        });
     }
 
     maybe_print_debug_rows(rows, session, &out_rows, debug_sample_rows, debug_batches_remaining);
@@ -1808,10 +1921,11 @@ fn apply_udf_to_rows_stream<W: Write>(
             debug_sample_rows, &mut *config.debug_batches_remaining,
         )?;
         let mut payload_buf = Vec::with_capacity(256);
-        write_framed_rows(&mut *config.writer, &out_rows, session, &mut payload_buf)?;
+        write_output_blocks(&mut *config.writer, &out_rows, session, &mut payload_buf)?;
         return Ok(());
     }
 
+    let is_filter = session.function_kind == FunctionKind::Filter;
     let input_columns = build_input_columns(rows, &session.arg_positions, &session.arg_types)?;
     let output_columns = call_udf_to_columns(&mut *config.udf, method, &input_columns, &session.output_names)?;
 
@@ -1823,6 +1937,16 @@ fn apply_udf_to_rows_stream<W: Write>(
         );
     }
 
+    let pred_col = if is_filter {
+        Some(
+            output_columns
+                .get(0)
+                .with_context(|| "filter UDF returned no columns")?,
+        )
+    } else {
+        None
+    };
+
     // Zero-alloc streaming encoder: encode each row directly from input/output columns.
     let n_fields = session.post_payload_positions.len();
     let null_bytes = (n_fields + 7) >> 3;
@@ -1830,25 +1954,27 @@ fn apply_udf_to_rows_stream<W: Write>(
     let writer = &mut *config.writer;
 
     for (row_idx, source_row) in rows.iter().enumerate() {
-        payload.clear();
-
         // __op
-        let op = match source_row.first() {
-            Some(V::I32(v)) => *v,
-            Some(V::I64(v)) => *v as i32,
-            _ => 0,
+        let op = row_op(source_row);
+        let row_id = row_row_id(source_row)?;
+        let passes = if let Some(pred_col) = pred_col {
+            if column_is_null(pred_col, row_idx) {
+                false
+            } else {
+                input_column_to_bool(pred_col, row_idx, &FieldType::Boolean)?
+            }
+        } else {
+            true
         };
-        write_i32_be_vec(&mut payload, op);
-
-        // __rowId
-        if session.reorder_responses {
-            let row_id = match source_row.get(1) {
-                Some(V::I64(v)) => *v,
-                Some(V::I32(v)) => *v as i64,
-                _ => 0,
-            };
-            write_i64_be_vec(&mut payload, row_id);
+        let count = if passes { 1 } else { 0 };
+        write_header_frame(writer, op, row_id, count, &mut payload)?;
+        if count == 0 {
+            continue;
         }
+
+        payload.clear();
+        write_i32_be_vec(&mut payload, op);
+        write_i64_be_vec(&mut payload, row_id);
 
         // null bitmap placeholder
         let null_pos = payload.len();
@@ -2306,7 +2432,7 @@ fn v_to_decimal_i128(v: &V) -> Result<i128> {
 fn maybe_print_debug_rows(
     input_rows: &[Vec<V>],
     session: &SessionConfig,
-    output_rows: &[Vec<V>],
+    output_rows: &[OutputBlock],
     debug_sample_rows: usize,
     debug_batches_remaining: &mut usize,
 ) {
@@ -2325,12 +2451,21 @@ fn maybe_print_debug_rows(
         }
 
         let mut output_parts = Vec::new();
+        let output_row = output_rows
+            .get(row_idx)
+            .and_then(|block| block.row.as_ref());
         if !session.output_positions.is_empty() {
-            for (idx, name) in session.output_names.iter().enumerate() {
-                let pos = session.output_positions.get(idx).copied().unwrap_or(0);
-                let value = output_rows.get(row_idx).and_then(|r| r.get(pos)).unwrap_or(&V::Null);
-                output_parts.push(format!("{}={}", name, debug_v(value)));
+            if let Some(row) = output_row {
+                for (idx, name) in session.output_names.iter().enumerate() {
+                    let pos = session.output_positions.get(idx).copied().unwrap_or(0);
+                    let value = row.get(pos).unwrap_or(&V::Null);
+                    output_parts.push(format!("{}={}", name, debug_v(value)));
+                }
+            } else {
+                output_parts.push("<filtered>".to_string());
             }
+        } else if output_row.is_none() && session.function_kind == FunctionKind::Filter {
+            output_parts.push("<filtered>".to_string());
         }
 
         println!(

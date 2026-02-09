@@ -6,17 +6,17 @@ use udf_abi::{UdfInputColumn, UdfResult, UdfStrView, UDF_ABI_VERSION};
 struct UdfState;
 
 #[no_mangle]
-pub extern "C" fn proxy_udf_abi_version() -> u32 {
+pub extern "C" fn flinke2c_runtime_udf_abi_version() -> u32 {
     UDF_ABI_VERSION
 }
 
 #[no_mangle]
-pub extern "C" fn proxy_udf_create() -> *mut c_void {
+pub extern "C" fn flinke2c_runtime_udf_create() -> *mut c_void {
     Box::into_raw(Box::new(UdfState)) as *mut c_void
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn proxy_udf_drop(state: *mut c_void) {
+pub unsafe extern "C" fn flinke2c_runtime_udf_drop(state: *mut c_void) {
     if state.is_null() {
         return;
     }
@@ -24,7 +24,7 @@ pub unsafe extern "C" fn proxy_udf_drop(state: *mut c_void) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn proxy_udf_free_result(result: *mut UdfResult) {
+pub unsafe extern "C" fn flinke2c_runtime_udf_free_result(result: *mut UdfResult) {
     if result.is_null() {
         return;
     }
@@ -32,7 +32,7 @@ pub unsafe extern "C" fn proxy_udf_free_result(result: *mut UdfResult) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn proxy_udf_eval(
+pub unsafe extern "C" fn flinke2c_runtime_udf_eval(
     state: *mut c_void,
     _function_class: UdfStrView,
     _columns: *const UdfInputColumn,

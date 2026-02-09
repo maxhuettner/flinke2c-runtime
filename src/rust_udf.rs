@@ -8,11 +8,11 @@ use udf_abi::{UdfColumnType, UdfInputColumn, UdfResult, UdfStrView, UDF_ABI_VERS
 
 use crate::java_udf::InputColumn;
 
-const SYMBOL_ABI_VERSION: &[u8] = b"proxy_udf_abi_version\0";
-const SYMBOL_CREATE: &[u8] = b"proxy_udf_create\0";
-const SYMBOL_DROP: &[u8] = b"proxy_udf_drop\0";
-const SYMBOL_EVAL: &[u8] = b"proxy_udf_eval\0";
-const SYMBOL_FREE_RESULT: &[u8] = b"proxy_udf_free_result\0";
+const SYMBOL_ABI_VERSION: &[u8] = b"flinke2c_runtime_udf_abi_version\0";
+const SYMBOL_CREATE: &[u8] = b"flinke2c_runtime_udf_create\0";
+const SYMBOL_DROP: &[u8] = b"flinke2c_runtime_udf_drop\0";
+const SYMBOL_EVAL: &[u8] = b"flinke2c_runtime_udf_eval\0";
+const SYMBOL_FREE_RESULT: &[u8] = b"flinke2c_runtime_udf_free_result\0";
 
 #[derive(Debug)]
 pub struct RustUdfHandle {

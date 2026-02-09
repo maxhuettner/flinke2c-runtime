@@ -3,7 +3,7 @@ package org.apache.flink.types;
 import java.util.Arrays;
 
 /**
- * Minimal stub of Flink's Row type for UDF compilation and proxy-side reflection.
+ * Minimal stub of Flink's Row type for UDF compilation and runtime-side reflection.
  */
 public final class Row {
     private final Object[] fields;
@@ -35,4 +35,3 @@ public final class Row {
         return Arrays.toString(fields);
     }
 }
-

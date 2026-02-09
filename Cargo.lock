@@ -385,6 +385,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "flinke2c-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "chrono",
+ "clap",
+ "jni",
+ "libloading 0.8.9",
+ "notify",
+ "num_cpus",
+ "rmp",
+ "rmpv",
+ "serde",
+ "serde_json",
+ "udf-abi",
+]
+
+[[package]]
 name = "fsevent-sys"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -824,27 +845,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "535d180e0ecab6268a3e718bb9fd44db66bbbc256257165fc699dadf70d16fe7"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "proxy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow-array",
- "arrow-ipc",
- "arrow-schema",
- "chrono",
- "clap",
- "jni",
- "libloading 0.8.9",
- "notify",
- "num_cpus",
- "rmp",
- "rmpv",
- "serde",
- "serde_json",
- "udf-abi",
 ]
 
 [[package]]

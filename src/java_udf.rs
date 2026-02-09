@@ -121,7 +121,7 @@ impl JavaUdfHandle {
         let ret = env.call_method(
             self.udf_obj.as_obj(),
             method,
-            "([Ljava/lang/Object;[[Z)Lorg/example/proxy/ScalarFunctionAdapter$ColumnarResult;",
+            "([Ljava/lang/Object;[[Z)Lorg/example/flinke2c/runtime/ScalarFunctionAdapter$ColumnarResult;",
             &[
                 JValue::Object(&columns_obj),
                 JValue::Object(&nulls_obj),
@@ -187,7 +187,7 @@ impl JavaUdfHandle {
         let ret = env.call_method(
             self.udf_obj.as_obj(),
             method,
-            "([Ljava/lang/Object;[[Z[Ljava/lang/String;)Lorg/example/proxy/ScalarFunctionAdapter$ColumnarResult;",
+            "([Ljava/lang/Object;[[Z[Ljava/lang/String;)Lorg/example/flinke2c/runtime/ScalarFunctionAdapter$ColumnarResult;",
             &[
                 JValue::Object(&columns_obj),
                 JValue::Object(&nulls_obj),

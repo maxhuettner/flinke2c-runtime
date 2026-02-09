@@ -9,6 +9,7 @@ OUT_JAR="$ROOT_DIR/../jar/udf-adapter.jar"
 STUBS_JAR="$ROOT_DIR/../jar/flink-stubs.jar"
 JAVA_RELEASE="${JAVA_RELEASE:-8}"
 
+rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 
 SOURCES="$(find "$SRC_DIR" -name "*.java")"

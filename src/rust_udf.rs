@@ -1,7 +1,10 @@
 use anyhow::{bail, Context, Result};
 use libloading::Library;
+use std::env;
 use std::ffi::c_void;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use udf_abi::{UdfColumnType, UdfInputColumn, UdfResult, UdfStrView, UDF_ABI_VERSION};
@@ -14,9 +17,13 @@ const SYMBOL_DROP: &[u8] = b"flinke2c_runtime_udf_drop\0";
 const SYMBOL_EVAL: &[u8] = b"flinke2c_runtime_udf_eval\0";
 const SYMBOL_FREE_RESULT: &[u8] = b"flinke2c_runtime_udf_free_result\0";
 
+static LIB_SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+
 #[derive(Debug)]
 pub struct RustUdfHandle {
     lib_path: PathBuf,
+    loaded_lib_path: PathBuf,
     lib_state: LibState,
     lib: Library,
     api: UdfApi,
@@ -27,8 +34,9 @@ pub struct RustUdfHandle {
 impl RustUdfHandle {
     pub fn new(lib_path: &Path, function_class: &str) -> Result<Self> {
         let lib_state = lib_state(lib_path)?;
-        let lib = unsafe { Library::new(lib_path) }
-            .with_context(|| format!("load rust udf library {}", lib_path.display()))?;
+        let loaded_lib_path = copy_lib_to_temp(lib_path)?;
+        let lib = unsafe { Library::new(&loaded_lib_path) }
+            .with_context(|| format!("load rust udf library {}", loaded_lib_path.display()))?;
         let api = unsafe { UdfApi::load(&lib)? };
         let state = unsafe { (api.create)() };
         if state.is_null() {
@@ -36,6 +44,7 @@ impl RustUdfHandle {
         }
         Ok(Self {
             lib_path: lib_path.to_path_buf(),
+            loaded_lib_path,
             lib_state,
             lib,
             api,
@@ -50,21 +59,27 @@ impl RustUdfHandle {
             return Ok(false);
         }
 
-        unsafe {
-            (self.api.drop)(self.state);
-        }
-        let lib = unsafe { Library::new(&self.lib_path) }
-            .with_context(|| format!("reload rust udf library {}", self.lib_path.display()))?;
-        let api = unsafe { UdfApi::load(&lib)? };
-        let state = unsafe { (api.create)() };
-        if state.is_null() {
+        let new_loaded_lib_path = copy_lib_to_temp(&self.lib_path)?;
+        let new_lib = unsafe { Library::new(&new_loaded_lib_path) }
+            .with_context(|| format!("reload rust udf library {}", new_loaded_lib_path.display()))?;
+        let new_api = unsafe { UdfApi::load(&new_lib)? };
+        let new_state_ptr = unsafe { (new_api.create)() };
+        if new_state_ptr.is_null() {
             bail!("rust udf create returned null state after reload");
         }
 
+        unsafe {
+            (self.api.drop)(self.state);
+        }
+
         self.lib_state = new_state;
-        self.lib = lib;
-        self.api = api;
-        self.state = state;
+        let old_lib = std::mem::replace(&mut self.lib, new_lib);
+        let old_loaded = std::mem::replace(&mut self.loaded_lib_path, new_loaded_lib_path);
+        self.api = new_api;
+        self.state = new_state_ptr;
+
+        drop(old_lib);
+        cleanup_lib_copy(&old_loaded);
         Ok(true)
     }
 
@@ -115,6 +130,7 @@ impl Drop for RustUdfHandle {
         unsafe {
             (self.api.drop)(self.state);
         }
+        cleanup_lib_copy(&self.loaded_lib_path);
     }
 }
 
@@ -130,6 +146,39 @@ fn lib_state(path: &Path) -> Result<LibState> {
         modified: meta.modified().ok(),
         len: meta.len(),
     })
+}
+
+fn copy_lib_to_temp(original: &Path) -> Result<PathBuf> {
+    let base_dir = env::temp_dir().join("flinke2c-runtime-libs");
+    fs::create_dir_all(&base_dir)
+        .with_context(|| format!("create lib snapshot dir {}", base_dir.display()))?;
+    let dest = temp_lib_path(&base_dir, original)?;
+    fs::copy(original, &dest)
+        .with_context(|| format!("copy {} -> {}", original.display(), dest.display()))?;
+    Ok(dest)
+}
+
+fn temp_lib_path(base_dir: &Path, original: &Path) -> Result<PathBuf> {
+    let stem = original
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("udf");
+    let ext = original
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("so");
+    let pid = std::process::id();
+    let counter = LIB_SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ts = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let filename = format!("{}-{}-{}-{}.{}", stem, pid, ts, counter, ext);
+    Ok(base_dir.join(filename))
+}
+
+fn cleanup_lib_copy(path: &Path) {
+    let _ = fs::remove_file(path);
 }
 
 #[derive(Clone, Copy, Debug)]

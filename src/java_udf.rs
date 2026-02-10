@@ -2,13 +2,16 @@ use anyhow::{bail, Context, Result};
 use jni::objects::{GlobalRef, JClass, JObject, JObjectArray, JString, JValue};
 use jni::sys::{jboolean, jbyte};
 use jni::{InitArgsBuilder, JNIVersion, JNIEnv, JavaVM};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 static JVM: OnceLock<JavaVM> = OnceLock::new();
 static JVM_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub enum JavaArg {
@@ -66,6 +69,7 @@ pub struct JavaUdfHandle {
     /// Cached Java String[] for the output-column names; rebuilt only when
     /// the names vector changes between sessions.
     cached_output_names: Option<(Vec<String>, GlobalRef)>,
+    snapshot_paths: Vec<PathBuf>,
 }
 
 impl JavaUdfHandle {
@@ -78,8 +82,8 @@ impl JavaUdfHandle {
     ) -> Result<Self> {
         let classpath = normalize_classpath(classpath_jars)?;
         let jar_state = collect_jar_state(&classpath)?;
-        let (udf_obj, class_loader) =
-            create_udf_instance(&classpath, class_name, ctor_sig, ctor_args)?;
+        let (udf_obj, class_loader, snapshot_paths) =
+            create_udf_instance_snapshot(&classpath, class_name, ctor_sig, ctor_args)?;
 
         Ok(Self {
             classpath_jars: classpath,
@@ -91,6 +95,7 @@ impl JavaUdfHandle {
             udf_obj,
             context_loader_set: false,
             cached_output_names: None,
+            snapshot_paths,
         })
     }
 
@@ -233,35 +238,44 @@ impl JavaUdfHandle {
     pub fn reload_with_classpath(&mut self, classpath_jars: &[PathBuf]) -> Result<()> {
         let classpath = normalize_classpath(classpath_jars)?;
         let jar_state = collect_jar_state(&classpath)?;
-        let (udf_obj, class_loader) = create_udf_instance(
+        let (udf_obj, class_loader, snapshot_paths) = create_udf_instance_snapshot(
             &classpath,
             &self.class_name,
             &self.ctor_sig,
             &self.ctor_args,
         )?;
 
-        self.close_class_loader();
+        let old_loader = std::mem::replace(&mut self.class_loader, class_loader);
+        let old_snapshot = std::mem::replace(&mut self.snapshot_paths, snapshot_paths);
+        let _old_udf = std::mem::replace(&mut self.udf_obj, udf_obj);
+
+        self.close_class_loader_ref(&old_loader);
+        cleanup_snapshot_paths(&old_snapshot);
+
         self.classpath_jars = classpath;
         self.jar_state = jar_state;
-        self.udf_obj = udf_obj;
-        self.class_loader = class_loader;
         self.context_loader_set = false;
         self.cached_output_names = None;
         Ok(())
     }
 
-    fn close_class_loader(&self) {
+    fn close_class_loader_ref(&self, class_loader: &GlobalRef) {
         if let Ok(jvm) = get_or_create_jvm() {
             if let Ok(mut env) = jvm.attach_current_thread() {
-                let _ = env.call_method(self.class_loader.as_obj(), "close", "()V", &[]);
+                let _ = env.call_method(class_loader.as_obj(), "close", "()V", &[]);
             }
         }
+    }
+
+    fn close_class_loader(&self) {
+        self.close_class_loader_ref(&self.class_loader);
     }
 }
 
 impl Drop for JavaUdfHandle {
     fn drop(&mut self) {
         self.close_class_loader();
+        cleanup_snapshot_paths(&self.snapshot_paths);
     }
 }
 
@@ -320,6 +334,62 @@ fn normalize_classpath(classpath_jars: &[PathBuf]) -> Result<Vec<PathBuf>> {
         bail!("classpath_jars is empty");
     }
     Ok(out)
+}
+
+fn create_udf_instance_snapshot(
+    classpath_jars: &[PathBuf],
+    class_name: &str,
+    ctor_sig: &str,
+    ctor_args: &[JavaArg],
+) -> Result<(GlobalRef, GlobalRef, Vec<PathBuf>)> {
+    let snapshot_paths = snapshot_classpath(classpath_jars)?;
+    match create_udf_instance(&snapshot_paths, class_name, ctor_sig, ctor_args) {
+        Ok((udf_obj, class_loader)) => Ok((udf_obj, class_loader, snapshot_paths)),
+        Err(err) => {
+            cleanup_snapshot_paths(&snapshot_paths);
+            Err(err)
+        }
+    }
+}
+
+fn snapshot_classpath(classpath_jars: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let base_dir = env::temp_dir().join("flinke2c-runtime-jars");
+    fs::create_dir_all(&base_dir)
+        .with_context(|| format!("create jar snapshot dir {}", base_dir.display()))?;
+
+    let mut out = Vec::with_capacity(classpath_jars.len());
+    for jar in classpath_jars {
+        let dest = snapshot_path(&base_dir, jar)?;
+        fs::copy(jar, &dest)
+            .with_context(|| format!("copy {} -> {}", jar.display(), dest.display()))?;
+        out.push(dest);
+    }
+    Ok(out)
+}
+
+fn snapshot_path(base_dir: &Path, jar: &Path) -> Result<PathBuf> {
+    let stem = jar
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("udf");
+    let ext = jar
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("jar");
+    let pid = std::process::id();
+    let counter = SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ts = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let filename = format!("{}-{}-{}-{}.{}", stem, pid, ts, counter, ext);
+    Ok(base_dir.join(filename))
+}
+
+fn cleanup_snapshot_paths(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn create_udf_instance(

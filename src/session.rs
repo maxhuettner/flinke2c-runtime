@@ -219,8 +219,8 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
         }
 
         let udf_handle = config.udf.as_mut().context("UDF handle not initialized")?;
-        if udf_handle.reload_if_changed()? {
-            println!("Reloaded UDF classes after jar change");
+        if let Err(err) = udf_handle.reload_if_changed() {
+            eprintln!("UDF reload failed (keeping current): {err:#}");
         }
 
         let mut debug_batches_remaining = config.args.debug_sample_batches;

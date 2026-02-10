@@ -183,7 +183,6 @@ pub fn maybe_reload_udf(
     if let Some(signal) = reload_signal {
         let version = signal.current();
         if version != *last_version {
-            *last_version = version;
             let paths = signal.take_paths();
             if !paths.is_empty() {
                 let list = paths
@@ -195,15 +194,30 @@ pub fn maybe_reload_udf(
             } else {
                 println!("UDF change detected for {}", udf_class);
             }
-            if udf.reload_if_changed()? {
-                println!("UDF reloaded for {} (updated version running)", udf_class);
+
+            match udf.reload_if_changed() {
+                Ok(true) => {
+                    println!("UDF reloaded for {} (updated version running)", udf_class);
+                    *last_version = version;
+                }
+                Ok(false) => {
+                    *last_version = version;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "UDF reload failed for {} (keeping current): {:#}",
+                        udf_class, err
+                    );
+                }
             }
         }
         return Ok(());
     }
 
-    if udf.reload_if_changed()? {
-        println!("Reloaded UDF after change");
+    match udf.reload_if_changed() {
+        Ok(true) => println!("Reloaded UDF after change"),
+        Ok(false) => {}
+        Err(err) => eprintln!("UDF reload failed (keeping current): {:#}", err),
     }
     Ok(())
 }

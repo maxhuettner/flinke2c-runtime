@@ -170,6 +170,8 @@ pub struct SessionConfig {
     pub post_payload_types: Vec<FieldType>,
     /// Direct columnar source for each post-payload field (parallel to post_payload_positions/types).
     pub post_payload_sources: Vec<PayloadSource>,
+    /// Reverse map: row position -> payload slot index (None for __op/__rowId or unused).
+    pub pre_pos_to_payload_slot: Vec<Option<usize>>,
 }
 
 #[derive(Clone, Debug)]
@@ -456,6 +458,14 @@ pub fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
             .collect()
     };
 
+    let pre_pos_to_payload_slot = {
+        let mut map = vec![None; expected_input_len];
+        for (slot, &pos) in pre_payload_positions.iter().enumerate() {
+            map[pos] = Some(slot);
+        }
+        map
+    };
+
     if !saw_pre_row_id {
         bail!("preFields must include __rowId");
     }
@@ -481,6 +491,7 @@ pub fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
         post_payload_positions,
         post_payload_types,
         post_payload_sources,
+        pre_pos_to_payload_slot,
     })
 }
 

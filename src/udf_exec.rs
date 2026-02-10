@@ -2,165 +2,37 @@ use anyhow::{bail, Context, Result};
 use std::io::Write;
 
 use crate::codec::{
-    encode_field, i128_to_twos_complement_be_minimal, row_op, row_row_id, set_null_bit,
-    write_header_frame, write_i32_be_stream, write_i32_be_vec, write_i64_be_vec, write_output_blocks,
-    write_u32_be_vec, write_u64_be_vec, OutputBlock,
+    i128_to_twos_complement_be_minimal, set_null_bit,
+    write_header_frame, write_i32_be_stream, write_i32_be_vec, write_i64_be_vec,
+    write_u32_be_vec, write_u64_be_vec, ColumnarBatch, OutputBlock,
 };
 use crate::config::{FieldType, FunctionKind, PayloadSource, PostFieldSourceKind, SessionConfig};
 use crate::constants::DEFAULT_MAX_FRAME_SIZE;
 use crate::udf::{InputColumn, UdfHandle};
 use crate::values::{
     decimal_to_f64, decimal_to_i64, decimal_to_string, parse_bool_string, parse_decimal_to_i128,
-    parse_with, v_to_bool, v_to_decimal_i128, v_to_f64, v_to_i64, v_to_string, V,
+    parse_with, V,
 };
 
-pub struct UdfConfig<'a, W: Write> {
+pub struct ColumnarUdfConfig<'a, W: Write> {
     pub writer: &'a mut W,
-    pub rows: &'a [Vec<V>],
+    pub batch: &'a ColumnarBatch,
     pub session: &'a SessionConfig,
     pub udf: &'a mut UdfHandle,
     pub method: &'a str,
-    pub debug_sample_rows: usize,
-    pub debug_batches_remaining: &'a mut usize,
 }
 
-pub fn apply_udf_to_rows(
-    rows: &[Vec<V>],
-    session: &SessionConfig,
-    udf: &mut UdfHandle,
-    method: &str,
-    debug_sample_rows: usize,
-    debug_batches_remaining: &mut usize,
-) -> Result<Vec<OutputBlock>> {
-    if rows.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let input_columns = build_input_columns(rows, &session.arg_positions, &session.arg_types)?;
-    let output_columns = call_udf_to_columns(udf, method, &input_columns, &session.output_names)?;
-
-    if output_columns.len() < session.output_positions.len() {
-        bail!(
-            "UDF returned {} columns but functionResults resolved {} targets",
-            output_columns.len(),
-            session.output_positions.len()
-        );
-    }
-
-    let pred_col = if session.function_kind == FunctionKind::Filter {
-        Some(
-            output_columns
-                .get(0)
-                .with_context(|| "filter UDF returned no columns")?,
-        )
-    } else {
-        None
-    };
-
-    let mut out_rows = Vec::with_capacity(rows.len());
-    for row_idx in 0..rows.len() {
-        let source_row = rows.get(row_idx).context("missing source row")?;
-        let op = row_op(source_row);
-        let row_id = row_row_id(source_row)?;
-
-        let passes = filter_passes(pred_col, row_idx)?;
-
-        if !passes {
-            out_rows.push(OutputBlock {
-                op,
-                row_id,
-                row: None,
-            });
-            continue;
-        }
-
-        let mut out_row = if session.passthrough_identity && source_row.len() == session.output_row_len {
-            source_row.clone()
-        } else {
-            let mut row = vec![V::Null; session.output_row_len];
-            if let Some(op) = source_row.first() {
-                row[0] = op.clone();
-            }
-            if let Some(row_id) = source_row.get(1) {
-                if session.output_row_len > 1 {
-                    row[1] = row_id.clone();
-                }
-            }
-
-            for source in &session.post_field_sources {
-                match source.kind {
-                    PostFieldSourceKind::Op => {
-                        if source.pos < row.len() {
-                            row[source.pos] = row[0].clone();
-                        }
-                    }
-                    PostFieldSourceKind::RowId => {
-                        if source.pos < row.len() {
-                            let row_id = row.get(1).cloned().unwrap_or(V::Null);
-                            row[source.pos] = row_id;
-                        }
-                    }
-                    PostFieldSourceKind::InputPos(pre_pos) => {
-                        if source.pos < row.len() {
-                            row[source.pos] = source_row.get(pre_pos).cloned().unwrap_or(V::Null);
-                        }
-                    }
-                    PostFieldSourceKind::Output => {}
-                }
-            }
-
-            row
-        };
-
-        for (idx, pos) in session.output_positions.iter().enumerate() {
-            if *pos >= out_row.len() {
-                bail!("functionResult outputIndex {} is out of range", pos);
-            }
-            let v = output_column_to_v(
-                &output_columns[idx],
-                row_idx,
-                session.output_types.get(idx).unwrap_or(&FieldType::String),
-            )?;
-            out_row[*pos] = v;
-        }
-
-        out_rows.push(OutputBlock {
-            op,
-            row_id,
-            row: Some(out_row),
-        });
-    }
-
-    maybe_print_debug_rows(rows, session, &out_rows, debug_sample_rows, debug_batches_remaining);
-    Ok(out_rows)
-}
-
-pub fn apply_udf_to_rows_stream<W: Write>(config: &mut UdfConfig<W>) -> Result<()> {
-    let rows = config.rows;
+pub fn apply_udf_to_batch_stream<W: Write>(config: &mut ColumnarUdfConfig<W>) -> Result<()> {
+    let batch = config.batch;
     let session = config.session;
-    let method = config.method;
-    let debug_sample_rows = config.debug_sample_rows;
 
-    if rows.is_empty() {
+    if batch.len() == 0 {
         return Ok(());
     }
 
-    if debug_sample_rows > 0 && *config.debug_batches_remaining > 0 {
-        let out_rows = apply_udf_to_rows(
-            rows,
-            session,
-            &mut *config.udf,
-            method,
-            debug_sample_rows,
-            &mut *config.debug_batches_remaining,
-        )?;
-        let mut payload_buf = Vec::with_capacity(256);
-        write_output_blocks(&mut *config.writer, &out_rows, session, &mut payload_buf)?;
-        return Ok(());
-    }
-
-    let input_columns = build_input_columns(rows, &session.arg_positions, &session.arg_types)?;
-    let output_columns = call_udf_to_columns(&mut *config.udf, method, &input_columns, &session.output_names)?;
+    let input_columns = extract_arg_columns(batch, session);
+    let output_columns =
+        call_udf_to_columns(&mut *config.udf, config.method, &input_columns, &session.output_names)?;
 
     if output_columns.len() < session.output_positions.len() {
         bail!(
@@ -171,11 +43,7 @@ pub fn apply_udf_to_rows_stream<W: Write>(config: &mut UdfConfig<W>) -> Result<(
     }
 
     let pred_col = if session.function_kind == FunctionKind::Filter {
-        Some(
-            output_columns
-                .get(0)
-                .with_context(|| "filter UDF returned no columns")?,
-        )
+        Some(output_columns.get(0).with_context(|| "filter UDF returned no columns")?)
     } else {
         None
     };
@@ -185,9 +53,9 @@ pub fn apply_udf_to_rows_stream<W: Write>(config: &mut UdfConfig<W>) -> Result<(
     let mut payload = Vec::with_capacity(256);
     let writer = &mut *config.writer;
 
-    for (row_idx, source_row) in rows.iter().enumerate() {
-        let op = row_op(source_row);
-        let row_id = row_row_id(source_row)?;
+    for row_idx in 0..batch.len() {
+        let op = batch.ops[row_idx];
+        let row_id = batch.row_ids[row_idx];
         let passes = filter_passes(pred_col, row_idx)?;
         let count = if passes { 1 } else { 0 };
         write_header_frame(writer, op, row_id, count, &mut payload)?;
@@ -206,12 +74,10 @@ pub fn apply_udf_to_rows_stream<W: Write>(config: &mut UdfConfig<W>) -> Result<(
             let ftype = &session.post_payload_types[i];
             let is_null = match source {
                 PayloadSource::InputAt(pre_pos) => {
-                    let v = source_row.get(*pre_pos).unwrap_or(&V::Null);
-                    if matches!(v, V::Null) {
-                        true
+                    if let Some(slot) = session.pre_pos_to_payload_slot.get(*pre_pos).and_then(|s| *s) {
+                        encode_input_column_at(&mut payload, &batch.columns[slot], row_idx, ftype)?
                     } else {
-                        encode_field(&mut payload, v, ftype)?;
-                        false
+                        true
                     }
                 }
                 PayloadSource::OutputAt(col_idx) => {
@@ -238,6 +104,162 @@ pub fn apply_udf_to_rows_stream<W: Write>(config: &mut UdfConfig<W>) -> Result<(
     Ok(())
 }
 
+pub fn apply_udf_to_batch(
+    batch: &ColumnarBatch,
+    session: &SessionConfig,
+    udf: &mut UdfHandle,
+    method: &str,
+) -> Result<Vec<OutputBlock>> {
+    if batch.len() == 0 {
+        return Ok(Vec::new());
+    }
+
+    let input_columns = extract_arg_columns(batch, session);
+    let output_columns = call_udf_to_columns(udf, method, &input_columns, &session.output_names)?;
+
+    if output_columns.len() < session.output_positions.len() {
+        bail!(
+            "UDF returned {} columns but functionResults resolved {} targets",
+            output_columns.len(),
+            session.output_positions.len()
+        );
+    }
+
+    let pred_col = if session.function_kind == FunctionKind::Filter {
+        Some(output_columns.get(0).with_context(|| "filter UDF returned no columns")?)
+    } else {
+        None
+    };
+
+    let mut out = Vec::with_capacity(batch.len());
+    for row_idx in 0..batch.len() {
+        let op = batch.ops[row_idx];
+        let row_id = batch.row_ids[row_idx];
+        let passes = filter_passes(pred_col, row_idx)?;
+
+        if !passes {
+            out.push(OutputBlock { op, row_id, row: None });
+            continue;
+        }
+
+        let mut row = vec![V::Null; session.output_row_len];
+        row[0] = V::I32(op);
+        if session.output_row_len > 1 {
+            row[1] = V::I64(row_id);
+        }
+
+        for source in &session.post_field_sources {
+            match &source.kind {
+                PostFieldSourceKind::Op => {
+                    if source.pos < row.len() {
+                        row[source.pos] = V::I32(op);
+                    }
+                }
+                PostFieldSourceKind::RowId => {
+                    if source.pos < row.len() {
+                        row[source.pos] = V::I64(row_id);
+                    }
+                }
+                PostFieldSourceKind::InputPos(pre_pos) => {
+                    if source.pos < row.len() {
+                        if let Some(slot) =
+                            session.pre_pos_to_payload_slot.get(*pre_pos).and_then(|s| *s)
+                        {
+                            row[source.pos] = column_to_v_at(&batch.columns[slot], row_idx);
+                        }
+                    }
+                }
+                PostFieldSourceKind::Output => {}
+            }
+        }
+
+        for (idx, pos) in session.output_positions.iter().enumerate() {
+            if *pos >= row.len() {
+                bail!("functionResult outputIndex {} is out of range", pos);
+            }
+            let v = output_column_to_v(
+                &output_columns[idx],
+                row_idx,
+                session.output_types.get(idx).unwrap_or(&FieldType::String),
+            )?;
+            row[*pos] = v;
+        }
+
+        out.push(OutputBlock { op, row_id, row: Some(row) });
+    }
+
+    Ok(out)
+}
+
+fn extract_arg_columns(batch: &ColumnarBatch, session: &SessionConfig) -> Vec<InputColumn> {
+    session
+        .arg_positions
+        .iter()
+        .map(|&pos| {
+            if let Some(slot) = session.pre_pos_to_payload_slot.get(pos).and_then(|s| *s) {
+                batch.columns[slot].clone()
+            } else {
+                InputColumn::I64 {
+                    values: vec![0; batch.len()],
+                    is_null: Some(vec![true; batch.len()]),
+                }
+            }
+        })
+        .collect()
+}
+
+fn column_to_v_at(col: &InputColumn, row: usize) -> V {
+    match col {
+        InputColumn::String(values) => values
+            .get(row)
+            .and_then(|v| v.clone())
+            .map(V::String)
+            .unwrap_or(V::Null),
+        InputColumn::I64 { values, is_null } => {
+            if is_null_at(is_null.as_deref(), row) {
+                V::Null
+            } else {
+                V::I64(values.get(row).copied().unwrap_or(0))
+            }
+        }
+        InputColumn::I32 { values, is_null } => {
+            if is_null_at(is_null.as_deref(), row) {
+                V::Null
+            } else {
+                V::I32(values.get(row).copied().unwrap_or(0))
+            }
+        }
+        InputColumn::F64 { values, is_null } => {
+            if is_null_at(is_null.as_deref(), row) {
+                V::Null
+            } else {
+                V::F64(values.get(row).copied().unwrap_or(0.0))
+            }
+        }
+        InputColumn::F32 { values, is_null } => {
+            if is_null_at(is_null.as_deref(), row) {
+                V::Null
+            } else {
+                V::F32(values.get(row).copied().unwrap_or(0.0))
+            }
+        }
+        InputColumn::Bool { values, is_null } => {
+            if is_null_at(is_null.as_deref(), row) {
+                V::Null
+            } else {
+                V::Bool(values.get(row).copied().unwrap_or(false))
+            }
+        }
+        InputColumn::Decimal128 { values, is_null } => {
+            if is_null_at(is_null.as_deref(), row) {
+                V::Null
+            } else {
+                V::DecimalI128(values.get(row).copied().unwrap_or(0))
+            }
+        }
+    }
+}
+
 fn call_udf_to_columns(
     udf: &mut UdfHandle,
     method: &str,
@@ -260,181 +282,6 @@ fn call_udf_to_columns(
         format!("{columns_method}Named")
     };
     udf.call_typed_columns_to_named_results(&named_method, input_columns, output_names)
-}
-
-fn build_input_columns(
-    rows: &[Vec<V>],
-    arg_positions: &[usize],
-    arg_types: &[FieldType],
-) -> Result<Vec<InputColumn>> {
-    let mut columns = Vec::with_capacity(arg_positions.len());
-    for (idx, arg_index) in arg_positions.iter().enumerate() {
-        let target_type = arg_types
-            .get(idx)
-            .with_context(|| format!("missing arg type at {}", idx))?;
-        let column = build_input_column(rows, *arg_index, target_type)?;
-        columns.push(column);
-    }
-    Ok(columns)
-}
-
-fn build_input_column(
-    rows: &[Vec<V>],
-    index: usize,
-    target_type: &FieldType,
-) -> Result<InputColumn> {
-    match target_type {
-        FieldType::String | FieldType::Unknown(_) => {
-            let mut values = Vec::with_capacity(rows.len());
-            for row in rows {
-                let v = row.get(index).unwrap_or(&V::Null);
-                if matches!(v, V::Null) {
-                    values.push(None);
-                } else {
-                    values.push(Some(v_to_string(v)?));
-                }
-            }
-            Ok(InputColumn::String(values))
-        }
-        FieldType::Bytes => {
-            let mut values = Vec::with_capacity(rows.len());
-            for row in rows {
-                let v = row.get(index).unwrap_or(&V::Null);
-                if matches!(v, V::Null) {
-                    values.push(None);
-                } else {
-                    match v {
-                        V::Bytes(b) => values.push(Some(String::from_utf8_lossy(b).to_string())),
-                        _ => values.push(Some(v_to_string(v)?)),
-                    }
-                }
-            }
-            Ok(InputColumn::String(values))
-        }
-        FieldType::Boolean => {
-            let mut values = Vec::with_capacity(rows.len());
-            let mut nulls: Option<Vec<bool>> = None;
-            for row in rows {
-                let v = row.get(index).unwrap_or(&V::Null);
-                let prev_len = values.len();
-                if matches!(v, V::Null) {
-                    values.push(false);
-                    push_null(&mut nulls, prev_len, true);
-                } else {
-                    values.push(v_to_bool(v)?);
-                    if let Some(n) = nulls.as_mut() {
-                        n.push(false);
-                    }
-                }
-            }
-            Ok(InputColumn::Bool { values, is_null: nulls })
-        }
-        FieldType::Int64 | FieldType::TimestampMillis | FieldType::Date => {
-            let mut values = Vec::with_capacity(rows.len());
-            let mut nulls: Option<Vec<bool>> = None;
-            for row in rows {
-                let v = row.get(index).unwrap_or(&V::Null);
-                let prev_len = values.len();
-                if matches!(v, V::Null) {
-                    values.push(0);
-                    push_null(&mut nulls, prev_len, true);
-                } else {
-                    values.push(v_to_i64(v)?);
-                    if let Some(n) = nulls.as_mut() {
-                        n.push(false);
-                    }
-                }
-            }
-            Ok(InputColumn::I64 { values, is_null: nulls })
-        }
-        FieldType::Int32 | FieldType::Int16 | FieldType::Int8 => {
-            let mut values = Vec::with_capacity(rows.len());
-            let mut nulls: Option<Vec<bool>> = None;
-            for row in rows {
-                let v = row.get(index).unwrap_or(&V::Null);
-                let prev_len = values.len();
-                if matches!(v, V::Null) {
-                    values.push(0);
-                    push_null(&mut nulls, prev_len, true);
-                } else {
-                    let x = v_to_i64(v)?;
-                    let casted = i32::try_from(x)
-                        .map_err(|_| anyhow::anyhow!("value {} overflows i32", x))?;
-                    values.push(casted);
-                    if let Some(n) = nulls.as_mut() {
-                        n.push(false);
-                    }
-                }
-            }
-            Ok(InputColumn::I32 { values, is_null: nulls })
-        }
-        FieldType::Float64 => {
-            let mut values = Vec::with_capacity(rows.len());
-            let mut nulls: Option<Vec<bool>> = None;
-            for row in rows {
-                let v = row.get(index).unwrap_or(&V::Null);
-                let prev_len = values.len();
-                if matches!(v, V::Null) {
-                    values.push(0.0);
-                    push_null(&mut nulls, prev_len, true);
-                } else {
-                    values.push(v_to_f64(v)?);
-                    if let Some(n) = nulls.as_mut() {
-                        n.push(false);
-                    }
-                }
-            }
-            Ok(InputColumn::F64 { values, is_null: nulls })
-        }
-        FieldType::Float32 => {
-            let mut values = Vec::with_capacity(rows.len());
-            let mut nulls: Option<Vec<bool>> = None;
-            for row in rows {
-                let v = row.get(index).unwrap_or(&V::Null);
-                let prev_len = values.len();
-                if matches!(v, V::Null) {
-                    values.push(0.0);
-                    push_null(&mut nulls, prev_len, true);
-                } else {
-                    values.push(v_to_f64(v)? as f32);
-                    if let Some(n) = nulls.as_mut() {
-                        n.push(false);
-                    }
-                }
-            }
-            Ok(InputColumn::F32 { values, is_null: nulls })
-        }
-        FieldType::Decimal { .. } | FieldType::DecimalUnscaledI64 | FieldType::DecimalUnscaledBytes => {
-            let mut values = Vec::with_capacity(rows.len());
-            let mut nulls: Option<Vec<bool>> = None;
-            for row in rows {
-                let v = row.get(index).unwrap_or(&V::Null);
-                let prev_len = values.len();
-                if matches!(v, V::Null) {
-                    values.push(0);
-                    push_null(&mut nulls, prev_len, true);
-                } else {
-                    values.push(v_to_decimal_i128(v)?);
-                    if let Some(n) = nulls.as_mut() {
-                        n.push(false);
-                    }
-                }
-            }
-            Ok(InputColumn::Decimal128 { values, is_null: nulls })
-        }
-    }
-}
-
-fn push_null(nulls: &mut Option<Vec<bool>>, previous_len: usize, is_null: bool) {
-    if let Some(nulls) = nulls.as_mut() {
-        nulls.push(is_null);
-        return;
-    }
-    if is_null {
-        let mut vec = vec![false; previous_len];
-        vec.push(true);
-        *nulls = Some(vec);
-    }
 }
 
 fn column_is_null(column: &InputColumn, row: usize) -> bool {
@@ -671,66 +518,3 @@ fn filter_passes(pred_col: Option<&InputColumn>, row_idx: usize) -> Result<bool>
     }
 }
 
-fn maybe_print_debug_rows(
-    input_rows: &[Vec<V>],
-    session: &SessionConfig,
-    output_rows: &[OutputBlock],
-    debug_sample_rows: usize,
-    debug_batches_remaining: &mut usize,
-) {
-    if debug_sample_rows == 0 || *debug_batches_remaining == 0 || input_rows.is_empty() {
-        return;
-    }
-
-    let sample_rows = debug_sample_rows.min(input_rows.len());
-    println!("Debug sample ({} of {} rows):", sample_rows, input_rows.len());
-    for (row_idx, row) in input_rows.iter().take(sample_rows).enumerate() {
-        let mut input_parts = Vec::with_capacity(session.arg_names.len());
-        for (arg_pos, name) in session.arg_names.iter().enumerate() {
-            let idx = session.arg_positions.get(arg_pos).copied().unwrap_or(0);
-            let value = row.get(idx).unwrap_or(&V::Null);
-            input_parts.push(format!("{}={}", name, debug_v(value)));
-        }
-
-        let mut output_parts = Vec::new();
-        let output_row = output_rows
-            .get(row_idx)
-            .and_then(|block| block.row.as_ref());
-        if !session.output_positions.is_empty() {
-            if let Some(row) = output_row {
-                for (idx, name) in session.output_names.iter().enumerate() {
-                    let pos = session.output_positions.get(idx).copied().unwrap_or(0);
-                    let value = row.get(pos).unwrap_or(&V::Null);
-                    output_parts.push(format!("{}={}", name, debug_v(value)));
-                }
-            } else {
-                output_parts.push("<filtered>".to_string());
-            }
-        } else if output_row.is_none() && session.function_kind == FunctionKind::Filter {
-            output_parts.push("<filtered>".to_string());
-        }
-
-        println!(
-            "  row {}: {} -> {}",
-            row_idx,
-            input_parts.join(", "),
-            output_parts.join(", ")
-        );
-    }
-
-    *debug_batches_remaining = debug_batches_remaining.saturating_sub(1);
-}
-
-fn debug_v(v: &V) -> String {
-    match v {
-        V::Null => "<null>".to_string(),
-        V::Bool(b) => b.to_string(),
-        V::I32(x) => x.to_string(),
-        V::I64(x) => x.to_string(),
-        V::F32(x) => x.to_string(),
-        V::F64(x) => x.to_string(),
-        V::String(s) => s.clone(),
-        V::Bytes(b) => format!("{:?}", b),
-        V::DecimalI128(x) => x.to_string(),
-    }
-}

@@ -3,6 +3,7 @@ use std::io::{ErrorKind, Read, Write};
 
 use crate::config::{FieldType, SessionConfig};
 use crate::constants::DEFAULT_MAX_FRAME_SIZE;
+use crate::udf::InputColumn;
 use crate::values::{v_to_bool, v_to_decimal_i128, v_to_f64, v_to_i64, v_to_string, V};
 
 #[derive(Debug)]
@@ -10,30 +11,6 @@ pub struct OutputBlock {
     pub op: i32,
     pub row_id: i64,
     pub row: Option<Vec<V>>,
-}
-
-pub fn read_framed_row<R: Read>(
-    reader: &mut R,
-    session: &SessionConfig,
-    scratch: &mut Vec<u8>,
-) -> Result<Option<Vec<V>>> {
-    let len = match read_i32_be_stream_opt(reader)? {
-        Some(v) => v,
-        None => return Ok(None),
-    };
-    if len < 0 {
-        bail!("invalid negative frame length: {}", len);
-    }
-
-    let len = len.try_into().context("frame length overflow")?;
-    if len > DEFAULT_MAX_FRAME_SIZE {
-        bail!("frame length {} exceeds max_frame_size {}", len, DEFAULT_MAX_FRAME_SIZE);
-    }
-
-    scratch.resize(len, 0);
-    reader.read_exact(scratch).context("read frame payload")?;
-
-    decode_payload_to_row(scratch, session).map(Some)
 }
 
 pub fn read_framed_payload<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
@@ -53,60 +30,6 @@ pub fn read_framed_payload<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload).context("read frame payload")?;
     Ok(Some(payload))
-}
-
-pub fn decode_payload_to_row(payload: &[u8], session: &SessionConfig) -> Result<Vec<V>> {
-    let mut p = 0usize;
-    if payload.len() < 4 {
-        bail!("truncated payload: missing __op");
-    }
-    let op = read_i32_be(payload, &mut p)?;
-    let mut row = vec![V::Null; session.expected_input_len];
-    row[0] = V::I32(op);
-
-    let row_id = read_i64_be(payload, &mut p)?;
-    if session.expected_input_len > 1 {
-        row[1] = V::I64(row_id);
-    }
-
-    let n_fields = session.pre_payload_positions.len();
-    let null_bytes = (n_fields + 7) >> 3;
-
-    if p + null_bytes > payload.len() {
-        bail!("truncated payload: missing nullBitmap");
-    }
-    let null_pos = p;
-    p += null_bytes;
-
-    for (i, (&row_pos, ftype)) in session
-        .pre_payload_positions
-        .iter()
-        .zip(session.pre_payload_types.iter())
-        .enumerate()
-    {
-        let needed = session.pre_payload_needed.get(i).copied().unwrap_or(true);
-        if is_null_bit_set(payload, null_pos, i) {
-            if needed && row_pos < row.len() {
-                row[row_pos] = V::Null;
-            }
-            continue;
-        }
-        if needed {
-            let v = decode_field(payload, &mut p, ftype)
-                .with_context(|| format!("decode field {} at row_pos {}", i, row_pos))?;
-            if row_pos < row.len() {
-                row[row_pos] = v;
-            }
-        } else {
-            skip_field(payload, &mut p, ftype)
-                .with_context(|| format!("skip field {} at row_pos {}", i, row_pos))?;
-        }
-    }
-
-    if p > payload.len() {
-        bail!("payload decode overran buffer");
-    }
-    Ok(row)
 }
 
 fn skip_len_bytes(buf: &[u8], p: &mut usize, label: &str) -> Result<()> {
@@ -166,62 +89,6 @@ fn skip_field(buf: &[u8], p: &mut usize, t: &FieldType) -> Result<()> {
         bail!("skip overran buffer");
     }
     Ok(())
-}
-
-fn decode_field(buf: &[u8], p: &mut usize, t: &FieldType) -> Result<V> {
-    match t {
-        FieldType::Boolean => {
-            let b = read_u8(buf, p)?;
-            Ok(V::Bool(b != 0))
-        }
-        FieldType::Int64 | FieldType::TimestampMillis => Ok(V::I64(read_i64_be(buf, p)?)),
-        FieldType::Int32 | FieldType::Int16 | FieldType::Int8 => Ok(V::I32(read_i32_be(buf, p)?)),
-        FieldType::Float32 => {
-            let bits = read_u32_be(buf, p)?;
-            Ok(V::F32(f32::from_bits(bits)))
-        }
-        FieldType::Float64 => {
-            let bits = read_u64_be(buf, p)?;
-            Ok(V::F64(f64::from_bits(bits)))
-        }
-        FieldType::String | FieldType::Unknown(_) => {
-            let bytes = read_len_bytes(buf, p)?;
-            let s = String::from_utf8(bytes).context("invalid UTF-8 STRING")?;
-            Ok(V::String(s))
-        }
-        FieldType::Bytes => {
-            let bytes = read_len_bytes(buf, p)?;
-            Ok(V::Bytes(bytes))
-        }
-        FieldType::Date => {
-            // wire: int32 days since epoch (Flink); internally store millis for UDF convenience
-            let days = read_i32_be(buf, p)? as i64;
-            let millis = days.checked_mul(86_400_000).context("DATE days->millis overflow")?;
-            Ok(V::I64(millis))
-        }
-        FieldType::Decimal { precision, .. } => {
-            let prec = precision.unwrap_or(38);
-            if prec <= 18 {
-                let unscaled = read_i64_be(buf, p)? as i128;
-                Ok(V::DecimalI128(unscaled))
-            } else {
-                let bytes = read_len_bytes(buf, p)?;
-                let unscaled =
-                    twos_complement_be_to_i128(&bytes).context("decimal bytes too large for i128")?;
-                Ok(V::DecimalI128(unscaled))
-            }
-        }
-        FieldType::DecimalUnscaledI64 => {
-            let unscaled = read_i64_be(buf, p)? as i128;
-            Ok(V::DecimalI128(unscaled))
-        }
-        FieldType::DecimalUnscaledBytes => {
-            let bytes = read_len_bytes(buf, p)?;
-            let unscaled =
-                twos_complement_be_to_i128(&bytes).context("decimal bytes too large for i128")?;
-            Ok(V::DecimalI128(unscaled))
-        }
-    }
 }
 
 pub fn write_output_blocks<W: Write>(
@@ -542,11 +409,280 @@ fn twos_complement_be_to_i128(bytes: &[u8]) -> Result<i128> {
     Ok(i128::from_be_bytes(out))
 }
 
-// row validation
+// columnar batch: decode wire format straight into columns
 
-pub fn validate_row_len(row: &[V], expected_min: usize) -> Result<()> {
-    if row.len() < expected_min {
-        bail!("row has {} values but expected at least {}", row.len(), expected_min);
+pub struct ColumnarBatch {
+    pub ops: Vec<i32>,
+    pub row_ids: Vec<i64>,
+    pub columns: Vec<InputColumn>,
+}
+
+impl ColumnarBatch {
+    pub fn new(types: &[FieldType], capacity: usize) -> Self {
+        let columns = types.iter().map(|t| new_empty_column(t, capacity)).collect();
+        ColumnarBatch {
+            ops: Vec::with_capacity(capacity),
+            row_ids: Vec::with_capacity(capacity),
+            columns,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    pub fn clear(&mut self) {
+        self.ops.clear();
+        self.row_ids.clear();
+        for col in &mut self.columns {
+            clear_column(col);
+        }
+    }
+}
+
+pub fn read_framed_payload_into<R: Read>(
+    reader: &mut R,
+    scratch: &mut Vec<u8>,
+) -> Result<bool> {
+    let len = match read_i32_be_stream_opt(reader)? {
+        Some(v) => v,
+        None => return Ok(false),
+    };
+    if len < 0 {
+        bail!("invalid negative frame length: {}", len);
+    }
+    let len: usize = len.try_into().context("frame length overflow")?;
+    if len > DEFAULT_MAX_FRAME_SIZE {
+        bail!("frame length {} exceeds max_frame_size {}", len, DEFAULT_MAX_FRAME_SIZE);
+    }
+    scratch.resize(len, 0);
+    reader.read_exact(scratch).context("read frame payload")?;
+    Ok(true)
+}
+
+pub fn decode_payload_into_batch(
+    payload: &[u8],
+    batch: &mut ColumnarBatch,
+    types: &[FieldType],
+    needed: &[bool],
+) -> Result<()> {
+    let mut p = 0usize;
+    if payload.len() < 12 {
+        bail!("truncated payload: need at least 12 bytes for op+rowId");
+    }
+    let op = read_i32_be(payload, &mut p)?;
+    let row_id = read_i64_be(payload, &mut p)?;
+    batch.ops.push(op);
+    batch.row_ids.push(row_id);
+
+    let n_fields = types.len();
+    let null_bytes = (n_fields + 7) >> 3;
+    if p + null_bytes > payload.len() {
+        bail!("truncated payload: missing nullBitmap");
+    }
+    let null_pos = p;
+    p += null_bytes;
+
+    for (i, ftype) in types.iter().enumerate() {
+        let needed_flag = needed.get(i).copied().unwrap_or(true);
+        if is_null_bit_set(payload, null_pos, i) {
+            if needed_flag {
+                push_null_to_column(&mut batch.columns[i]);
+            }
+            continue;
+        }
+        if needed_flag {
+            decode_field_into_column(payload, &mut p, ftype, &mut batch.columns[i])?;
+        } else {
+            skip_field(payload, &mut p, ftype)?;
+        }
+    }
+
+    if p > payload.len() {
+        bail!("payload decode overran buffer");
+    }
+    Ok(())
+}
+
+fn new_empty_column(ftype: &FieldType, capacity: usize) -> InputColumn {
+    match ftype {
+        FieldType::String | FieldType::Bytes | FieldType::Unknown(_) => {
+            InputColumn::String(Vec::with_capacity(capacity))
+        }
+        FieldType::Boolean => InputColumn::Bool {
+            values: Vec::with_capacity(capacity),
+            is_null: None,
+        },
+        FieldType::Int64 | FieldType::TimestampMillis | FieldType::Date => InputColumn::I64 {
+            values: Vec::with_capacity(capacity),
+            is_null: None,
+        },
+        FieldType::Int32 | FieldType::Int16 | FieldType::Int8 => InputColumn::I32 {
+            values: Vec::with_capacity(capacity),
+            is_null: None,
+        },
+        FieldType::Float64 => InputColumn::F64 {
+            values: Vec::with_capacity(capacity),
+            is_null: None,
+        },
+        FieldType::Float32 => InputColumn::F32 {
+            values: Vec::with_capacity(capacity),
+            is_null: None,
+        },
+        FieldType::Decimal { .. } | FieldType::DecimalUnscaledI64 | FieldType::DecimalUnscaledBytes => {
+            InputColumn::Decimal128 {
+                values: Vec::with_capacity(capacity),
+                is_null: None,
+            }
+        }
+    }
+}
+
+fn clear_column(col: &mut InputColumn) {
+    match col {
+        InputColumn::String(v) => v.clear(),
+        InputColumn::I64 { values, is_null } => {
+            values.clear();
+            *is_null = None;
+        }
+        InputColumn::I32 { values, is_null } => {
+            values.clear();
+            *is_null = None;
+        }
+        InputColumn::F64 { values, is_null } => {
+            values.clear();
+            *is_null = None;
+        }
+        InputColumn::F32 { values, is_null } => {
+            values.clear();
+            *is_null = None;
+        }
+        InputColumn::Bool { values, is_null } => {
+            values.clear();
+            *is_null = None;
+        }
+        InputColumn::Decimal128 { values, is_null } => {
+            values.clear();
+            *is_null = None;
+        }
+    }
+}
+
+fn push_null_to_column(col: &mut InputColumn) {
+    match col {
+        InputColumn::String(v) => v.push(None),
+        InputColumn::I64 { values, is_null } => push_null_typed(values, is_null, 0),
+        InputColumn::I32 { values, is_null } => push_null_typed(values, is_null, 0),
+        InputColumn::F64 { values, is_null } => push_null_typed(values, is_null, 0.0),
+        InputColumn::F32 { values, is_null } => push_null_typed(values, is_null, 0.0f32),
+        InputColumn::Bool { values, is_null } => push_null_typed(values, is_null, false),
+        InputColumn::Decimal128 { values, is_null } => push_null_typed(values, is_null, 0i128),
+    }
+}
+
+fn push_null_typed<T>(values: &mut Vec<T>, is_null: &mut Option<Vec<bool>>, default: T) {
+    let prev_len = values.len();
+    values.push(default);
+    if let Some(n) = is_null.as_mut() {
+        n.push(true);
+    } else {
+        let mut v = vec![false; prev_len];
+        v.push(true);
+        *is_null = Some(v);
+    }
+}
+
+fn decode_field_into_column(
+    buf: &[u8],
+    p: &mut usize,
+    t: &FieldType,
+    col: &mut InputColumn,
+) -> Result<()> {
+    match t {
+        FieldType::Boolean => {
+            let b = read_u8(buf, p)?;
+            if let InputColumn::Bool { values, is_null } = col {
+                values.push(b != 0);
+                if let Some(n) = is_null.as_mut() { n.push(false); }
+            }
+        }
+        FieldType::Int64 | FieldType::TimestampMillis => {
+            let v = read_i64_be(buf, p)?;
+            if let InputColumn::I64 { values, is_null } = col {
+                values.push(v);
+                if let Some(n) = is_null.as_mut() { n.push(false); }
+            }
+        }
+        FieldType::Int32 | FieldType::Int16 | FieldType::Int8 => {
+            let v = read_i32_be(buf, p)?;
+            if let InputColumn::I32 { values, is_null } = col {
+                values.push(v);
+                if let Some(n) = is_null.as_mut() { n.push(false); }
+            }
+        }
+        FieldType::Float32 => {
+            let bits = read_u32_be(buf, p)?;
+            if let InputColumn::F32 { values, is_null } = col {
+                values.push(f32::from_bits(bits));
+                if let Some(n) = is_null.as_mut() { n.push(false); }
+            }
+        }
+        FieldType::Float64 => {
+            let bits = read_u64_be(buf, p)?;
+            if let InputColumn::F64 { values, is_null } = col {
+                values.push(f64::from_bits(bits));
+                if let Some(n) = is_null.as_mut() { n.push(false); }
+            }
+        }
+        FieldType::String | FieldType::Unknown(_) => {
+            let bytes = read_len_bytes(buf, p)?;
+            let s = String::from_utf8(bytes).context("invalid UTF-8")?;
+            if let InputColumn::String(values) = col {
+                values.push(Some(s));
+            }
+        }
+        FieldType::Bytes => {
+            let bytes = read_len_bytes(buf, p)?;
+            if let InputColumn::String(values) = col {
+                values.push(Some(String::from_utf8_lossy(&bytes).to_string()));
+            }
+        }
+        FieldType::Date => {
+            let days = read_i32_be(buf, p)? as i64;
+            let millis = days.checked_mul(86_400_000).context("DATE days->millis overflow")?;
+            if let InputColumn::I64 { values, is_null } = col {
+                values.push(millis);
+                if let Some(n) = is_null.as_mut() { n.push(false); }
+            }
+        }
+        FieldType::Decimal { precision, .. } => {
+            let prec = precision.unwrap_or(38);
+            let unscaled = if prec <= 18 {
+                read_i64_be(buf, p)? as i128
+            } else {
+                let bytes = read_len_bytes(buf, p)?;
+                twos_complement_be_to_i128(&bytes)?
+            };
+            if let InputColumn::Decimal128 { values, is_null } = col {
+                values.push(unscaled);
+                if let Some(n) = is_null.as_mut() { n.push(false); }
+            }
+        }
+        FieldType::DecimalUnscaledI64 => {
+            let unscaled = read_i64_be(buf, p)? as i128;
+            if let InputColumn::Decimal128 { values, is_null } = col {
+                values.push(unscaled);
+                if let Some(n) = is_null.as_mut() { n.push(false); }
+            }
+        }
+        FieldType::DecimalUnscaledBytes => {
+            let bytes = read_len_bytes(buf, p)?;
+            let unscaled = twos_complement_be_to_i128(&bytes)?;
+            if let InputColumn::Decimal128 { values, is_null } = col {
+                values.push(unscaled);
+                if let Some(n) = is_null.as_mut() { n.push(false); }
+            }
+        }
     }
     Ok(())
 }

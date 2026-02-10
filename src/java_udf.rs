@@ -37,7 +37,7 @@ pub enum JavaArg {
     Char(u16),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum InputColumn {
     String(Vec<Option<String>>),
     I64 { values: Vec<i64>, is_null: Option<Vec<bool>> },

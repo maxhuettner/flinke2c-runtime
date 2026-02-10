@@ -6,8 +6,8 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 
 use crate::codec::{
-    decode_payload_to_row, read_framed_payload, read_framed_row, read_i32_be_stream,
-    validate_row_len, write_output_blocks, OutputBlock,
+    decode_payload_into_batch, read_framed_payload, read_framed_payload_into, read_i32_be_stream,
+    write_output_blocks, ColumnarBatch, OutputBlock,
 };
 use crate::config::{build_session_config, Args, ConfigMessage};
 use crate::constants::DEFAULT_BUF_SIZE;
@@ -15,8 +15,7 @@ use crate::reload::{
     maybe_reload_udf, resolve_rust_udf_lib, udf_reload_watch_paths, ReloadSignal, ReloadWatcher,
 };
 use crate::udf::UdfHandle;
-use crate::udf_exec::{apply_udf_to_rows, apply_udf_to_rows_stream, UdfConfig};
-use crate::values::V;
+use crate::udf_exec::{apply_udf_to_batch, apply_udf_to_batch_stream, ColumnarUdfConfig};
 
 #[derive(Debug)]
 pub struct TcpSessionConfig<'a> {
@@ -224,7 +223,6 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
             eprintln!("UDF reload failed (keeping current): {err:#}");
         }
 
-        let mut debug_batches_remaining = config.args.debug_sample_batches;
         let mut reader = BufReader::with_capacity(DEFAULT_BUF_SIZE, pre);
         let mut writer = BufWriter::with_capacity(DEFAULT_BUF_SIZE, post);
 
@@ -235,51 +233,52 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
             .as_ref()
             .context("missing UDF class")?
             .clone();
-        let mut batch_rows: Vec<Vec<V>> = Vec::with_capacity(batch_size);
 
         let mut scratch = Vec::<u8>::new();
+        let mut batch = ColumnarBatch::new(&session_cfg.pre_payload_types, batch_size);
 
-        while let Some(row) = read_framed_row(&mut reader, &session_cfg, &mut scratch)? {
-            validate_row_len(&row, session_cfg.expected_input_len)?;
-            batch_rows.push(row);
-            if batch_rows.len() >= batch_size {
+        loop {
+            if !read_framed_payload_into(&mut reader, &mut scratch)? {
+                break;
+            }
+            decode_payload_into_batch(
+                &scratch,
+                &mut batch,
+                &session_cfg.pre_payload_types,
+                &session_cfg.pre_payload_needed,
+            )?;
+            if batch.len() >= batch_size {
                 maybe_reload_udf(
                     udf_handle,
                     &udf_class,
                     reload_signal.as_ref(),
                     &mut last_reload_version,
                 )?;
-                let mut udf_config = UdfConfig {
+                apply_udf_to_batch_stream(&mut ColumnarUdfConfig {
                     writer: &mut writer,
-                    rows: &batch_rows,
+                    batch: &batch,
                     session: &session_cfg,
                     udf: udf_handle,
                     method: &config.args.udf_method,
-                    debug_sample_rows: config.args.debug_sample_rows,
-                    debug_batches_remaining: &mut debug_batches_remaining,
-                };
-                apply_udf_to_rows_stream(&mut udf_config)?;
-                batch_rows.clear();
+                })?;
+                batch.clear();
             }
         }
 
-        if !batch_rows.is_empty() {
+        if batch.len() > 0 {
             maybe_reload_udf(
                 udf_handle,
                 &udf_class,
                 reload_signal.as_ref(),
                 &mut last_reload_version,
             )?;
-            let mut udf_config = UdfConfig {
+            apply_udf_to_batch_stream(&mut ColumnarUdfConfig {
                 writer: &mut writer,
-                rows: &batch_rows,
+                batch: &batch,
                 session: &session_cfg,
                 udf: udf_handle,
                 method: &config.args.udf_method,
-                debug_sample_rows: config.args.debug_sample_rows,
-                debug_batches_remaining: &mut debug_batches_remaining,
-            };
-            apply_udf_to_rows_stream(&mut udf_config)?;
+            })?;
         }
 
         writer.flush().ok();
@@ -333,7 +332,6 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
                 }
             };
 
-            let mut debug_batches_remaining = 0usize;
             let mut last_reload_version = reload_signal.as_ref().map(|s| s.current()).unwrap_or(0);
             for msg in rx {
                 let Some(work) = msg else { break };
@@ -347,20 +345,17 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
                     continue;
                 }
                 let result = (|| {
-                    let mut rows = Vec::with_capacity(work.payloads.len());
+                    let mut batch =
+                        ColumnarBatch::new(&session_cfg.pre_payload_types, work.payloads.len());
                     for payload in &work.payloads {
-                        let row = decode_payload_to_row(payload, &session_cfg)?;
-                        validate_row_len(&row, session_cfg.expected_input_len)?;
-                        rows.push(row);
+                        decode_payload_into_batch(
+                            payload,
+                            &mut batch,
+                            &session_cfg.pre_payload_types,
+                            &session_cfg.pre_payload_needed,
+                        )?;
                     }
-                    apply_udf_to_rows(
-                        &rows,
-                        &session_cfg,
-                        &mut udf_handle,
-                        &udf_method,
-                        0,
-                        &mut debug_batches_remaining,
-                    )
+                    apply_udf_to_batch(&batch, &session_cfg, &mut udf_handle, &udf_method)
                 })();
                 if result_tx.send(WorkResult { seq: work.seq, result }).is_err() {
                     break;

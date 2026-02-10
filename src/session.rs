@@ -10,7 +10,7 @@ use crate::codec::{
     validate_row_len, write_output_blocks, OutputBlock,
 };
 use crate::config::{build_session_config, Args, ConfigMessage};
-use crate::constants::{DEFAULT_BATCH_SIZE, DEFAULT_BUF_SIZE};
+use crate::constants::DEFAULT_BUF_SIZE;
 use crate::reload::{
     maybe_reload_udf, resolve_rust_udf_lib, udf_reload_watch_paths, ReloadSignal, ReloadWatcher,
 };
@@ -31,6 +31,7 @@ pub struct TcpSessionConfig<'a> {
 }
 
 pub fn run_server(args: Args) -> Result<()> {
+    crate::java_udf::set_jvm_opts(args.jvm_opts.clone());
     let listener = TcpListener::bind((args.listen_host.as_str(), args.in_port)).context("bind in-port")?;
     let mut current_udf_class: Option<String> = None;
     let mut current_udf_types: Option<Vec<String>> = None;
@@ -227,7 +228,7 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
         let mut reader = BufReader::with_capacity(DEFAULT_BUF_SIZE, pre);
         let mut writer = BufWriter::with_capacity(DEFAULT_BUF_SIZE, post);
 
-        let batch_size = DEFAULT_BATCH_SIZE;
+        let batch_size = config.args.batch_size.max(1);
         let mut last_reload_version = reload_signal.as_ref().map(|s| s.current()).unwrap_or(0);
         let udf_class = config
             .current_udf_class
@@ -413,7 +414,7 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
     let mut send_index = 0usize;
     let mut reader = BufReader::with_capacity(DEFAULT_BUF_SIZE, pre);
 
-    let batch_size = DEFAULT_BATCH_SIZE;
+    let batch_size = config.args.batch_size.max(1);
     let mut batch_payloads: Vec<Vec<u8>> = Vec::with_capacity(batch_size);
 
     loop {

@@ -38,6 +38,12 @@ pub struct Args {
     #[arg(long, default_value_os_t = default_rust_udf_lib())]
     pub rust_udf_lib: PathBuf,
 
+    #[arg(long, default_value_t = crate::constants::DEFAULT_BATCH_SIZE)]
+    pub batch_size: usize,
+
+    #[arg(long, env = "JVM_OPTS", value_delimiter = ' ', default_value = "-Xms256m -Xmx512m -XX:+UseG1GC -XX:MaxGCPauseMillis=5 -XX:+AlwaysPreTouch -XX:-TieredCompilation -XX:CompileThreshold=100")]
+    pub jvm_opts: Vec<String>,
+
     #[arg(long, default_value_t = 0)]
     pub debug_sample_rows: usize,
     #[arg(long, default_value_t = 1)]

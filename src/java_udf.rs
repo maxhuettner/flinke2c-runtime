@@ -1,5 +1,8 @@
 use anyhow::{bail, Context, Result};
-use jni::objects::{GlobalRef, JClass, JObject, JObjectArray, JString, JValue};
+use jni::objects::{
+    GlobalRef, JBooleanArray, JByteArray, JClass, JDoubleArray, JFloatArray, JIntArray,
+    JLongArray, JObject, JObjectArray, JString, JValue,
+};
 use jni::sys::{jboolean, jbyte};
 use jni::{InitArgsBuilder, JNIVersion, JNIEnv, JavaVM};
 use std::env;
@@ -11,7 +14,12 @@ use std::time::SystemTime;
 
 static JVM: OnceLock<JavaVM> = OnceLock::new();
 static JVM_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static JVM_OPTS: OnceLock<Vec<String>> = OnceLock::new();
 static SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_jvm_opts(opts: Vec<String>) {
+    let _ = JVM_OPTS.set(opts);
+}
 
 #[derive(Debug, Clone)]
 pub enum JavaArg {
@@ -54,6 +62,61 @@ impl InputColumn {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColumnKind {
+    String,
+    I64,
+    I32,
+    F64,
+    F32,
+    Bool,
+    Decimal128,
+}
+
+impl ColumnKind {
+    fn of(col: &InputColumn) -> Self {
+        match col {
+            InputColumn::String(_) => Self::String,
+            InputColumn::I64 { .. } => Self::I64,
+            InputColumn::I32 { .. } => Self::I32,
+            InputColumn::F64 { .. } => Self::F64,
+            InputColumn::F32 { .. } => Self::F32,
+            InputColumn::Bool { .. } => Self::Bool,
+            InputColumn::Decimal128 { .. } => Self::Decimal128,
+        }
+    }
+}
+
+struct CachedInputArrays {
+    row_count: usize,
+    col_types: Vec<ColumnKind>,
+    columns_wrapper: GlobalRef,
+    nulls_wrapper: GlobalRef,
+    column_refs: Vec<GlobalRef>,
+    null_refs: Vec<Option<GlobalRef>>,
+}
+
+impl std::fmt::Debug for CachedInputArrays {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedInputArrays")
+            .field("row_count", &self.row_count)
+            .field("col_count", &self.col_types.len())
+            .finish()
+    }
+}
+
+impl CachedInputArrays {
+    fn matches(&self, columns: &[InputColumn]) -> bool {
+        if columns.is_empty() {
+            return false;
+        }
+        let row_count = columns[0].len();
+        self.row_count == row_count
+            && self.col_types.len() == columns.len()
+            && self.col_types.iter().zip(columns).all(|(k, c)| *k == ColumnKind::of(c))
+    }
+}
+
 #[derive(Debug)]
 pub struct JavaUdfHandle {
     classpath_jars: Vec<PathBuf>,
@@ -66,9 +129,8 @@ pub struct JavaUdfHandle {
     /// True once setContextClassLoader has been called on the owning thread.
     /// Avoids Thread.currentThread() + setContextClassLoader() on every batch.
     context_loader_set: bool,
-    /// Cached Java String[] for the output-column names; rebuilt only when
-    /// the names vector changes between sessions.
     cached_output_names: Option<(Vec<String>, GlobalRef)>,
+    cached_input_arrays: Option<CachedInputArrays>,
     snapshot_paths: Vec<PathBuf>,
 }
 
@@ -95,11 +157,11 @@ impl JavaUdfHandle {
             udf_obj,
             context_loader_set: false,
             cached_output_names: None,
+            cached_input_arrays: None,
             snapshot_paths,
         })
     }
 
-    /// Call a method that takes Object[] columns + boolean[][] nulls and returns ColumnarResult.
     pub fn call_typed_columns_to_typed_results(
         &mut self,
         method: &str,
@@ -122,14 +184,15 @@ impl JavaUdfHandle {
             self.context_loader_set = true;
         }
 
-        let (columns_obj, nulls_obj) = new_typed_columns(&mut env, columns)?;
+        self.prepare_input_arrays(&mut env, columns)?;
+        let cache = self.cached_input_arrays.as_ref().unwrap();
         let ret = env.call_method(
             self.udf_obj.as_obj(),
             method,
             "([Ljava/lang/Object;[[Z)Lorg/example/flinke2c/runtime/ScalarFunctionAdapter$ColumnarResult;",
             &[
-                JValue::Object(&columns_obj),
-                JValue::Object(&nulls_obj),
+                JValue::Object(cache.columns_wrapper.as_obj()),
+                JValue::Object(cache.nulls_wrapper.as_obj()),
             ],
         )?;
         check_exception(&mut env, "invoke method")?;
@@ -138,26 +201,9 @@ impl JavaUdfHandle {
             return Ok(Vec::new());
         }
 
-        let columns_val =
-            env.call_method(&result_obj, "columns", "()[Ljava/lang/Object;", &[])?;
-        check_exception(&mut env, "ColumnarResult.columns")?;
-        let columns_obj = columns_val.l()?;
-        let columns_array = JObjectArray::from(columns_obj);
-
-        let nulls_val = env.call_method(&result_obj, "nulls", "()[[Z", &[])?;
-        check_exception(&mut env, "ColumnarResult.nulls")?;
-        let nulls_obj = nulls_val.l()?;
-        let nulls_array = if nulls_obj.is_null() {
-            None
-        } else {
-            Some(JObjectArray::from(nulls_obj))
-        };
-
-        typed_columns_to_vec(&mut env, columns_array, nulls_array)
+        extract_columnar_result(&mut env, result_obj)
     }
 
-    /// Call a method that takes Object[] columns + boolean[][] nulls + String[] outputNames
-    /// and returns ColumnarResult.
     pub fn call_typed_columns_to_named_results(
         &mut self,
         method: &str,
@@ -181,8 +227,8 @@ impl JavaUdfHandle {
             self.context_loader_set = true;
         }
 
-        let (columns_obj, nulls_obj) = new_typed_columns(&mut env, columns)?;
-        // Cache the output-names String[] across batches; rebuild only when names change.
+        self.prepare_input_arrays(&mut env, columns)?;
+        let cache = self.cached_input_arrays.as_ref().unwrap();
         if self.cached_output_names.as_ref().is_none_or(|(names, _)| names != output_names) {
             let new_obj = new_string_array_from_strings(&mut env, output_names)?;
             let global = env.new_global_ref(&new_obj)?;
@@ -194,8 +240,8 @@ impl JavaUdfHandle {
             method,
             "([Ljava/lang/Object;[[Z[Ljava/lang/String;)Lorg/example/flinke2c/runtime/ScalarFunctionAdapter$ColumnarResult;",
             &[
-                JValue::Object(&columns_obj),
-                JValue::Object(&nulls_obj),
+                JValue::Object(cache.columns_wrapper.as_obj()),
+                JValue::Object(cache.nulls_wrapper.as_obj()),
                 JValue::Object(names_ref),
             ],
         )?;
@@ -205,22 +251,25 @@ impl JavaUdfHandle {
             return Ok(Vec::new());
         }
 
-        let columns_val =
-            env.call_method(&result_obj, "columns", "()[Ljava/lang/Object;", &[])?;
-        check_exception(&mut env, "ColumnarResult.columns")?;
-        let columns_obj = columns_val.l()?;
-        let columns_array = JObjectArray::from(columns_obj);
+        extract_columnar_result(&mut env, result_obj)
+    }
 
-        let nulls_val = env.call_method(&result_obj, "nulls", "()[[Z", &[])?;
-        check_exception(&mut env, "ColumnarResult.nulls")?;
-        let nulls_obj = nulls_val.l()?;
-        let nulls_array = if nulls_obj.is_null() {
-            None
+    fn prepare_input_arrays(
+        &mut self,
+        env: &mut JNIEnv<'_>,
+        columns: &[InputColumn],
+    ) -> Result<()> {
+        if self
+            .cached_input_arrays
+            .as_ref()
+            .is_some_and(|c| c.matches(columns))
+        {
+            let cache = self.cached_input_arrays.as_ref().unwrap();
+            fill_cached_columns(env, cache, columns)
         } else {
-            Some(JObjectArray::from(nulls_obj))
-        };
-
-        typed_columns_to_vec(&mut env, columns_array, nulls_array)
+            self.cached_input_arrays = Some(allocate_input_cache(env, columns)?);
+            Ok(())
+        }
     }
 
     /// Reload only if any jar file has changed.
@@ -256,6 +305,7 @@ impl JavaUdfHandle {
         self.jar_state = jar_state;
         self.context_loader_set = false;
         self.cached_output_names = None;
+        self.cached_input_arrays = None;
         Ok(())
     }
 
@@ -290,10 +340,13 @@ fn get_or_create_jvm() -> Result<&'static JavaVM> {
         return Ok(jvm);
     }
 
-    let args = InitArgsBuilder::new()
-        .version(JNIVersion::V8)
-        .build()
-        .context("build JVM args")?;
+    let mut builder = InitArgsBuilder::new().version(JNIVersion::V8);
+    if let Some(opts) = JVM_OPTS.get() {
+        for opt in opts {
+            builder = builder.option(opt);
+        }
+    }
+    let args = builder.build().context("build JVM args")?;
     let jvm = JavaVM::new(args).context("create JVM")?;
     let _ = JVM.set(jvm);
     Ok(JVM.get().expect("JVM initialized"))
@@ -854,6 +907,160 @@ fn new_typed_columns<'local>(
     }
 
     Ok((col_array, nulls_array))
+}
+
+fn allocate_input_cache(
+    env: &mut JNIEnv<'_>,
+    columns: &[InputColumn],
+) -> Result<CachedInputArrays> {
+    let row_count = columns[0].len();
+    let col_types: Vec<ColumnKind> = columns.iter().map(ColumnKind::of).collect();
+    let (col_array, nulls_array) = new_typed_columns(env, columns)?;
+
+    let mut column_refs = Vec::with_capacity(columns.len());
+    let mut null_refs = Vec::with_capacity(columns.len());
+
+    for (idx, col_type) in col_types.iter().enumerate() {
+        let col_elem = env.get_object_array_element(&col_array, idx as i32)?;
+        column_refs.push(env.new_global_ref(&col_elem)?);
+
+        if *col_type == ColumnKind::String {
+            null_refs.push(None);
+        } else {
+            let null_elem = env.get_object_array_element(&nulls_array, idx as i32)?;
+            if null_elem.is_null() {
+                let arr = env.new_boolean_array(row_count as i32)?;
+                let obj = JObject::from(arr);
+                env.set_object_array_element(&nulls_array, idx as i32, &obj)?;
+                null_refs.push(Some(env.new_global_ref(&obj)?));
+            } else {
+                null_refs.push(Some(env.new_global_ref(&null_elem)?));
+            }
+        }
+    }
+
+    let columns_wrapper = env.new_global_ref(&col_array)?;
+    let nulls_wrapper = env.new_global_ref(&nulls_array)?;
+
+    Ok(CachedInputArrays {
+        row_count,
+        col_types,
+        columns_wrapper,
+        nulls_wrapper,
+        column_refs,
+        null_refs,
+    })
+}
+
+fn fill_cached_columns(
+    env: &mut JNIEnv<'_>,
+    cache: &CachedInputArrays,
+    columns: &[InputColumn],
+) -> Result<()> {
+    for (idx, column) in columns.iter().enumerate() {
+        fill_column_data(env, &cache.column_refs[idx], column)?;
+        if let Some(null_ref) = &cache.null_refs[idx] {
+            fill_null_data(env, null_ref, column, cache.row_count)?;
+        }
+    }
+    Ok(())
+}
+
+fn fill_column_data(
+    env: &mut JNIEnv<'_>,
+    global: &GlobalRef,
+    column: &InputColumn,
+) -> Result<()> {
+    let local = env.new_local_ref(global.as_obj())?;
+    match column {
+        InputColumn::String(values) => {
+            let array = JObjectArray::from(local);
+            for (idx, value) in values.iter().enumerate() {
+                if let Some(v) = value {
+                    let jstr = env.new_string(v)?;
+                    env.set_object_array_element(&array, idx as i32, JObject::from(jstr))?;
+                } else {
+                    env.set_object_array_element(&array, idx as i32, JObject::null())?;
+                }
+            }
+        }
+        InputColumn::I64 { values, .. } => {
+            env.set_long_array_region(&JLongArray::from(local), 0, values)?;
+        }
+        InputColumn::I32 { values, .. } => {
+            env.set_int_array_region(&JIntArray::from(local), 0, values)?;
+        }
+        InputColumn::F64 { values, .. } => {
+            env.set_double_array_region(&JDoubleArray::from(local), 0, values)?;
+        }
+        InputColumn::F32 { values, .. } => {
+            env.set_float_array_region(&JFloatArray::from(local), 0, values)?;
+        }
+        InputColumn::Bool { values, .. } => {
+            let raw: Vec<jboolean> = values.iter().map(|v| if *v { 1_u8 } else { 0_u8 }).collect();
+            env.set_boolean_array_region(&JBooleanArray::from(local), 0, &raw)?;
+        }
+        InputColumn::Decimal128 { values, .. } => {
+            let mut raw: Vec<jbyte> = Vec::with_capacity(values.len() * 16);
+            for value in values {
+                raw.extend(value.to_be_bytes().iter().map(|b| *b as i8));
+            }
+            env.set_byte_array_region(&JByteArray::from(local), 0, &raw)?;
+        }
+    }
+    Ok(())
+}
+
+fn fill_null_data(
+    env: &mut JNIEnv<'_>,
+    global: &GlobalRef,
+    column: &InputColumn,
+    row_count: usize,
+) -> Result<()> {
+    let nulls = match column {
+        InputColumn::String(_) => return Ok(()),
+        InputColumn::I64 { is_null, .. }
+        | InputColumn::I32 { is_null, .. }
+        | InputColumn::F64 { is_null, .. }
+        | InputColumn::F32 { is_null, .. }
+        | InputColumn::Bool { is_null, .. }
+        | InputColumn::Decimal128 { is_null, .. } => is_null.as_deref(),
+    };
+
+    let local = env.new_local_ref(global.as_obj())?;
+    let array = JBooleanArray::from(local);
+    match nulls {
+        Some(n) => {
+            let raw: Vec<jboolean> = n.iter().map(|v| if *v { 1_u8 } else { 0_u8 }).collect();
+            env.set_boolean_array_region(&array, 0, &raw)?;
+        }
+        None => {
+            let zeros = vec![0_u8; row_count];
+            env.set_boolean_array_region(&array, 0, &zeros)?;
+        }
+    }
+    Ok(())
+}
+
+fn extract_columnar_result(
+    env: &mut JNIEnv<'_>,
+    result_obj: JObject<'_>,
+) -> Result<Vec<InputColumn>> {
+    let columns_val = env.call_method(&result_obj, "columns", "()[Ljava/lang/Object;", &[])?;
+    check_exception(env, "ColumnarResult.columns")?;
+    let columns_obj = columns_val.l()?;
+    let columns_array = JObjectArray::from(columns_obj);
+
+    let nulls_val = env.call_method(&result_obj, "nulls", "()[[Z", &[])?;
+    check_exception(env, "ColumnarResult.nulls")?;
+    let nulls_obj = nulls_val.l()?;
+    let nulls_array = if nulls_obj.is_null() {
+        None
+    } else {
+        Some(JObjectArray::from(nulls_obj))
+    };
+
+    typed_columns_to_vec(env, columns_array, nulls_array)
 }
 
 fn input_column_to_java<'local>(

@@ -38,10 +38,10 @@ pub struct Args {
     #[arg(long, default_value_os_t = default_rust_udf_lib())]
     pub rust_udf_lib: PathBuf,
 
-    #[arg(long, default_value_t = crate::constants::DEFAULT_BATCH_SIZE)]
-    pub batch_size: usize,
+    #[arg(long = "udf-batch-size", alias = "batch-size")]
+    pub udf_batch_size: Option<usize>,
 
-    #[arg(long, env = "JVM_OPTS", value_delimiter = ' ', default_value = "-Xms256m -Xmx512m -XX:+UseG1GC -XX:MaxGCPauseMillis=5 -XX:+AlwaysPreTouch -XX:-TieredCompilation -XX:CompileThreshold=100")]
+    #[arg(long, env = "JVM_OPTS", value_delimiter = ' ', default_value = "-Xms256m -Xmx512m -XX:+UseG1GC -XX:+AlwaysPreTouch")]
     pub jvm_opts: Vec<String>,
 
     #[arg(long, default_value_t = 0)]
@@ -88,6 +88,8 @@ pub struct ConfigMessage {
     pub function_results: Vec<FunctionResult>,
     #[serde(default)]
     pub reorder_responses: bool,
+    #[serde(default, rename = "batchSize", alias = "commBatchSize")]
+    pub comm_batch_size: Option<usize>,
     #[serde(default)]
     pub pre_fields: Vec<FieldSpec>,
     #[serde(default)]

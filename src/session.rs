@@ -1,16 +1,19 @@
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::codec::{
-    decode_payload_into_batch, read_framed_payload, read_framed_payload_into, read_i32_be_stream,
-    write_output_blocks, ColumnarBatch, OutputBlock,
+    decode_payload_into_batch, read_i32_be_stream, write_output_blocks, ColumnarBatch, OutputBlock,
 };
 use crate::config::{build_session_config, Args, ConfigMessage};
-use crate::constants::DEFAULT_BUF_SIZE;
+use crate::constants::{
+    DEFAULT_BATCH_IDLE_MS, DEFAULT_BATCH_MAX_LATENCY_MS, DEFAULT_COMM_BATCH_SIZE,
+    DEFAULT_UDF_BATCH_SIZE, DEFAULT_BUF_SIZE, DEFAULT_MAX_FRAME_SIZE,
+};
 use crate::reload::{
     maybe_reload_udf, resolve_rust_udf_lib, udf_reload_watch_paths, ReloadSignal, ReloadWatcher,
 };
@@ -107,6 +110,148 @@ fn accept_pair(listener: &TcpListener) -> Result<(TcpStream, ConfigMessage, TcpS
     Ok((pre_stream, pre_cfg, post_stream, post_cfg))
 }
 
+enum FrameLenRead {
+    Len(i32),
+    Timeout,
+    Eof,
+}
+
+enum FrameReadOwned {
+    Payload(Vec<u8>),
+    Timeout,
+    Eof,
+}
+
+fn read_frame_len_or_timeout<R: Read>(reader: &mut R) -> Result<FrameLenRead> {
+    let mut buf = [0u8; 4];
+    let mut offset = 0usize;
+    loop {
+        match reader.read(&mut buf[offset..]) {
+            Ok(0) => {
+                if offset == 0 {
+                    return Ok(FrameLenRead::Eof);
+                }
+                bail!("unexpected EOF while reading frame length");
+            }
+            Ok(n) => {
+                offset += n;
+                if offset == buf.len() {
+                    return Ok(FrameLenRead::Len(i32::from_be_bytes(buf)));
+                }
+            }
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if offset == 0 {
+                    return Ok(FrameLenRead::Timeout);
+                }
+                continue;
+            }
+            Err(err) => return Err(err).context("read frame length"),
+        }
+    }
+}
+
+fn read_exact_retry<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<()> {
+    let mut offset = 0usize;
+    while offset < buf.len() {
+        match reader.read(&mut buf[offset..]) {
+            Ok(0) => bail!("unexpected EOF while reading frame payload"),
+            Ok(n) => offset += n,
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => continue,
+            Err(err) => return Err(err).context("read frame payload"),
+        }
+    }
+    Ok(())
+}
+
+fn read_framed_payload_timeout<R: Read>(reader: &mut R) -> Result<FrameReadOwned> {
+    let len = match read_frame_len_or_timeout(reader)? {
+        FrameLenRead::Len(v) => v,
+        FrameLenRead::Timeout => return Ok(FrameReadOwned::Timeout),
+        FrameLenRead::Eof => return Ok(FrameReadOwned::Eof),
+    };
+    if len < 0 {
+        bail!("invalid negative frame length: {}", len);
+    }
+    let len: usize = len.try_into().context("frame length overflow")?;
+    if len > DEFAULT_MAX_FRAME_SIZE {
+        bail!("frame length {} exceeds max_frame_size {}", len, DEFAULT_MAX_FRAME_SIZE);
+    }
+    let mut payload = vec![0u8; len];
+    read_exact_retry(reader, &mut payload)?;
+    Ok(FrameReadOwned::Payload(payload))
+}
+
+fn set_batch_read_timeout(
+    reader: &mut BufReader<TcpStream>,
+    current: &mut Option<Duration>,
+    desired: Option<Duration>,
+) -> Result<()> {
+    if *current == desired {
+        return Ok(());
+    }
+    reader
+        .get_mut()
+        .set_read_timeout(desired)
+        .context("set read timeout")?;
+    *current = desired;
+    Ok(())
+}
+
+fn next_batch_timeout(
+    now: Instant,
+    batch_start: Option<Instant>,
+    last_recv: Option<Instant>,
+) -> Option<Duration> {
+    let (start, last) = match (batch_start, last_recv) {
+        (Some(s), Some(l)) => (s, l),
+        _ => return None,
+    };
+    let mut deadline: Option<Instant> = None;
+    if DEFAULT_BATCH_IDLE_MS > 0 {
+        let idle_deadline = last + Duration::from_millis(DEFAULT_BATCH_IDLE_MS);
+        deadline = Some(match deadline {
+            Some(current) if current <= idle_deadline => current,
+            _ => idle_deadline,
+        });
+    }
+    if DEFAULT_BATCH_MAX_LATENCY_MS > 0 {
+        let max_deadline = start + Duration::from_millis(DEFAULT_BATCH_MAX_LATENCY_MS);
+        deadline = Some(match deadline {
+            Some(current) if current <= max_deadline => current,
+            _ => max_deadline,
+        });
+    }
+    let Some(deadline) = deadline else {
+        return None;
+    };
+    if deadline <= now {
+        Some(Duration::from_millis(0))
+    } else {
+        Some(deadline - now)
+    }
+}
+
+fn resolve_comm_batch_size(pre_cfg: &ConfigMessage, post_cfg: &ConfigMessage) -> usize {
+    let from_config = match (pre_cfg.comm_batch_size, post_cfg.comm_batch_size) {
+        (Some(pre), Some(post)) if pre != post => {
+            eprintln!(
+                "PRE/POST batchSize mismatch (pre={}, post={}); using PRE value",
+                pre, post
+            );
+            Some(pre)
+        }
+        (Some(pre), _) => Some(pre),
+        (None, Some(post)) => Some(post),
+        (None, None) => None,
+    };
+
+    from_config.unwrap_or(DEFAULT_COMM_BATCH_SIZE).max(1)
+}
+
+fn resolve_udf_batch_size(args: &Args) -> usize {
+    args.udf_batch_size.unwrap_or(DEFAULT_UDF_BATCH_SIZE).max(1)
+}
+
 fn run_session(config: TcpSessionConfig) -> Result<()> {
     let pre_fn = config.pre_cfg.function_class.as_deref().unwrap_or("<none>");
     let post_fn = config.post_cfg.function_class.as_deref().unwrap_or("<none>");
@@ -201,6 +346,8 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
     };
 
     let worker_count = config.args.workers.max(1);
+    let comm_batch_size = resolve_comm_batch_size(pre_cfg, post_cfg);
+    let udf_batch_size = resolve_udf_batch_size(config.args);
 
     if worker_count == 1 {
         if class_changed || types_changed || config.udf.is_none() {
@@ -225,8 +372,8 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
 
         let mut reader = BufReader::with_capacity(DEFAULT_BUF_SIZE, pre);
         let mut writer = BufWriter::with_capacity(DEFAULT_BUF_SIZE, post);
+        let mut current_timeout: Option<Duration> = None;
 
-        let batch_size = config.args.batch_size.max(1);
         let mut last_reload_version = reload_signal.as_ref().map(|s| s.current()).unwrap_or(0);
         let udf_class = config
             .current_udf_class
@@ -234,38 +381,11 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
             .context("missing UDF class")?
             .clone();
 
-        let mut scratch = Vec::<u8>::new();
-        let mut batch = ColumnarBatch::new(&session_cfg.pre_payload_types, batch_size);
-
-        loop {
-            if !read_framed_payload_into(&mut reader, &mut scratch)? {
-                break;
-            }
-            decode_payload_into_batch(
-                &scratch,
-                &mut batch,
-                &session_cfg.pre_payload_types,
-                &session_cfg.pre_payload_needed,
-            )?;
-            if batch.len() >= batch_size {
-                maybe_reload_udf(
-                    udf_handle,
-                    &udf_class,
-                    reload_signal.as_ref(),
-                    &mut last_reload_version,
-                )?;
-                apply_udf_to_batch_stream(&mut ColumnarUdfConfig {
-                    writer: &mut writer,
-                    batch: &batch,
-                    session: &session_cfg,
-                    udf: udf_handle,
-                    method: &config.args.udf_method,
-                })?;
-                batch.clear();
-            }
-        }
-
-        if batch.len() > 0 {
+        let mut batch_payloads: Vec<Vec<u8>> = Vec::with_capacity(comm_batch_size);
+        let mut batch_start: Option<Instant> = None;
+        let mut last_recv: Option<Instant> = None;
+        let mut udf_batch = ColumnarBatch::new(&session_cfg.pre_payload_types, udf_batch_size);
+        let mut flush_batch = |batch: &ColumnarBatch| -> Result<()> {
             maybe_reload_udf(
                 udf_handle,
                 &udf_class,
@@ -274,11 +394,86 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
             )?;
             apply_udf_to_batch_stream(&mut ColumnarUdfConfig {
                 writer: &mut writer,
-                batch: &batch,
+                batch,
                 session: &session_cfg,
                 udf: udf_handle,
                 method: &config.args.udf_method,
             })?;
+            Ok(())
+        };
+
+        let mut process_payloads = |payloads: &[Vec<u8>]| -> Result<()> {
+            for payload in payloads {
+                decode_payload_into_batch(
+                    payload,
+                    &mut udf_batch,
+                    &session_cfg.pre_payload_types,
+                    &session_cfg.pre_payload_needed,
+                )?;
+                if udf_batch.len() >= udf_batch_size {
+                    flush_batch(&udf_batch)?;
+                    udf_batch.clear();
+                }
+            }
+            if udf_batch.len() > 0 {
+                flush_batch(&udf_batch)?;
+                udf_batch.clear();
+            }
+            Ok(())
+        };
+
+        loop {
+            if let Some(remaining) = next_batch_timeout(Instant::now(), batch_start, last_recv) {
+                if remaining == Duration::from_millis(0) {
+                    if !batch_payloads.is_empty() {
+                        let payloads = std::mem::take(&mut batch_payloads);
+                        process_payloads(&payloads)?;
+                        batch_start = None;
+                        last_recv = None;
+                        set_batch_read_timeout(&mut reader, &mut current_timeout, None)?;
+                        continue;
+                    }
+                } else {
+                    set_batch_read_timeout(&mut reader, &mut current_timeout, Some(remaining))?;
+                }
+            } else {
+                set_batch_read_timeout(&mut reader, &mut current_timeout, None)?;
+            }
+
+            match read_framed_payload_timeout(&mut reader)? {
+                FrameReadOwned::Payload(payload) => {
+                    let now = Instant::now();
+                    let was_empty = batch_payloads.is_empty();
+                    batch_payloads.push(payload);
+                    if was_empty {
+                        batch_start = Some(now);
+                    }
+                    last_recv = Some(now);
+                    if batch_payloads.len() < comm_batch_size {
+                        continue;
+                    }
+                }
+                FrameReadOwned::Timeout => {
+                    if batch_payloads.is_empty() {
+                        continue;
+                    }
+                }
+                FrameReadOwned::Eof => {
+                    if batch_payloads.is_empty() {
+                        break;
+                    }
+                }
+            }
+
+            let payloads = std::mem::take(&mut batch_payloads);
+            process_payloads(&payloads)?;
+            batch_start = None;
+            last_recv = None;
+            set_batch_read_timeout(&mut reader, &mut current_timeout, None)?;
+        }
+
+        if !batch_payloads.is_empty() {
+            process_payloads(&batch_payloads)?;
         }
 
         writer.flush().ok();
@@ -314,6 +509,7 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
         let udf_types = config.current_udf_types.as_ref().context("missing UDF types")?.clone();
         let rust_udf_lib = resolve_rust_udf_lib(&config.args.rust_udf_lib, &udf_class);
         let reload_signal = reload_signal.clone();
+        let udf_batch_size = udf_batch_size;
 
         let handle = thread::spawn(move || {
             let udf_handle = UdfHandle::new(
@@ -346,7 +542,8 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
                 }
                 let result = (|| {
                     let mut batch =
-                        ColumnarBatch::new(&session_cfg.pre_payload_types, work.payloads.len());
+                        ColumnarBatch::new(&session_cfg.pre_payload_types, udf_batch_size);
+                    let mut out = Vec::with_capacity(work.payloads.len());
                     for payload in &work.payloads {
                         decode_payload_into_batch(
                             payload,
@@ -354,8 +551,19 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
                             &session_cfg.pre_payload_types,
                             &session_cfg.pre_payload_needed,
                         )?;
+                        if batch.len() >= udf_batch_size {
+                            let rows =
+                                apply_udf_to_batch(&batch, &session_cfg, &mut udf_handle, &udf_method)?;
+                            out.extend(rows);
+                            batch.clear();
+                        }
                     }
-                    apply_udf_to_batch(&batch, &session_cfg, &mut udf_handle, &udf_method)
+                    if batch.len() > 0 {
+                        let rows =
+                            apply_udf_to_batch(&batch, &session_cfg, &mut udf_handle, &udf_method)?;
+                        out.extend(rows);
+                    }
+                    Ok(out)
                 })();
                 if result_tx.send(WorkResult { seq: work.seq, result }).is_err() {
                     break;
@@ -408,19 +616,61 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
     let mut dispatched = 0usize;
     let mut send_index = 0usize;
     let mut reader = BufReader::with_capacity(DEFAULT_BUF_SIZE, pre);
-
-    let batch_size = config.args.batch_size.max(1);
-    let mut batch_payloads: Vec<Vec<u8>> = Vec::with_capacity(batch_size);
+    let mut current_timeout: Option<Duration> = None;
+    let mut batch_payloads: Vec<Vec<u8>> = Vec::with_capacity(comm_batch_size);
+    let mut batch_start: Option<Instant> = None;
+    let mut last_recv: Option<Instant> = None;
 
     loop {
-        match read_framed_payload(&mut reader)? {
-            Some(payload) => {
+        if let Some(remaining) = next_batch_timeout(Instant::now(), batch_start, last_recv) {
+            if remaining == Duration::from_millis(0) {
+                if !batch_payloads.is_empty() {
+                    let payloads = std::mem::take(&mut batch_payloads);
+                    batch_start = None;
+                    last_recv = None;
+                    set_batch_read_timeout(&mut reader, &mut current_timeout, None)?;
+                    let (lock, cvar) = &*inflight;
+                    let mut count = lock.lock().expect("lock inflight");
+                    while *count >= max_in_flight {
+                        count = cvar.wait(count).expect("wait inflight");
+                    }
+                    *count += 1;
+                    drop(count);
+
+                    let sender = &senders[send_index % senders.len()];
+                    sender
+                        .send(Some(WorkItem { seq: dispatched, payloads }))
+                        .context("dispatch batch to worker")?;
+                    dispatched += 1;
+                    send_index += 1;
+                    continue;
+                }
+            } else {
+                set_batch_read_timeout(&mut reader, &mut current_timeout, Some(remaining))?;
+            }
+        } else {
+            set_batch_read_timeout(&mut reader, &mut current_timeout, None)?;
+        }
+
+        match read_framed_payload_timeout(&mut reader)? {
+            FrameReadOwned::Payload(payload) => {
+                let now = Instant::now();
+                let was_empty = batch_payloads.is_empty();
                 batch_payloads.push(payload);
-                if batch_payloads.len() < batch_size {
+                if was_empty {
+                    batch_start = Some(now);
+                }
+                last_recv = Some(now);
+                if batch_payloads.len() < comm_batch_size {
                     continue;
                 }
             }
-            None => {
+            FrameReadOwned::Timeout => {
+                if batch_payloads.is_empty() {
+                    continue;
+                }
+            }
+            FrameReadOwned::Eof => {
                 if batch_payloads.is_empty() {
                     break;
                 }
@@ -428,6 +678,9 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
         }
 
         let payloads = std::mem::take(&mut batch_payloads);
+        batch_start = None;
+        last_recv = None;
+        set_batch_read_timeout(&mut reader, &mut current_timeout, None)?;
         let (lock, cvar) = &*inflight;
         let mut count = lock.lock().expect("lock inflight");
         while *count >= max_in_flight {

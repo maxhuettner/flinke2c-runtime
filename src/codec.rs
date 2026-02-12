@@ -97,112 +97,63 @@ pub fn write_output_blocks<W: Write>(
     session: &SessionConfig,
     payload: &mut Vec<u8>,
 ) -> Result<()> {
+    // Send one batched frame per input row (per OutputBlock)
     for block in blocks {
+        payload.clear();
+
+        // Count: 1 if this input row produced output, 0 if filtered
         let count = if block.row.is_some() { 1 } else { 0 };
-        write_header_frame(writer, block.op, block.row_id, count, payload)?;
+
+        // header section, no frame length prefix
+        write_i32_be_vec(payload, block.op);
+        write_i64_be_vec(payload, block.row_id);
+        payload.push(0u8); // null bitmap for count field (not null)
+        write_i32_be_vec(payload, count);
+
+        // row section if present, no frame length prefix
         if let Some(row) = block.row.as_ref() {
-            write_framed_row(writer, row, session, payload)?;
+            // Row header: __op and __rowId
+            write_i32_be_vec(payload, block.op);
+            write_i64_be_vec(payload, block.row_id);
+
+            // null bitmap for payload fields (post payload only)
+            let n_fields = session.post_payload_positions.len();
+            let null_bytes = (n_fields + 7) >> 3;
+            let null_pos = payload.len();
+            payload.resize(null_pos + null_bytes, 0);
+
+            // encode values in postFields order (excluding __op/__rowId)
+            for (i, (&row_pos, ftype)) in session
+                .post_payload_positions
+                .iter()
+                .zip(session.post_payload_types.iter())
+                .enumerate()
+            {
+                let v = row.get(row_pos).unwrap_or(&V::Null);
+                if matches!(v, V::Null) {
+                    set_null_bit(&mut payload[null_pos..null_pos + null_bytes], i);
+                    continue;
+                }
+                encode_field(payload, v, ftype)
+                    .with_context(|| format!("encode post field {} at row_pos {}", i, row_pos))?;
+            }
         }
-    }
-    Ok(())
-}
 
-pub fn write_framed_row<W: Write>(
-    writer: &mut W,
-    output_row: &[V],
-    session: &SessionConfig,
-    payload: &mut Vec<u8>,
-) -> Result<()> {
-    payload.clear();
-
-    // __op
-    let op = row_op(output_row);
-    write_i32_be_vec(payload, op);
-
-    // __rowId
-    let row_id = row_row_id(output_row)?;
-    write_i64_be_vec(payload, row_id);
-
-    // null bitmap for payload fields (post payload only)
-    let n_fields = session.post_payload_positions.len();
-    let null_bytes = (n_fields + 7) >> 3;
-    let null_pos = payload.len();
-    payload.resize(null_pos + null_bytes, 0);
-
-    // encode values in postFields order (excluding __op/__rowId)
-    for (i, (&row_pos, ftype)) in session
-        .post_payload_positions
-        .iter()
-        .zip(session.post_payload_types.iter())
-        .enumerate()
-    {
-        let v = output_row.get(row_pos).unwrap_or(&V::Null);
-        if matches!(v, V::Null) {
-            set_null_bit(&mut payload[null_pos..null_pos + null_bytes], i);
-            continue;
+        if payload.len() > DEFAULT_MAX_FRAME_SIZE {
+            bail!(
+                "batch payload exceeds max_frame_size: {} > {}",
+                payload.len(),
+                DEFAULT_MAX_FRAME_SIZE
+            );
         }
-        encode_field(payload, v, ftype)
-            .with_context(|| format!("encode post field {} at row_pos {}", i, row_pos))?;
-    }
 
-    if payload.len() > DEFAULT_MAX_FRAME_SIZE {
-        bail!(
-            "row payload exceeds max_frame_size: {} > {}",
-            payload.len(),
-            DEFAULT_MAX_FRAME_SIZE
-        );
+        // Write entire batch as one frame: [length][payload]
+        write_i32_be_stream(writer, payload.len() as i32)?;
+        writer.write_all(payload.as_slice()).context("write batch payload")?;
     }
-
-    // frame: [len][payload]
-    write_i32_be_stream(writer, payload.len() as i32)?;
-    writer.write_all(payload.as_slice()).context("write payload")?;
     Ok(())
 }
 
-pub fn row_op(row: &[V]) -> i32 {
-    match row.first() {
-        Some(V::I32(v)) => *v,
-        Some(V::I64(v)) => *v as i32,
-        _ => 0,
-    }
-}
-
-pub fn row_row_id(row: &[V]) -> Result<i64> {
-    match row.get(1) {
-        Some(V::I64(v)) => Ok(*v),
-        Some(V::I32(v)) => Ok(*v as i64),
-        Some(V::Null) | None => bail!("missing __rowId in row"),
-        Some(other) => bail!("unsupported __rowId type: {:?}", other),
-    }
-}
-
-pub fn write_header_frame<W: Write>(
-    writer: &mut W,
-    op: i32,
-    row_id: i64,
-    count: i32,
-    payload: &mut Vec<u8>,
-) -> Result<()> {
-    payload.clear();
-    write_i32_be_vec(payload, op);
-    write_i64_be_vec(payload, row_id);
-    // Header uses the same row framing: null-bitmap for payload fields.
-    // Header has exactly one payload field: __count.
-    payload.push(0u8);
-    write_i32_be_vec(payload, count);
-
-    if payload.len() > DEFAULT_MAX_FRAME_SIZE {
-        bail!(
-            "header payload exceeds max_frame_size: {} > {}",
-            payload.len(),
-            DEFAULT_MAX_FRAME_SIZE
-        );
-    }
-
-    write_i32_be_stream(writer, payload.len() as i32)?;
-    writer.write_all(payload.as_slice()).context("write header payload")?;
-    Ok(())
-}
 
 pub fn encode_field(out: &mut Vec<u8>, v: &V, t: &FieldType) -> Result<()> {
     match t {

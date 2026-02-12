@@ -3,7 +3,7 @@ use std::io::Write;
 
 use crate::codec::{
     i128_to_twos_complement_be_minimal, set_null_bit,
-    write_header_frame, write_i32_be_stream, write_i32_be_vec, write_i64_be_vec,
+    write_i32_be_stream, write_i32_be_vec, write_i64_be_vec,
     write_u32_be_vec, write_u64_be_vec, ColumnarBatch, OutputBlock,
 };
 use crate::config::{FieldType, FunctionKind, PayloadSource, PostFieldSourceKind, SessionConfig};
@@ -50,55 +50,65 @@ pub fn apply_udf_to_batch_stream<W: Write>(config: &mut ColumnarUdfConfig<W>) ->
 
     let n_fields = session.post_payload_positions.len();
     let null_bytes = (n_fields + 7) >> 3;
-    let mut payload = Vec::with_capacity(256);
+    let mut batch_payload = Vec::with_capacity(256);
     let writer = &mut *config.writer;
 
+    // Send one batched frame per input row
     for row_idx in 0..batch.len() {
+        batch_payload.clear();
+
         let op = batch.ops[row_idx];
         let row_id = batch.row_ids[row_idx];
         let passes = filter_passes(pred_col, row_idx)?;
         let count = if passes { 1 } else { 0 };
-        write_header_frame(writer, op, row_id, count, &mut payload)?;
-        if count == 0 {
-            continue;
-        }
 
-        payload.clear();
-        write_i32_be_vec(&mut payload, op);
-        write_i64_be_vec(&mut payload, row_id);
+        // header section, no frame length prefix
+        write_i32_be_vec(&mut batch_payload, op);
+        write_i64_be_vec(&mut batch_payload, row_id);
+        batch_payload.push(0u8); // null bitmap for count field (not null)
+        write_i32_be_vec(&mut batch_payload, count);
 
-        let null_pos = payload.len();
-        payload.resize(null_pos + null_bytes, 0);
+        // row section if the filter passes, no frame length prefix
+        if passes {
+            // Row header: __op and __rowId
+            write_i32_be_vec(&mut batch_payload, op);
+            write_i64_be_vec(&mut batch_payload, row_id);
 
-        for (i, source) in session.post_payload_sources.iter().enumerate() {
-            let ftype = &session.post_payload_types[i];
-            let is_null = match source {
-                PayloadSource::InputAt(pre_pos) => {
-                    if let Some(slot) = session.pre_pos_to_payload_slot.get(*pre_pos).and_then(|s| *s) {
-                        encode_input_column_at(&mut payload, &batch.columns[slot], row_idx, ftype)?
-                    } else {
-                        true
+            // null bitmap for payload fields
+            let null_pos = batch_payload.len();
+            batch_payload.resize(null_pos + null_bytes, 0);
+
+            for (i, source) in session.post_payload_sources.iter().enumerate() {
+                let ftype = &session.post_payload_types[i];
+                let is_null = match source {
+                    PayloadSource::InputAt(pre_pos) => {
+                        if let Some(slot) = session.pre_pos_to_payload_slot.get(*pre_pos).and_then(|s| *s) {
+                            encode_input_column_at(&mut batch_payload, &batch.columns[slot], row_idx, ftype)?
+                        } else {
+                            true
+                        }
                     }
+                    PayloadSource::OutputAt(col_idx) => {
+                        encode_input_column_at(&mut batch_payload, &output_columns[*col_idx], row_idx, ftype)?
+                    }
+                };
+                if is_null {
+                    set_null_bit(&mut batch_payload[null_pos..null_pos + null_bytes], i);
                 }
-                PayloadSource::OutputAt(col_idx) => {
-                    encode_input_column_at(&mut payload, &output_columns[*col_idx], row_idx, ftype)?
-                }
-            };
-            if is_null {
-                set_null_bit(&mut payload[null_pos..null_pos + null_bytes], i);
             }
         }
 
-        if payload.len() > DEFAULT_MAX_FRAME_SIZE {
+        if batch_payload.len() > DEFAULT_MAX_FRAME_SIZE {
             bail!(
-                "row payload exceeds max_frame_size: {} > {}",
-                payload.len(),
+                "batch payload exceeds max_frame_size: {} > {}",
+                batch_payload.len(),
                 DEFAULT_MAX_FRAME_SIZE
             );
         }
 
-        write_i32_be_stream(writer, payload.len() as i32)?;
-        writer.write_all(payload.as_slice()).context("write payload")?;
+        // Write entire batched frame: [length][payload]
+        write_i32_be_stream(writer, batch_payload.len() as i32)?;
+        writer.write_all(batch_payload.as_slice()).context("write batch payload")?;
     }
 
     Ok(())

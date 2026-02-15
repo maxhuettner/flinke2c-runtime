@@ -83,20 +83,34 @@ fn accept_pair(listener: &TcpListener) -> Result<(TcpStream, ConfigMessage, TcpS
     let mut pre: Option<(TcpStream, ConfigMessage)> = None;
     let mut post: Option<(TcpStream, ConfigMessage)> = None;
 
-    while pre.is_none() || post.is_none() {
+    loop {
+        let _ = drop_if_disconnected(&mut pre, "PRE")?;
+        let _ = drop_if_disconnected(&mut post, "POST")?;
+        if pre.is_some() && post.is_some() {
+            break;
+        }
+
         let (mut stream, addr) = listener.accept().context("accept connection")?;
         let cfg = read_config(&mut stream).context("read config")?;
         match cfg.role.as_str() {
             "pre" => {
                 if pre.is_some() {
-                    bail!("duplicate PRE connection from {}", addr);
+                    if !drop_if_disconnected(&mut pre, "PRE")? {
+                        println!("Replacing stale PRE with new connection from {}", addr);
+                    } else {
+                        bail!("duplicate PRE connection from {}", addr);
+                    }
                 }
                 println!("PRE connected from {}", addr);
                 pre = Some((stream, cfg));
             }
             "post" => {
                 if post.is_some() {
-                    bail!("duplicate POST connection from {}", addr);
+                    if !drop_if_disconnected(&mut post, "POST")? {
+                        println!("Replacing stale POST with new connection from {}", addr);
+                    } else {
+                        bail!("duplicate POST connection from {}", addr);
+                    }
                 }
                 println!("POST connected from {}", addr);
                 post = Some((stream, cfg));
@@ -108,6 +122,45 @@ fn accept_pair(listener: &TcpListener) -> Result<(TcpStream, ConfigMessage, TcpS
     let (pre_stream, pre_cfg) = pre.expect("pre connection");
     let (post_stream, post_cfg) = post.expect("post connection");
     Ok((pre_stream, pre_cfg, post_stream, post_cfg))
+}
+
+fn drop_if_disconnected(
+    conn: &mut Option<(TcpStream, ConfigMessage)>,
+    role: &str,
+) -> Result<bool> {
+    let disconnected = match conn.as_ref() {
+        Some((stream, _)) => is_stream_disconnected(stream)?,
+        None => false,
+    };
+    if disconnected {
+        println!("{role} disconnected before pair completed; dropping pending connection");
+        *conn = None;
+    }
+    Ok(conn.is_some())
+}
+
+fn is_stream_disconnected(stream: &TcpStream) -> Result<bool> {
+    stream
+        .set_nonblocking(true)
+        .context("set nonblocking while probing stream state")?;
+
+    let mut probe = [0u8; 1];
+    let peek_result = match stream.peek(&mut probe) {
+        Ok(0) => Ok(true),
+        Ok(_) => Ok(false),
+        Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(false),
+        Err(err) => Err(err).context("peek stream state"),
+    };
+
+    let restore_result = stream
+        .set_nonblocking(false)
+        .context("restore blocking mode after probing stream state");
+
+    match (peek_result, restore_result) {
+        (Ok(disconnected), Ok(())) => Ok(disconnected),
+        (Err(err), Ok(())) => Err(err),
+        (_, Err(err)) => Err(err),
+    }
 }
 
 enum FrameLenRead {

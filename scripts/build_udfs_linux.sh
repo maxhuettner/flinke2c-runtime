@@ -4,6 +4,7 @@ set -euo pipefail
 TARGET="${TARGET:-x86_64-unknown-linux-gnu}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIB_DIR="${ROOT_DIR}/lib"
+UPDATED_LIB_DIR="${LIB_DIR}/updated"
 
 if ! command -v cargo >/dev/null 2>&1; then
   echo "error: cargo not found" >&2
@@ -16,6 +17,7 @@ if ! cargo --list | grep -q "zigbuild"; then
 fi
 
 mkdir -p "${LIB_DIR}"
+mkdir -p "${UPDATED_LIB_DIR}"
 
 for crate_dir in "${ROOT_DIR}"/rust-udfs/*; do
   if [[ -f "${crate_dir}/Cargo.toml" ]]; then
@@ -49,7 +51,21 @@ for crate_dir in "${ROOT_DIR}"/rust-udfs/*; do
 
     echo "Copying $(basename "${so_path}") -> ${LIB_DIR}"
     cp -f "${so_path}" "${LIB_DIR}/"
+
+    if [[ "${crate_dir##*/}" == "price-greater-than" ]]; then
+      echo "Building ${crate_dir##*/} (less_sensitive) for ${TARGET}..."
+      cargo zigbuild --release --target "${TARGET}" --features less_sensitive --manifest-path "${crate_dir}/Cargo.toml"
+
+      so_path_less_sensitive="${crate_dir}/target/${TARGET}/release/lib${lib_name}.so"
+      if [[ ! -f "${so_path_less_sensitive}" ]]; then
+        echo "error: expected output not found: ${so_path_less_sensitive}" >&2
+        exit 1
+      fi
+
+      echo "Copying $(basename "${so_path_less_sensitive}") -> ${UPDATED_LIB_DIR}"
+      cp -f "${so_path_less_sensitive}" "${UPDATED_LIB_DIR}/"
+    fi
   fi
 done
 
-echo "Done. Linux UDFs are in ${LIB_DIR}"
+echo "Done. Linux UDFs are in ${LIB_DIR} (plus updated variants in ${UPDATED_LIB_DIR})"

@@ -5,8 +5,14 @@ use std::ptr;
 use udf_abi::helpers::{ensure_column_lengths, expect_i128, validate_function_class};
 use udf_abi::{UDF_ABI_VERSION, UdfColumnType, UdfInputColumn, UdfOutputColumn, UdfResult, UdfStrView};
 
-const CLASS_NAME: &str = "org.example.flinke2c.CurrencyConversionFunction";
-const CONVERSION_FACTOR_UNSCALED: i128 = 908; // BigDecimal("0.908") unscaled
+const CLASS_NAME: &str = "org.example.flinke2c.PriceGreaterThan";
+const DECIMAL_SCALE_FACTOR: i128 = 1_000; // DECIMAL(23,3)
+
+#[cfg(feature = "less_sensitive")]
+const THRESHOLD_UNSCALED: i128 = 100_000 * DECIMAL_SCALE_FACTOR; // 100000.000
+
+#[cfg(not(feature = "less_sensitive"))]
+const THRESHOLD_UNSCALED: i128 = 1_000 * DECIMAL_SCALE_FACTOR; // 1000.000
 
 struct UdfState;
 
@@ -17,7 +23,6 @@ struct ResultStorage {
 
 enum Buffer {
     Bytes { _buf: Vec<u8> },
-    I128 { _buf: Vec<i128> },
 }
 
 #[no_mangle]
@@ -73,7 +78,7 @@ pub unsafe extern "C" fn flinke2c_runtime_udf_eval(
         std::slice::from_raw_parts(columns, num_columns)
     };
 
-    let output = match eval_currency(input_columns) {
+    let output = match eval_price_greater_than(input_columns) {
         Ok(v) => v,
         Err(err) => {
             eprintln!("rust udf eval error: {err:#}");
@@ -98,10 +103,11 @@ fn validate_class(function_class: UdfStrView) -> Result<()> {
     validate_function_class(function_class, CLASS_NAME)
 }
 
-fn eval_currency(columns: &[UdfInputColumn]) -> Result<ResultStorage> {
+fn eval_price_greater_than(columns: &[UdfInputColumn]) -> Result<ResultStorage> {
     if columns.len() != 1 {
-        bail!("CurrencyConversionFunction expects 1 input column, got {}", columns.len());
+        bail!("PriceGreaterThan expects 1 input column, got {}", columns.len());
     }
+
     let row_count = ensure_column_lengths(columns)?;
     let (values, nulls) = expect_i128(&columns[0], "price")?;
 
@@ -114,14 +120,12 @@ fn eval_currency(columns: &[UdfInputColumn]) -> Result<ResultStorage> {
             .map(|v| v.get(row).copied().unwrap_or(0) != 0)
             .unwrap_or(false);
         if is_null {
-            out.push(0);
+            out.push(0u8);
             continue;
         }
-        let value = *values.get(row).unwrap_or(&0);
-        let scaled = value
-            .checked_mul(CONVERSION_FACTOR_UNSCALED)
-            .ok_or_else(|| anyhow::anyhow!("decimal overflow in currency conversion"))?;
-        out.push(scaled);
+
+        let price_unscaled = *values.get(row).unwrap_or(&0);
+        out.push((price_unscaled > THRESHOLD_UNSCALED) as u8);
     }
 
     let mut storage = ResultStorage {
@@ -130,7 +134,7 @@ fn eval_currency(columns: &[UdfInputColumn]) -> Result<ResultStorage> {
     };
 
     let values_ptr = out.as_ptr();
-    storage.buffers.push(Buffer::I128 { _buf: out });
+    storage.buffers.push(Buffer::Bytes { _buf: out });
 
     let nulls_ptr = if let Some(nulls) = out_nulls.take() {
         let ptr = nulls.as_ptr();
@@ -141,9 +145,9 @@ fn eval_currency(columns: &[UdfInputColumn]) -> Result<ResultStorage> {
     };
 
     storage.columns.push(UdfOutputColumn {
-        kind: UdfColumnType::Decimal128,
+        kind: UdfColumnType::Bool,
         len: row_count,
-        values: values_ptr as *const u8,
+        values: values_ptr,
         nulls: nulls_ptr,
         strings: ptr::null(),
     });

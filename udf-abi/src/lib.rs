@@ -1,6 +1,7 @@
 use std::ffi::c_void;
 
 pub const UDF_ABI_VERSION: u32 = 1;
+pub mod helpers;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

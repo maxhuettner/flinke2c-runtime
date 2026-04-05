@@ -1,0 +1,10 @@
+.git
+.idea
+target
+**/target
+cmake-build-debug
+**/cmake-build-*
+lib
+jar
+java/**/build
+java/**/.gradle

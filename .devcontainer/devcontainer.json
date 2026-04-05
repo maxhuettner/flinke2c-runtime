@@ -1,0 +1,25 @@
+{
+  "name": "flinke2c-runtime-rdma",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": ".."
+  },
+  "workspaceFolder": "/workspaces/flinke2c-runtime",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/flinke2c-runtime,type=bind",
+  "mounts": [
+    "source=flinke2c-runtime-cargo-cache,target=/usr/local/cargo,type=volume",
+    "source=flinke2c-runtime-rustup-cache,target=/usr/local/rustup,type=volume"
+  ],
+  "postCreateCommand": "bash -lc 'rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable'",
+  "remoteUser": "root",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "rust-analyzer.check.command": "clippy"
+      }
+    },
+    "jetbrains": {
+      "backend": "RustRover"
+    }
+  }
+}

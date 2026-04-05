@@ -204,10 +204,7 @@ pub fn maybe_reload_udf(
                     *last_version = version;
                 }
                 Err(err) => {
-                    eprintln!(
-                        "UDF reload failed for {} (keeping current): {:#}",
-                        udf_class, err
-                    );
+                    eprintln!("UDF reload failed for {} (keeping current): {:#}", udf_class, err);
                 }
             }
         }

@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use libloading::Library;
 use std::env;
 use std::ffi::c_void;
@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
-use udf_abi::{UdfColumnType, UdfInputColumn, UdfResult, UdfStrView, UDF_ABI_VERSION};
+use udf_abi::{UDF_ABI_VERSION, UdfColumnType, UdfInputColumn, UdfResult, UdfStrView};
 
 use crate::java_udf::InputColumn;
 
@@ -18,7 +18,6 @@ const SYMBOL_EVAL: &[u8] = b"flinke2c_runtime_udf_eval\0";
 const SYMBOL_FREE_RESULT: &[u8] = b"flinke2c_runtime_udf_free_result\0";
 
 static LIB_SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 
 #[derive(Debug)]
 pub struct RustUdfHandle {
@@ -150,23 +149,15 @@ fn lib_state(path: &Path) -> Result<LibState> {
 
 fn copy_lib_to_temp(original: &Path) -> Result<PathBuf> {
     let base_dir = env::temp_dir().join("flinke2c-runtime-libs");
-    fs::create_dir_all(&base_dir)
-        .with_context(|| format!("create lib snapshot dir {}", base_dir.display()))?;
+    fs::create_dir_all(&base_dir).with_context(|| format!("create lib snapshot dir {}", base_dir.display()))?;
     let dest = temp_lib_path(&base_dir, original)?;
-    fs::copy(original, &dest)
-        .with_context(|| format!("copy {} -> {}", original.display(), dest.display()))?;
+    fs::copy(original, &dest).with_context(|| format!("copy {} -> {}", original.display(), dest.display()))?;
     Ok(dest)
 }
 
 fn temp_lib_path(base_dir: &Path, original: &Path) -> Result<PathBuf> {
-    let stem = original
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("udf");
-    let ext = original
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("so");
+    let stem = original.file_stem().and_then(|s| s.to_str()).unwrap_or("udf");
+    let ext = original.extension().and_then(|s| s.to_str()).unwrap_or("so");
     let pid = std::process::id();
     let counter = LIB_SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
     let ts = SystemTime::now()
@@ -198,14 +189,14 @@ struct UdfApi {
 
 impl UdfApi {
     unsafe fn load(lib: &Library) -> Result<Self> {
-        let abi_version: libloading::Symbol<unsafe extern "C" fn() -> u32> = lib.get(SYMBOL_ABI_VERSION)?;
-        let version = abi_version();
+        let abi_version: libloading::Symbol<unsafe extern "C" fn() -> u32> = unsafe { lib.get(SYMBOL_ABI_VERSION) }?;
+        let version = unsafe { abi_version() };
         if version != UDF_ABI_VERSION {
             bail!("rust udf ABI mismatch: host {} vs plugin {}", UDF_ABI_VERSION, version);
         }
 
-        let create: libloading::Symbol<unsafe extern "C" fn() -> *mut c_void> = lib.get(SYMBOL_CREATE)?;
-        let drop_fn: libloading::Symbol<unsafe extern "C" fn(*mut c_void)> = lib.get(SYMBOL_DROP)?;
+        let create: libloading::Symbol<unsafe extern "C" fn() -> *mut c_void> = unsafe { lib.get(SYMBOL_CREATE) }?;
+        let drop_fn: libloading::Symbol<unsafe extern "C" fn(*mut c_void)> = unsafe { lib.get(SYMBOL_DROP) }?;
         let eval: libloading::Symbol<
             unsafe extern "C" fn(
                 *mut c_void,
@@ -215,8 +206,9 @@ impl UdfApi {
                 *const UdfStrView,
                 usize,
             ) -> *mut UdfResult,
-        > = lib.get(SYMBOL_EVAL)?;
-        let free_result: libloading::Symbol<unsafe extern "C" fn(*mut UdfResult)> = lib.get(SYMBOL_FREE_RESULT)?;
+        > = unsafe { lib.get(SYMBOL_EVAL) }?;
+        let free_result: libloading::Symbol<unsafe extern "C" fn(*mut UdfResult)> =
+            unsafe { lib.get(SYMBOL_FREE_RESULT) }?;
 
         Ok(Self {
             create: *create,
@@ -420,7 +412,7 @@ fn str_to_view(value: &str) -> UdfStrView {
 }
 
 unsafe fn decode_result(result_ptr: *mut UdfResult) -> Result<Vec<InputColumn>> {
-    let result = &*result_ptr;
+    let result = unsafe { &*result_ptr };
     if result.len == 0 {
         return Ok(Vec::new());
     }
@@ -428,7 +420,7 @@ unsafe fn decode_result(result_ptr: *mut UdfResult) -> Result<Vec<InputColumn>> 
         bail!("rust udf returned null columns");
     }
 
-    let columns = std::slice::from_raw_parts(result.columns, result.len);
+    let columns = unsafe { std::slice::from_raw_parts(result.columns, result.len) };
     let mut out = Vec::with_capacity(columns.len());
 
     for column in columns {
@@ -436,7 +428,7 @@ unsafe fn decode_result(result_ptr: *mut UdfResult) -> Result<Vec<InputColumn>> 
         let nulls = if column.nulls.is_null() {
             None
         } else {
-            let raw = std::slice::from_raw_parts(column.nulls, len);
+            let raw = unsafe { std::slice::from_raw_parts(column.nulls, len) };
             Some(raw.iter().map(|v| *v != 0).collect::<Vec<bool>>())
         };
 
@@ -445,7 +437,7 @@ unsafe fn decode_result(result_ptr: *mut UdfResult) -> Result<Vec<InputColumn>> 
                 if column.strings.is_null() {
                     bail!("rust udf string column missing strings pointer");
                 }
-                let views = std::slice::from_raw_parts(column.strings, len);
+                let views = unsafe { std::slice::from_raw_parts(column.strings, len) };
                 let mut values = Vec::with_capacity(len);
                 for (idx, view) in views.iter().enumerate() {
                     if nulls
@@ -460,35 +452,35 @@ unsafe fn decode_result(result_ptr: *mut UdfResult) -> Result<Vec<InputColumn>> 
                         values.push(None);
                         continue;
                     }
-                    let bytes = std::slice::from_raw_parts(view.ptr, view.len);
+                    let bytes = unsafe { std::slice::from_raw_parts(view.ptr, view.len) };
                     let s = std::str::from_utf8(bytes).with_context(|| "invalid utf-8 in rust udf output")?;
                     values.push(Some(s.to_string()));
                 }
                 out.push(InputColumn::String(values));
             }
             UdfColumnType::I64 => {
-                let values = std::slice::from_raw_parts(column.values as *const i64, len).to_vec();
+                let values = unsafe { std::slice::from_raw_parts(column.values as *const i64, len).to_vec() };
                 out.push(InputColumn::I64 { values, is_null: nulls });
             }
             UdfColumnType::I32 => {
-                let values = std::slice::from_raw_parts(column.values as *const i32, len).to_vec();
+                let values = unsafe { std::slice::from_raw_parts(column.values as *const i32, len).to_vec() };
                 out.push(InputColumn::I32 { values, is_null: nulls });
             }
             UdfColumnType::F64 => {
-                let values = std::slice::from_raw_parts(column.values as *const f64, len).to_vec();
+                let values = unsafe { std::slice::from_raw_parts(column.values as *const f64, len).to_vec() };
                 out.push(InputColumn::F64 { values, is_null: nulls });
             }
             UdfColumnType::F32 => {
-                let values = std::slice::from_raw_parts(column.values as *const f32, len).to_vec();
+                let values = unsafe { std::slice::from_raw_parts(column.values as *const f32, len).to_vec() };
                 out.push(InputColumn::F32 { values, is_null: nulls });
             }
             UdfColumnType::Bool => {
-                let raw = std::slice::from_raw_parts(column.values, len);
+                let raw = unsafe { std::slice::from_raw_parts(column.values, len) };
                 let values = raw.iter().map(|v| *v != 0).collect::<Vec<bool>>();
                 out.push(InputColumn::Bool { values, is_null: nulls });
             }
             UdfColumnType::Decimal128 => {
-                let values = std::slice::from_raw_parts(column.values as *const i128, len).to_vec();
+                let values = unsafe { std::slice::from_raw_parts(column.values as *const i128, len).to_vec() };
                 out.push(InputColumn::Decimal128 { values, is_null: nulls });
             }
         }

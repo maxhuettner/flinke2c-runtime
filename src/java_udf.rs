@@ -1,15 +1,15 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use jni::objects::{
-    GlobalRef, JBooleanArray, JByteArray, JClass, JDoubleArray, JFloatArray, JIntArray,
-    JLongArray, JObject, JObjectArray, JString, JValue,
+    GlobalRef, JBooleanArray, JByteArray, JClass, JDoubleArray, JFloatArray, JIntArray, JLongArray, JObject,
+    JObjectArray, JString, JValue,
 };
 use jni::sys::{jboolean, jbyte};
-use jni::{InitArgsBuilder, JNIVersion, JNIEnv, JavaVM};
+use jni::{InitArgsBuilder, JNIEnv, JNIVersion, JavaVM};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 static JVM: OnceLock<JavaVM> = OnceLock::new();
@@ -40,12 +40,30 @@ pub enum JavaArg {
 #[derive(Debug, Clone)]
 pub enum InputColumn {
     String(Vec<Option<String>>),
-    I64 { values: Vec<i64>, is_null: Option<Vec<bool>> },
-    I32 { values: Vec<i32>, is_null: Option<Vec<bool>> },
-    F64 { values: Vec<f64>, is_null: Option<Vec<bool>> },
-    F32 { values: Vec<f32>, is_null: Option<Vec<bool>> },
-    Bool { values: Vec<bool>, is_null: Option<Vec<bool>> },
-    Decimal128 { values: Vec<i128>, is_null: Option<Vec<bool>> },
+    I64 {
+        values: Vec<i64>,
+        is_null: Option<Vec<bool>>,
+    },
+    I32 {
+        values: Vec<i32>,
+        is_null: Option<Vec<bool>>,
+    },
+    F64 {
+        values: Vec<f64>,
+        is_null: Option<Vec<bool>>,
+    },
+    F32 {
+        values: Vec<f32>,
+        is_null: Option<Vec<bool>>,
+    },
+    Bool {
+        values: Vec<bool>,
+        is_null: Option<Vec<bool>>,
+    },
+    Decimal128 {
+        values: Vec<i128>,
+        is_null: Option<Vec<bool>>,
+    },
 }
 
 impl InputColumn {
@@ -176,9 +194,7 @@ impl JavaUdfHandle {
         }
 
         let jvm = get_or_create_jvm()?;
-        let mut env = jvm
-            .attach_current_thread()
-            .context("attach JVM thread")?;
+        let mut env = jvm.attach_current_thread().context("attach JVM thread")?;
         if !self.context_loader_set {
             set_context_class_loader(&mut env, self.class_loader.as_obj())?;
             self.context_loader_set = true;
@@ -219,9 +235,7 @@ impl JavaUdfHandle {
         }
 
         let jvm = get_or_create_jvm()?;
-        let mut env = jvm
-            .attach_current_thread()
-            .context("attach JVM thread")?;
+        let mut env = jvm.attach_current_thread().context("attach JVM thread")?;
         if !self.context_loader_set {
             set_context_class_loader(&mut env, self.class_loader.as_obj())?;
             self.context_loader_set = true;
@@ -229,7 +243,11 @@ impl JavaUdfHandle {
 
         self.prepare_input_arrays(&mut env, columns)?;
         let cache = self.cached_input_arrays.as_ref().unwrap();
-        if self.cached_output_names.as_ref().is_none_or(|(names, _)| names != output_names) {
+        if self
+            .cached_output_names
+            .as_ref()
+            .is_none_or(|(names, _)| names != output_names)
+        {
             let new_obj = new_string_array_from_strings(&mut env, output_names)?;
             let global = env.new_global_ref(&new_obj)?;
             self.cached_output_names = Some((output_names.to_vec(), global));
@@ -254,16 +272,8 @@ impl JavaUdfHandle {
         extract_columnar_result(&mut env, result_obj)
     }
 
-    fn prepare_input_arrays(
-        &mut self,
-        env: &mut JNIEnv<'_>,
-        columns: &[InputColumn],
-    ) -> Result<()> {
-        if self
-            .cached_input_arrays
-            .as_ref()
-            .is_some_and(|c| c.matches(columns))
-        {
+    fn prepare_input_arrays(&mut self, env: &mut JNIEnv<'_>, columns: &[InputColumn]) -> Result<()> {
+        if self.cached_input_arrays.as_ref().is_some_and(|c| c.matches(columns)) {
             let cache = self.cached_input_arrays.as_ref().unwrap();
             fill_cached_columns(env, cache, columns)
         } else {
@@ -287,12 +297,8 @@ impl JavaUdfHandle {
     pub fn reload_with_classpath(&mut self, classpath_jars: &[PathBuf]) -> Result<()> {
         let classpath = normalize_classpath(classpath_jars)?;
         let jar_state = collect_jar_state(&classpath)?;
-        let (udf_obj, class_loader, snapshot_paths) = create_udf_instance_snapshot(
-            &classpath,
-            &self.class_name,
-            &self.ctor_sig,
-            &self.ctor_args,
-        )?;
+        let (udf_obj, class_loader, snapshot_paths) =
+            create_udf_instance_snapshot(&classpath, &self.class_name, &self.ctor_sig, &self.ctor_args)?;
 
         let old_loader = std::mem::replace(&mut self.class_loader, class_loader);
         let old_snapshot = std::mem::replace(&mut self.snapshot_paths, snapshot_paths);
@@ -359,10 +365,7 @@ struct JarState {
 }
 
 fn collect_jar_state(classpath_jars: &[PathBuf]) -> Result<Vec<JarState>> {
-    classpath_jars
-        .iter()
-        .map(|path| jar_state(path))
-        .collect()
+    classpath_jars.iter().map(|path| jar_state(path)).collect()
 }
 
 fn jar_state(path: &Path) -> Result<JarState> {
@@ -407,28 +410,20 @@ fn create_udf_instance_snapshot(
 
 fn snapshot_classpath(classpath_jars: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let base_dir = env::temp_dir().join("flinke2c-runtime-jars");
-    fs::create_dir_all(&base_dir)
-        .with_context(|| format!("create jar snapshot dir {}", base_dir.display()))?;
+    fs::create_dir_all(&base_dir).with_context(|| format!("create jar snapshot dir {}", base_dir.display()))?;
 
     let mut out = Vec::with_capacity(classpath_jars.len());
     for jar in classpath_jars {
         let dest = snapshot_path(&base_dir, jar)?;
-        fs::copy(jar, &dest)
-            .with_context(|| format!("copy {} -> {}", jar.display(), dest.display()))?;
+        fs::copy(jar, &dest).with_context(|| format!("copy {} -> {}", jar.display(), dest.display()))?;
         out.push(dest);
     }
     Ok(out)
 }
 
 fn snapshot_path(base_dir: &Path, jar: &Path) -> Result<PathBuf> {
-    let stem = jar
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("udf");
-    let ext = jar
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("jar");
+    let stem = jar.file_stem().and_then(|s| s.to_str()).unwrap_or("udf");
+    let ext = jar.extension().and_then(|s| s.to_str()).unwrap_or("jar");
     let pid = std::process::id();
     let counter = SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
     let ts = SystemTime::now()
@@ -452,9 +447,7 @@ fn create_udf_instance(
     ctor_args: &[JavaArg],
 ) -> Result<(GlobalRef, GlobalRef)> {
     let jvm = get_or_create_jvm()?;
-    let mut env = jvm
-        .attach_current_thread()
-        .context("attach JVM thread")?;
+    let mut env = jvm.attach_current_thread().context("attach JVM thread")?;
 
     let (udf_obj, class_loader) =
         load_udf_instance_with_args(&mut env, classpath_jars, class_name, ctor_sig, ctor_args)?;
@@ -500,10 +493,7 @@ fn load_udf_class<'local>(
     let class_loader = env.new_object(
         "java/net/URLClassLoader",
         "([Ljava/net/URL;Ljava/lang/ClassLoader;)V",
-        &[
-            JValue::Object(&url_array),
-            JValue::Object(&sys_cl.l()?),
-        ],
+        &[JValue::Object(&url_array), JValue::Object(&sys_cl.l()?)],
     )?;
     check_exception(env, "URLClassLoader.<init>")?;
     set_context_class_loader(env, &class_loader)?;
@@ -520,10 +510,7 @@ fn load_udf_class<'local>(
     Ok((class_obj.l()?, class_loader))
 }
 
-fn build_url_array<'local>(
-    env: &mut JNIEnv<'local>,
-    jar_paths: &[PathBuf],
-) -> Result<JObject<'local>> {
+fn build_url_array<'local>(env: &mut JNIEnv<'local>, jar_paths: &[PathBuf]) -> Result<JObject<'local>> {
     let url_class = env.find_class("java/net/URL")?;
     let url_array = env.new_object_array(jar_paths.len() as i32, url_class, JObject::null())?;
 
@@ -535,10 +522,7 @@ fn build_url_array<'local>(
     Ok(JObject::from(url_array))
 }
 
-fn jar_path_to_url<'local>(
-    env: &mut JNIEnv<'local>,
-    jar_path: &Path,
-) -> Result<JObject<'local>> {
+fn jar_path_to_url<'local>(env: &mut JNIEnv<'local>, jar_path: &Path) -> Result<JObject<'local>> {
     let jar_path = jar_path
         .canonicalize()
         .with_context(|| format!("canonicalize {}", jar_path.display()))?;
@@ -557,10 +541,7 @@ fn jar_path_to_url<'local>(
     Ok(url.l()?)
 }
 
-fn new_big_decimal<'local>(
-    env: &mut JNIEnv<'local>,
-    value: &str,
-) -> Result<JObject<'local>> {
+fn new_big_decimal<'local>(env: &mut JNIEnv<'local>, value: &str) -> Result<JObject<'local>> {
     let jvalue = env.new_string(value)?;
     let obj = env.new_object(
         "java/math/BigDecimal",
@@ -581,12 +562,7 @@ fn check_exception(env: &mut JNIEnv<'_>, context: &str) -> Result<()> {
 }
 
 fn set_context_class_loader(env: &mut JNIEnv<'_>, class_loader: &JObject<'_>) -> Result<()> {
-    let thread = env.call_static_method(
-        "java/lang/Thread",
-        "currentThread",
-        "()Ljava/lang/Thread;",
-        &[],
-    )?;
+    let thread = env.call_static_method("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;", &[])?;
     check_exception(env, "Thread.currentThread")?;
     env.call_method(
         thread.l()?,
@@ -666,13 +642,9 @@ fn build_jargs<'local, 'b>(
     Ok(jargs)
 }
 
-fn new_string_array_from_strings<'local>(
-    env: &mut JNIEnv<'local>,
-    values: &[String],
-) -> Result<JObject<'local>> {
+fn new_string_array_from_strings<'local>(env: &mut JNIEnv<'local>, values: &[String]) -> Result<JObject<'local>> {
     let string_class = env.find_class("java/lang/String")?;
-    let array: JObjectArray =
-        env.new_object_array(values.len() as i32, string_class, JObject::null())?;
+    let array: JObjectArray = env.new_object_array(values.len() as i32, string_class, JObject::null())?;
 
     for (idx, value) in values.iter().enumerate() {
         let jstr = env.new_string(value)?;
@@ -870,10 +842,7 @@ fn string_array_to_vec(env: &mut JNIEnv<'_>, array_obj: JObject<'_>) -> Result<V
     Ok(out)
 }
 
-fn new_string_array<'local>(
-    env: &mut JNIEnv<'local>,
-    values: &[Option<String>],
-) -> Result<JObject<'local>> {
+fn new_string_array<'local>(env: &mut JNIEnv<'local>, values: &[Option<String>]) -> Result<JObject<'local>> {
     let string_class = env.find_class("java/lang/String")?;
     let array: JObjectArray = env.new_object_array(values.len() as i32, string_class, JObject::null())?;
 
@@ -893,10 +862,8 @@ fn new_typed_columns<'local>(
 ) -> Result<(JObjectArray<'local>, JObjectArray<'local>)> {
     let object_class = env.find_class("java/lang/Object")?;
     let boolean_array_class = env.find_class("[Z")?;
-    let col_array =
-        env.new_object_array(columns.len() as i32, object_class, JObject::null())?;
-    let nulls_array =
-        env.new_object_array(columns.len() as i32, boolean_array_class, JObject::null())?;
+    let col_array = env.new_object_array(columns.len() as i32, object_class, JObject::null())?;
+    let nulls_array = env.new_object_array(columns.len() as i32, boolean_array_class, JObject::null())?;
 
     for (idx, column) in columns.iter().enumerate() {
         let (col_obj, nulls_obj) = input_column_to_java(env, column)?;
@@ -909,10 +876,7 @@ fn new_typed_columns<'local>(
     Ok((col_array, nulls_array))
 }
 
-fn allocate_input_cache(
-    env: &mut JNIEnv<'_>,
-    columns: &[InputColumn],
-) -> Result<CachedInputArrays> {
+fn allocate_input_cache(env: &mut JNIEnv<'_>, columns: &[InputColumn]) -> Result<CachedInputArrays> {
     let row_count = columns[0].len();
     let col_types: Vec<ColumnKind> = columns.iter().map(ColumnKind::of).collect();
     let (col_array, nulls_array) = new_typed_columns(env, columns)?;
@@ -952,11 +916,7 @@ fn allocate_input_cache(
     })
 }
 
-fn fill_cached_columns(
-    env: &mut JNIEnv<'_>,
-    cache: &CachedInputArrays,
-    columns: &[InputColumn],
-) -> Result<()> {
+fn fill_cached_columns(env: &mut JNIEnv<'_>, cache: &CachedInputArrays, columns: &[InputColumn]) -> Result<()> {
     for (idx, column) in columns.iter().enumerate() {
         fill_column_data(env, &cache.column_refs[idx], column)?;
         if let Some(null_ref) = &cache.null_refs[idx] {
@@ -966,11 +926,7 @@ fn fill_cached_columns(
     Ok(())
 }
 
-fn fill_column_data(
-    env: &mut JNIEnv<'_>,
-    global: &GlobalRef,
-    column: &InputColumn,
-) -> Result<()> {
+fn fill_column_data(env: &mut JNIEnv<'_>, global: &GlobalRef, column: &InputColumn) -> Result<()> {
     let local = env.new_local_ref(global.as_obj())?;
     match column {
         InputColumn::String(values) => {
@@ -1011,12 +967,7 @@ fn fill_column_data(
     Ok(())
 }
 
-fn fill_null_data(
-    env: &mut JNIEnv<'_>,
-    global: &GlobalRef,
-    column: &InputColumn,
-    row_count: usize,
-) -> Result<()> {
+fn fill_null_data(env: &mut JNIEnv<'_>, global: &GlobalRef, column: &InputColumn, row_count: usize) -> Result<()> {
     let nulls = match column {
         InputColumn::String(_) => return Ok(()),
         InputColumn::I64 { is_null, .. }
@@ -1042,10 +993,7 @@ fn fill_null_data(
     Ok(())
 }
 
-fn extract_columnar_result(
-    env: &mut JNIEnv<'_>,
-    result_obj: JObject<'_>,
-) -> Result<Vec<InputColumn>> {
+fn extract_columnar_result(env: &mut JNIEnv<'_>, result_obj: JObject<'_>) -> Result<Vec<InputColumn>> {
     let columns_val = env.call_method(&result_obj, "columns", "()[Ljava/lang/Object;", &[])?;
     check_exception(env, "ColumnarResult.columns")?;
     let columns_obj = columns_val.l()?;
@@ -1098,10 +1046,7 @@ fn input_column_to_java<'local>(
         }
         InputColumn::Bool { values, is_null } => {
             let array = env.new_boolean_array(values.len() as i32)?;
-            let raw: Vec<jboolean> = values
-                .iter()
-                .map(|v| if *v { 1_u8 } else { 0_u8 })
-                .collect();
+            let raw: Vec<jboolean> = values.iter().map(|v| if *v { 1_u8 } else { 0_u8 }).collect();
             env.set_boolean_array_region(&array, 0, &raw)?;
             let nulls = build_nulls_array(env, is_null.as_deref())?;
             Ok((JObject::from(array), nulls))
@@ -1120,18 +1065,12 @@ fn input_column_to_java<'local>(
     }
 }
 
-fn build_nulls_array<'local>(
-    env: &mut JNIEnv<'local>,
-    nulls: Option<&[bool]>,
-) -> Result<Option<JObject<'local>>> {
+fn build_nulls_array<'local>(env: &mut JNIEnv<'local>, nulls: Option<&[bool]>) -> Result<Option<JObject<'local>>> {
     let Some(nulls) = nulls else {
         return Ok(None);
     };
     let array = env.new_boolean_array(nulls.len() as i32)?;
-    let raw: Vec<jboolean> = nulls
-        .iter()
-        .map(|v| if *v { 1_u8 } else { 0_u8 })
-        .collect();
+    let raw: Vec<jboolean> = nulls.iter().map(|v| if *v { 1_u8 } else { 0_u8 }).collect();
     env.set_boolean_array_region(&array, 0, &raw)?;
     Ok(Some(JObject::from(array)))
 }

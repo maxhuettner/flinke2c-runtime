@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::ValueEnum;
 use std::path::{Path, PathBuf};
 
@@ -73,12 +73,8 @@ impl UdfHandle {
         output_names: &[String],
     ) -> Result<Vec<InputColumn>> {
         match self {
-            UdfHandle::Java(handle) => {
-                handle.call_typed_columns_to_named_results(method, columns, output_names)
-            }
-            UdfHandle::Rust(handle) => {
-                handle.call_typed_columns_to_named_results(method, columns, output_names)
-            }
+            UdfHandle::Java(handle) => handle.call_typed_columns_to_named_results(method, columns, output_names),
+            UdfHandle::Rust(handle) => handle.call_typed_columns_to_named_results(method, columns, output_names),
         }
     }
 }

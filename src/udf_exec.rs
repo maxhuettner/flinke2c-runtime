@@ -1,17 +1,15 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::io::Write;
 
 use crate::codec::{
-    i128_to_twos_complement_be_minimal, set_null_bit,
-    write_i32_be_stream, write_i32_be_vec, write_i64_be_vec,
-    write_u32_be_vec, write_u64_be_vec, ColumnarBatch, OutputBlock,
+    ColumnarBatch, OutputBlock, i128_to_twos_complement_be_minimal, set_null_bit, write_i32_be_stream,
+    write_i32_be_vec, write_i64_be_vec, write_u32_be_vec, write_u64_be_vec,
 };
 use crate::config::{FieldType, FunctionKind, PayloadSource, PostFieldSourceKind, SessionConfig};
 use crate::constants::DEFAULT_MAX_FRAME_SIZE;
 use crate::udf::{InputColumn, UdfHandle};
 use crate::values::{
-    decimal_to_f64, decimal_to_i64, decimal_to_string, parse_bool_string, parse_decimal_to_i128,
-    parse_with, V,
+    V, decimal_to_f64, decimal_to_i64, decimal_to_string, parse_bool_string, parse_decimal_to_i128, parse_with,
 };
 
 pub struct ColumnarUdfConfig<'a, W: Write> {
@@ -31,8 +29,7 @@ pub fn apply_udf_to_batch_stream<W: Write>(config: &mut ColumnarUdfConfig<W>) ->
     }
 
     let input_columns = extract_arg_columns(batch, session);
-    let output_columns =
-        call_udf_to_columns(&mut *config.udf, config.method, &input_columns, &session.output_names)?;
+    let output_columns = call_udf_to_columns(&mut *config.udf, config.method, &input_columns, &session.output_names)?;
 
     if output_columns.len() < session.output_positions.len() {
         bail!(
@@ -43,7 +40,11 @@ pub fn apply_udf_to_batch_stream<W: Write>(config: &mut ColumnarUdfConfig<W>) ->
     }
 
     let pred_col = if session.function_kind == FunctionKind::Filter {
-        Some(output_columns.get(0).with_context(|| "filter UDF returned no columns")?)
+        Some(
+            output_columns
+                .get(0)
+                .with_context(|| "filter UDF returned no columns")?,
+        )
     } else {
         None
     };
@@ -108,7 +109,9 @@ pub fn apply_udf_to_batch_stream<W: Write>(config: &mut ColumnarUdfConfig<W>) ->
 
         // Write entire batched frame: [length][payload]
         write_i32_be_stream(writer, batch_payload.len() as i32)?;
-        writer.write_all(batch_payload.as_slice()).context("write batch payload")?;
+        writer
+            .write_all(batch_payload.as_slice())
+            .context("write batch payload")?;
     }
 
     Ok(())
@@ -136,7 +139,11 @@ pub fn apply_udf_to_batch(
     }
 
     let pred_col = if session.function_kind == FunctionKind::Filter {
-        Some(output_columns.get(0).with_context(|| "filter UDF returned no columns")?)
+        Some(
+            output_columns
+                .get(0)
+                .with_context(|| "filter UDF returned no columns")?,
+        )
     } else {
         None
     };
@@ -172,9 +179,7 @@ pub fn apply_udf_to_batch(
                 }
                 PostFieldSourceKind::InputPos(pre_pos) => {
                     if source.pos < row.len() {
-                        if let Some(slot) =
-                            session.pre_pos_to_payload_slot.get(*pre_pos).and_then(|s| *s)
-                        {
+                        if let Some(slot) = session.pre_pos_to_payload_slot.get(*pre_pos).and_then(|s| *s) {
                             row[source.pos] = column_to_v_at(&batch.columns[slot], row_idx);
                         }
                     }
@@ -195,7 +200,11 @@ pub fn apply_udf_to_batch(
             row[*pos] = v;
         }
 
-        out.push(OutputBlock { op, row_id, row: Some(row) });
+        out.push(OutputBlock {
+            op,
+            row_id,
+            row: Some(row),
+        });
     }
 
     Ok(out)
@@ -317,12 +326,8 @@ fn output_column_to_v(column: &InputColumn, row: usize, output_type: &FieldType)
         return Ok(V::Null);
     }
     match output_type {
-        FieldType::String | FieldType::Unknown(_) => {
-            Ok(V::String(input_column_to_string(column, row, output_type)?))
-        }
-        FieldType::Bytes => Ok(V::Bytes(
-            input_column_to_string(column, row, output_type)?.into_bytes(),
-        )),
+        FieldType::String | FieldType::Unknown(_) => Ok(V::String(input_column_to_string(column, row, output_type)?)),
+        FieldType::Bytes => Ok(V::Bytes(input_column_to_string(column, row, output_type)?.into_bytes())),
         FieldType::Boolean => Ok(V::Bool(input_column_to_bool(column, row, output_type)?)),
         FieldType::Int64 | FieldType::TimestampMillis | FieldType::Date => {
             Ok(V::I64(input_column_to_i64(column, row, output_type)?))
@@ -445,12 +450,7 @@ fn input_column_to_decimal(column: &InputColumn, row: usize, _source_type: &Fiel
     }
 }
 
-fn encode_input_column_at(
-    out: &mut Vec<u8>,
-    col: &InputColumn,
-    row: usize,
-    ftype: &FieldType,
-) -> Result<bool> {
+fn encode_input_column_at(out: &mut Vec<u8>, col: &InputColumn, row: usize, ftype: &FieldType) -> Result<bool> {
     if column_is_null(col, row) {
         return Ok(true);
     }
@@ -496,8 +496,7 @@ fn encode_input_column_at(
             let unscaled = input_column_to_decimal(col, row, ftype)?;
             let prec = precision.unwrap_or(38);
             if prec <= 18 {
-                let as_i64 = i64::try_from(unscaled)
-                    .map_err(|_| anyhow::anyhow!("DECIMAL_UNSCALED_I64 overflow"))?;
+                let as_i64 = i64::try_from(unscaled).map_err(|_| anyhow::anyhow!("DECIMAL_UNSCALED_I64 overflow"))?;
                 write_i64_be_vec(out, as_i64);
             } else {
                 let bytes = i128_to_twos_complement_be_minimal(unscaled);
@@ -507,8 +506,7 @@ fn encode_input_column_at(
         }
         FieldType::DecimalUnscaledI64 => {
             let unscaled = input_column_to_decimal(col, row, ftype)?;
-            let as_i64 =
-                i64::try_from(unscaled).map_err(|_| anyhow::anyhow!("DECIMAL_UNSCALED_I64 overflow"))?;
+            let as_i64 = i64::try_from(unscaled).map_err(|_| anyhow::anyhow!("DECIMAL_UNSCALED_I64 overflow"))?;
             write_i64_be_vec(out, as_i64);
         }
         FieldType::DecimalUnscaledBytes => {
@@ -527,4 +525,3 @@ fn filter_passes(pred_col: Option<&InputColumn>, row_idx: usize) -> Result<bool>
         None => Ok(true),
     }
 }
-

@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -41,7 +41,12 @@ pub struct Args {
     #[arg(long = "udf-batch-size", alias = "batch-size")]
     pub udf_batch_size: Option<usize>,
 
-    #[arg(long, env = "JVM_OPTS", value_delimiter = ' ', default_value = "-Xms256m -Xmx512m -XX:+UseG1GC -XX:+AlwaysPreTouch")]
+    #[arg(
+        long,
+        env = "JVM_OPTS",
+        value_delimiter = ' ',
+        default_value = "-Xms256m -Xmx512m -XX:+UseG1GC -XX:+AlwaysPreTouch"
+    )]
     pub jvm_opts: Vec<String>,
 
     #[arg(long, default_value_t = 0)]
@@ -206,8 +211,7 @@ enum OutputSlotKind {
 }
 
 pub fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
-    let function_kind = FunctionKind::parse(pre_cfg.function_kind.as_deref())
-        .context("parse functionKind")?;
+    let function_kind = FunctionKind::parse(pre_cfg.function_kind.as_deref()).context("parse functionKind")?;
     if function_kind == FunctionKind::Filter && !pre_cfg.function_results.is_empty() {
         bail!("functionKind=filter requires empty functionResults");
     }
@@ -326,12 +330,7 @@ pub fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
             .output_type
             .as_deref()
             .map(parse_field_type)
-            .with_context(|| {
-                format!(
-                    "functionResult outputType/wireType missing for {}",
-                    result.output_name
-                )
-            })?;
+            .with_context(|| format!("functionResult outputType/wireType missing for {}", result.output_name))?;
         output_types.push(output_type);
     }
 
@@ -379,8 +378,7 @@ pub fn build_session_config(pre_cfg: &ConfigMessage) -> Result<SessionConfig> {
             )
         } else if output_name_set.contains(field.name.as_str()) {
             passthrough_identity = false;
-            output_pos_to_idx[pos]
-                .with_context(|| format!("missing output column for postField {}", field.name))?;
+            output_pos_to_idx[pos].with_context(|| format!("missing output column for postField {}", field.name))?;
             (PostFieldSourceKind::Output, OutputSlotKind::Output)
         } else {
             bail!("postField {} not found in preFields", field.name);
@@ -529,10 +527,7 @@ fn parse_decimal_precision_scale(type_str: &str) -> (Option<u8>, i8) {
         let inner = &trimmed[start + 1..end];
         let mut parts = inner.split(',');
         let precision = parts.next().and_then(|p| p.trim().parse::<u8>().ok());
-        let scale = parts
-            .next()
-            .and_then(|s| s.trim().parse::<i8>().ok())
-            .unwrap_or(0);
+        let scale = parts.next().and_then(|s| s.trim().parse::<i8>().ok()).unwrap_or(0);
         (precision, scale)
     } else {
         (None, 0)

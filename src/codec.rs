@@ -1,16 +1,35 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::io::{ErrorKind, Read, Write};
 
 use crate::config::{FieldType, SessionConfig};
 use crate::constants::DEFAULT_MAX_FRAME_SIZE;
 use crate::udf::InputColumn;
-use crate::values::{v_to_bool, v_to_decimal_i128, v_to_f64, v_to_i64, v_to_string, V};
+use crate::values::{V, v_to_bool, v_to_decimal_i128, v_to_f64, v_to_i64, v_to_string};
+
+pub const ACK_CONTROL_OP: i32 = -1;
 
 #[derive(Debug)]
 pub struct OutputBlock {
     pub op: i32,
     pub row_id: i64,
     pub row: Option<Vec<V>>,
+}
+
+pub fn decode_ack_control_frame(payload: &[u8]) -> Result<i64> {
+    if payload.len() != 12 {
+        bail!(
+            "invalid ACK control frame length: expected 12 bytes, got {}",
+            payload.len()
+        );
+    }
+
+    let mut p = 0usize;
+    let op = read_i32_be(payload, &mut p)?;
+    if op != ACK_CONTROL_OP {
+        bail!("invalid ACK control frame op: expected {}, got {}", ACK_CONTROL_OP, op);
+    }
+
+    read_i64_be(payload, &mut p)
 }
 
 pub fn read_framed_payload<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
@@ -154,7 +173,6 @@ pub fn write_output_blocks<W: Write>(
     Ok(())
 }
 
-
 pub fn encode_field(out: &mut Vec<u8>, v: &V, t: &FieldType) -> Result<()> {
     match t {
         FieldType::Boolean => {
@@ -202,8 +220,7 @@ pub fn encode_field(out: &mut Vec<u8>, v: &V, t: &FieldType) -> Result<()> {
             let unscaled = v_to_decimal_i128(v)?;
             let prec = precision.unwrap_or(38);
             if prec <= 18 {
-                let as_i64 =
-                    i64::try_from(unscaled).map_err(|_| anyhow::anyhow!("DECIMAL_UNSCALED_I64 overflow"))?;
+                let as_i64 = i64::try_from(unscaled).map_err(|_| anyhow::anyhow!("DECIMAL_UNSCALED_I64 overflow"))?;
                 write_i64_be_vec(out, as_i64);
             } else {
                 let bytes = i128_to_twos_complement_be_minimal(unscaled);
@@ -213,8 +230,7 @@ pub fn encode_field(out: &mut Vec<u8>, v: &V, t: &FieldType) -> Result<()> {
         }
         FieldType::DecimalUnscaledI64 => {
             let unscaled = v_to_decimal_i128(v)?;
-            let as_i64 =
-                i64::try_from(unscaled).map_err(|_| anyhow::anyhow!("DECIMAL_UNSCALED_I64 overflow"))?;
+            let as_i64 = i64::try_from(unscaled).map_err(|_| anyhow::anyhow!("DECIMAL_UNSCALED_I64 overflow"))?;
             write_i64_be_vec(out, as_i64);
         }
         FieldType::DecimalUnscaledBytes => {
@@ -391,10 +407,7 @@ impl ColumnarBatch {
     }
 }
 
-pub fn read_framed_payload_into<R: Read>(
-    reader: &mut R,
-    scratch: &mut Vec<u8>,
-) -> Result<bool> {
+pub fn read_framed_payload_into<R: Read>(reader: &mut R, scratch: &mut Vec<u8>) -> Result<bool> {
     let len = match read_i32_be_stream_opt(reader)? {
         Some(v) => v,
         None => return Ok(false),
@@ -543,46 +556,51 @@ fn push_null_typed<T>(values: &mut Vec<T>, is_null: &mut Option<Vec<bool>>, defa
     }
 }
 
-fn decode_field_into_column(
-    buf: &[u8],
-    p: &mut usize,
-    t: &FieldType,
-    col: &mut InputColumn,
-) -> Result<()> {
+fn decode_field_into_column(buf: &[u8], p: &mut usize, t: &FieldType, col: &mut InputColumn) -> Result<()> {
     match t {
         FieldType::Boolean => {
             let b = read_u8(buf, p)?;
             if let InputColumn::Bool { values, is_null } = col {
                 values.push(b != 0);
-                if let Some(n) = is_null.as_mut() { n.push(false); }
+                if let Some(n) = is_null.as_mut() {
+                    n.push(false);
+                }
             }
         }
         FieldType::Int64 | FieldType::TimestampMillis => {
             let v = read_i64_be(buf, p)?;
             if let InputColumn::I64 { values, is_null } = col {
                 values.push(v);
-                if let Some(n) = is_null.as_mut() { n.push(false); }
+                if let Some(n) = is_null.as_mut() {
+                    n.push(false);
+                }
             }
         }
         FieldType::Int32 | FieldType::Int16 | FieldType::Int8 => {
             let v = read_i32_be(buf, p)?;
             if let InputColumn::I32 { values, is_null } = col {
                 values.push(v);
-                if let Some(n) = is_null.as_mut() { n.push(false); }
+                if let Some(n) = is_null.as_mut() {
+                    n.push(false);
+                }
             }
         }
         FieldType::Float32 => {
             let bits = read_u32_be(buf, p)?;
             if let InputColumn::F32 { values, is_null } = col {
                 values.push(f32::from_bits(bits));
-                if let Some(n) = is_null.as_mut() { n.push(false); }
+                if let Some(n) = is_null.as_mut() {
+                    n.push(false);
+                }
             }
         }
         FieldType::Float64 => {
             let bits = read_u64_be(buf, p)?;
             if let InputColumn::F64 { values, is_null } = col {
                 values.push(f64::from_bits(bits));
-                if let Some(n) = is_null.as_mut() { n.push(false); }
+                if let Some(n) = is_null.as_mut() {
+                    n.push(false);
+                }
             }
         }
         FieldType::String | FieldType::Unknown(_) => {
@@ -603,7 +621,9 @@ fn decode_field_into_column(
             let millis = days.checked_mul(86_400_000).context("DATE days->millis overflow")?;
             if let InputColumn::I64 { values, is_null } = col {
                 values.push(millis);
-                if let Some(n) = is_null.as_mut() { n.push(false); }
+                if let Some(n) = is_null.as_mut() {
+                    n.push(false);
+                }
             }
         }
         FieldType::Decimal { precision, .. } => {
@@ -616,14 +636,18 @@ fn decode_field_into_column(
             };
             if let InputColumn::Decimal128 { values, is_null } = col {
                 values.push(unscaled);
-                if let Some(n) = is_null.as_mut() { n.push(false); }
+                if let Some(n) = is_null.as_mut() {
+                    n.push(false);
+                }
             }
         }
         FieldType::DecimalUnscaledI64 => {
             let unscaled = read_i64_be(buf, p)? as i128;
             if let InputColumn::Decimal128 { values, is_null } = col {
                 values.push(unscaled);
-                if let Some(n) = is_null.as_mut() { n.push(false); }
+                if let Some(n) = is_null.as_mut() {
+                    n.push(false);
+                }
             }
         }
         FieldType::DecimalUnscaledBytes => {
@@ -631,9 +655,36 @@ fn decode_field_into_column(
             let unscaled = twos_complement_be_to_i128(&bytes)?;
             if let InputColumn::Decimal128 { values, is_null } = col {
                 values.push(unscaled);
-                if let Some(n) = is_null.as_mut() { n.push(false); }
+                if let Some(n) = is_null.as_mut() {
+                    n.push(false);
+                }
             }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ACK_CONTROL_OP, decode_ack_control_frame, write_i32_be_vec, write_i64_be_vec};
+
+    #[test]
+    fn decodes_ack_control_frame() {
+        let mut payload = Vec::new();
+        write_i32_be_vec(&mut payload, ACK_CONTROL_OP);
+        write_i64_be_vec(&mut payload, 42);
+
+        let row_id = decode_ack_control_frame(&payload).expect("valid ACK control frame");
+        assert_eq!(row_id, 42);
+    }
+
+    #[test]
+    fn rejects_non_ack_control_frame() {
+        let mut payload = Vec::new();
+        write_i32_be_vec(&mut payload, 7);
+        write_i64_be_vec(&mut payload, 42);
+
+        let err = decode_ack_control_frame(&payload).expect_err("non-ACK frame must be rejected");
+        assert!(err.to_string().contains("invalid ACK control frame op"));
+    }
 }

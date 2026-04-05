@@ -26,10 +26,7 @@ pub fn ensure_column_lengths(columns: &[UdfInputColumn]) -> Result<usize> {
     Ok(len)
 }
 
-pub fn expect_i128<'a>(
-    column: &'a UdfInputColumn,
-    label: &str,
-) -> Result<(&'a [i128], Option<&'a [u8]>)> {
+pub fn expect_i128<'a>(column: &'a UdfInputColumn, label: &str) -> Result<(&'a [i128], Option<&'a [u8]>)> {
     if column.kind != UdfColumnType::Decimal128 {
         bail!("expected DECIMAL column for {label}");
     }
@@ -45,10 +42,7 @@ pub fn expect_i128<'a>(
     Ok((values, nulls))
 }
 
-pub fn expect_i64<'a>(
-    column: &'a UdfInputColumn,
-    label: &str,
-) -> Result<(&'a [i64], Option<&'a [u8]>)> {
+pub fn expect_i64<'a>(column: &'a UdfInputColumn, label: &str) -> Result<(&'a [i64], Option<&'a [u8]>)> {
     if column.kind != UdfColumnType::I64 {
         bail!("expected BIGINT column for {label}");
     }
@@ -64,10 +58,7 @@ pub fn expect_i64<'a>(
     Ok((values, nulls))
 }
 
-pub fn expect_strings<'a>(
-    column: &'a UdfInputColumn,
-    label: &str,
-) -> Result<(&'a [UdfStrView], Option<&'a [u8]>)> {
+pub fn expect_strings<'a>(column: &'a UdfInputColumn, label: &str) -> Result<(&'a [UdfStrView], Option<&'a [u8]>)> {
     if column.kind != UdfColumnType::String {
         bail!("expected STRING column for {label}");
     }
@@ -93,8 +84,5 @@ pub fn view_to_string(view: UdfStrView) -> Result<String> {
 }
 
 pub fn is_null_at(nulls: Option<&[u8]>, row: usize) -> bool {
-    nulls
-        .and_then(|vals| vals.get(row))
-        .map(|v| *v != 0)
-        .unwrap_or(false)
+    nulls.and_then(|vals| vals.get(row)).map(|v| *v != 0).unwrap_or(false)
 }

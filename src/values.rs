@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 #[derive(Clone, Debug)]
 pub enum V {
@@ -186,11 +186,7 @@ pub fn decimal_to_string(value: i128, scale: i8) -> String {
         let split = digits.len() - scale;
         let (int_part, frac_part) = digits.split_at(split);
         let s = format!("{}.{}", int_part, frac_part);
-        if negative {
-            format!("-{}", s)
-        } else {
-            s
-        }
+        if negative { format!("-{}", s) } else { s }
     } else if negative {
         format!("-{}", digits)
     } else {

@@ -1,24 +1,24 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeMap;
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::codec::{
-    decode_payload_into_batch, read_i32_be_stream, write_output_blocks, ColumnarBatch, OutputBlock,
+    ColumnarBatch, OutputBlock, decode_ack_control_frame, decode_payload_into_batch, read_i32_be_stream,
+    write_i32_be_stream, write_output_blocks,
 };
-use crate::config::{build_session_config, Args, ConfigMessage};
+use crate::config::{Args, ConfigMessage, build_session_config};
 use crate::constants::{
-    DEFAULT_BATCH_IDLE_MS, DEFAULT_BATCH_MAX_LATENCY_MS, DEFAULT_COMM_BATCH_SIZE,
-    DEFAULT_UDF_BATCH_SIZE, DEFAULT_BUF_SIZE, DEFAULT_MAX_FRAME_SIZE,
+    DEFAULT_BATCH_IDLE_MS, DEFAULT_BATCH_MAX_LATENCY_MS, DEFAULT_BUF_SIZE, DEFAULT_COMM_BATCH_SIZE,
+    DEFAULT_MAX_FRAME_SIZE, DEFAULT_UDF_BATCH_SIZE,
 };
-use crate::reload::{
-    maybe_reload_udf, resolve_rust_udf_lib, udf_reload_watch_paths, ReloadSignal, ReloadWatcher,
-};
+use crate::reload::{ReloadSignal, ReloadWatcher, maybe_reload_udf, resolve_rust_udf_lib, udf_reload_watch_paths};
 use crate::udf::UdfHandle;
-use crate::udf_exec::{apply_udf_to_batch, apply_udf_to_batch_stream, ColumnarUdfConfig};
+use crate::udf_exec::{ColumnarUdfConfig, apply_udf_to_batch, apply_udf_to_batch_stream};
 
 #[derive(Debug)]
 pub struct TcpSessionConfig<'a> {
@@ -124,10 +124,7 @@ fn accept_pair(listener: &TcpListener) -> Result<(TcpStream, ConfigMessage, TcpS
     Ok((pre_stream, pre_cfg, post_stream, post_cfg))
 }
 
-fn drop_if_disconnected(
-    conn: &mut Option<(TcpStream, ConfigMessage)>,
-    role: &str,
-) -> Result<bool> {
+fn drop_if_disconnected(conn: &mut Option<(TcpStream, ConfigMessage)>, role: &str) -> Result<bool> {
     let disconnected = match conn.as_ref() {
         Some((stream, _)) => is_stream_disconnected(stream)?,
         None => false,
@@ -173,6 +170,74 @@ enum FrameReadOwned {
     Payload(Vec<u8>),
     Timeout,
     Eof,
+}
+
+struct AckRelay {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<Result<()>>>,
+}
+
+impl AckRelay {
+    fn new(pre: &TcpStream, post: &TcpStream) -> Result<Self> {
+        let pre = pre.try_clone().context("clone PRE stream for ACK relay")?;
+        let post = post.try_clone().context("clone POST stream for ACK relay")?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+
+        let handle = thread::spawn(move || -> Result<()> {
+            let mut reader = BufReader::with_capacity(DEFAULT_BUF_SIZE, post);
+            let mut writer = BufWriter::with_capacity(DEFAULT_BUF_SIZE, pre);
+            let mut current_timeout: Option<Duration> = None;
+
+            loop {
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                set_batch_read_timeout(&mut reader, &mut current_timeout, Some(Duration::from_millis(200)))?;
+
+                match read_framed_payload_timeout(&mut reader)? {
+                    FrameReadOwned::Payload(payload) => {
+                        decode_ack_control_frame(&payload).context("decode ACK control frame received on POST")?;
+                        write_i32_be_stream(&mut writer, payload.len() as i32)?;
+                        writer.write_all(&payload).context("forward ACK control frame to PRE")?;
+                        writer.flush().context("flush ACK control frame to PRE")?;
+                    }
+                    FrameReadOwned::Timeout => continue,
+                    FrameReadOwned::Eof => break,
+                }
+            }
+
+            writer.flush().ok();
+            Ok(())
+        });
+
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle.join().map_err(|_| anyhow!("ACK relay thread panicked"))??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AckRelay {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => eprintln!("ACK relay ended with error: {err:#}"),
+                Err(_) => eprintln!("ACK relay thread panicked"),
+            }
+        }
+    }
 }
 
 fn read_frame_len_or_timeout<R: Read>(reader: &mut R) -> Result<FrameLenRead> {
@@ -242,19 +307,12 @@ fn set_batch_read_timeout(
     if *current == desired {
         return Ok(());
     }
-    reader
-        .get_mut()
-        .set_read_timeout(desired)
-        .context("set read timeout")?;
+    reader.get_mut().set_read_timeout(desired).context("set read timeout")?;
     *current = desired;
     Ok(())
 }
 
-fn next_batch_timeout(
-    now: Instant,
-    batch_start: Option<Instant>,
-    last_recv: Option<Instant>,
-) -> Option<Duration> {
+fn next_batch_timeout(now: Instant, batch_start: Option<Instant>, last_recv: Option<Instant>) -> Option<Duration> {
     let (start, last) = match (batch_start, last_recv) {
         (Some(s), Some(l)) => (s, l),
         _ => return None,
@@ -314,6 +372,7 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
     let post_cfg = &config.post_cfg;
     let pre = config.pre;
     let post = config.post;
+    let ack_relay = AckRelay::new(&pre, &post)?;
     println!(
         "PRE config: functionKind={}, functionClass={}, functionArgs={}, functionResults={}",
         pre_kind,
@@ -428,23 +487,14 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
         let mut current_timeout: Option<Duration> = None;
 
         let mut last_reload_version = reload_signal.as_ref().map(|s| s.current()).unwrap_or(0);
-        let udf_class = config
-            .current_udf_class
-            .as_ref()
-            .context("missing UDF class")?
-            .clone();
+        let udf_class = config.current_udf_class.as_ref().context("missing UDF class")?.clone();
 
         let mut batch_payloads: Vec<Vec<u8>> = Vec::with_capacity(comm_batch_size);
         let mut batch_start: Option<Instant> = None;
         let mut last_recv: Option<Instant> = None;
         let mut udf_batch = ColumnarBatch::new(&session_cfg.pre_payload_types, udf_batch_size);
         let mut flush_batch = |batch: &ColumnarBatch| -> Result<()> {
-            maybe_reload_udf(
-                udf_handle,
-                &udf_class,
-                reload_signal.as_ref(),
-                &mut last_reload_version,
-            )?;
+            maybe_reload_udf(udf_handle, &udf_class, reload_signal.as_ref(), &mut last_reload_version)?;
             apply_udf_to_batch_stream(&mut ColumnarUdfConfig {
                 writer: &mut writer,
                 batch,
@@ -530,6 +580,7 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
         }
 
         writer.flush().ok();
+        ack_relay.finish()?;
         return Ok(());
     }
 
@@ -565,18 +616,14 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
         let udf_batch_size = udf_batch_size;
 
         let handle = thread::spawn(move || {
-            let udf_handle = UdfHandle::new(
-                udf_lang,
-                &udf_jars,
-                &udf_adapter,
-                &udf_class,
-                &udf_types,
-                &rust_udf_lib,
-            );
+            let udf_handle = UdfHandle::new(udf_lang, &udf_jars, &udf_adapter, &udf_class, &udf_types, &rust_udf_lib);
             let mut udf_handle = match udf_handle {
                 Ok(handle) => handle,
                 Err(err) => {
-                    let _ = result_tx.send(WorkResult { seq: 0, result: Err(err) });
+                    let _ = result_tx.send(WorkResult {
+                        seq: 0,
+                        result: Err(err),
+                    });
                     return;
                 }
             };
@@ -590,12 +637,14 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
                     reload_signal.as_ref(),
                     &mut last_reload_version,
                 ) {
-                    let _ = result_tx.send(WorkResult { seq: work.seq, result: Err(err) });
+                    let _ = result_tx.send(WorkResult {
+                        seq: work.seq,
+                        result: Err(err),
+                    });
                     continue;
                 }
                 let result = (|| {
-                    let mut batch =
-                        ColumnarBatch::new(&session_cfg.pre_payload_types, udf_batch_size);
+                    let mut batch = ColumnarBatch::new(&session_cfg.pre_payload_types, udf_batch_size);
                     let mut out = Vec::with_capacity(work.payloads.len());
                     for payload in &work.payloads {
                         decode_payload_into_batch(
@@ -605,15 +654,13 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
                             &session_cfg.pre_payload_needed,
                         )?;
                         if batch.len() >= udf_batch_size {
-                            let rows =
-                                apply_udf_to_batch(&batch, &session_cfg, &mut udf_handle, &udf_method)?;
+                            let rows = apply_udf_to_batch(&batch, &session_cfg, &mut udf_handle, &udf_method)?;
                             out.extend(rows);
                             batch.clear();
                         }
                     }
                     if batch.len() > 0 {
-                        let rows =
-                            apply_udf_to_batch(&batch, &session_cfg, &mut udf_handle, &udf_method)?;
+                        let rows = apply_udf_to_batch(&batch, &session_cfg, &mut udf_handle, &udf_method)?;
                         out.extend(rows);
                     }
                     Ok(out)
@@ -692,7 +739,10 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
 
                     let sender = &senders[send_index % senders.len()];
                     sender
-                        .send(Some(WorkItem { seq: dispatched, payloads }))
+                        .send(Some(WorkItem {
+                            seq: dispatched,
+                            payloads,
+                        }))
                         .context("dispatch batch to worker")?;
                     dispatched += 1;
                     send_index += 1;
@@ -744,7 +794,10 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
 
         let sender = &senders[send_index % senders.len()];
         sender
-            .send(Some(WorkItem { seq: dispatched, payloads }))
+            .send(Some(WorkItem {
+                seq: dispatched,
+                payloads,
+            }))
             .context("dispatch batch to worker")?;
         dispatched += 1;
         send_index += 1;
@@ -760,6 +813,7 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
     }
 
     writer_handle.join().expect("writer thread panicked")?;
+    ack_relay.finish()?;
     Ok(())
 }
 

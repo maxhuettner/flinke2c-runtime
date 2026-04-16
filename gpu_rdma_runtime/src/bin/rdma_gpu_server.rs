@@ -1,16 +1,12 @@
 mod linux_impl {
-    use std::io::{BufRead, BufReader, Write};
-    use std::mem::size_of;
     use std::net::{Ipv6Addr, SocketAddr, TcpListener};
-    use std::thread;
-    use std::time::Duration;
 
     use anyhow::{Context, Result};
     use clap::Parser;
 
     use gpu_rdma_runtime::control_helpers::{recv_json, send_json, CliMtu};
-    use gpu_rdma_runtime::control_protocol::{EndpointBootstrap, RdmaDestination, Slot};
-    use gpu_rdma_runtime::rdma::{self, RdmaEndpoint};
+    use gpu_rdma_runtime::control_protocol::{EndpointBootstrap, RdmaDestination};
+    use gpu_rdma_runtime::rdma::RdmaEndpoint;
     use sideway::ibverbs::device_context::Mtu;
     use sideway::ibverbs::queue_pair::QueuePair;
 
@@ -67,24 +63,22 @@ mod linux_impl {
         println!("server waiting for client RDMA write");
 
         let mut slot = loop {
-            let v = rdma_endpoint.read_slot_local(0);
-            if v.seq == 1 {
-                break v;
+            match rdma_endpoint.read_slot_local() {
+                Some(slot) => break Box::new(slot),
+                None => std::hint::spin_loop(),
             }
-            std::hint::spin_loop();
         };
 
         println!("server received value: {slot}");
 
-        slot.seq += 1;
         let msg = b"Hello from server";
         slot.len = msg.len() as u32;
         slot.value[..msg.len()].copy_from_slice(msg);
-        rdma_endpoint.write_slot_local(0, slot);
+        rdma_endpoint.write_slot_local(*slot)?;
         println!("server posting RDMA write back to client");
-        let write_id = 0;
-        rdma_endpoint.write_slot_remote(&remote.writable, write_id, 0)?;
-        rdma_endpoint.wait_for_completion(write_id)?;
+        let wr_id = rdma_endpoint.write_slot_remote(&remote.writable)?;
+        rdma_endpoint.wait_for_completion(wr_id)?;
+        rdma_endpoint.complete_sent_slot_local();
         println!("server RDMA write completion received");
 
         Ok(())

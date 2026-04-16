@@ -1,15 +1,15 @@
 mod linux_impl {
-    use std::io::{BufRead, BufReader, Write};
-    use std::mem::size_of;
-    use std::net::TcpStream;
-    use std::thread;
-    use std::time::{Duration, Instant};
 
-    use anyhow::{bail, Context, Result};
+    use std::net::TcpStream;
+
+    use std::time::Instant;
+
+    use anyhow::{Context, Result};
     use clap::Parser;
     use gpu_rdma_runtime::control_helpers::{recv_json, send_json, CliMtu};
-    use gpu_rdma_runtime::control_protocol::{EndpointBootstrap, RdmaDestination, Slot, MAX_ITEM_SIZE};
-    use gpu_rdma_runtime::rdma::{self, RdmaEndpoint};
+    use gpu_rdma_runtime::control_protocol::{EndpointBootstrap, RdmaDestination, MAX_ITEM_SIZE};
+    use gpu_rdma_runtime::rdma::RdmaEndpoint;
+    use gpu_rdma_runtime::ring_buffer::slot::Slot;
     use sideway::ibverbs::device_context::Mtu;
     use sideway::ibverbs::queue_pair::QueuePair;
 
@@ -66,25 +66,23 @@ mod linux_impl {
         value[..msg.len()].copy_from_slice(msg);
 
         let slot = Slot {
-            seq: 1,
             len: msg.len() as u32,
             value,
         };
 
         let start_time = Instant::now();
-        rdma_endpoint.write_slot_local(0, slot);
+        rdma_endpoint.write_slot_local(slot)?;
         println!("client posting RDMA write");
-        let write_id = 1;
-        rdma_endpoint.write_slot_remote(&server.writable, write_id, 0)?;
-        rdma_endpoint.wait_for_completion(write_id)?;
+        let wr_id = rdma_endpoint.write_slot_remote(&server.writable)?;
+        rdma_endpoint.wait_for_completion(wr_id)?;
+        rdma_endpoint.complete_sent_slot_local();
         println!("client RDMA write completed");
 
         let result = loop {
-            let v = rdma_endpoint.read_slot_local(0);
-            if v.seq == 2 {
-                break v;
+            match rdma_endpoint.read_slot_local() {
+                Some(slot) => break slot,
+                None => std::hint::spin_loop(),
             }
-            std::hint::spin_loop();
         };
 
         let elapsed = start_time.elapsed();

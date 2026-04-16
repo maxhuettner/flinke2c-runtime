@@ -1,37 +1,35 @@
-use std::{sync::Arc, thread, time::Duration};
+use std::sync::Arc;
 
-use crate::control_protocol::{MemoryRegionInfo, RdmaDestination, Slot};
+use crate::constants::RING_BUFFER_ELEMENTS;
+use crate::{
+    control_protocol::{MemoryRegionInfo, RdmaDestination},
+    ring_buffer::{slot::Slot, RingBuffer},
+};
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
 use sideway::ibverbs::{
-    address::{AddressHandleAttribute, Gid},
-    completion::{
-        ExtendedCompletionQueue, ExtendedWorkCompletion, GenericCompletionQueue, PollCompletionQueueError,
-        WorkCompletionStatus,
-    },
+    address::AddressHandleAttribute,
+    completion::{ExtendedCompletionQueue, GenericCompletionQueue, PollCompletionQueueError, WorkCompletionStatus},
     device::{DeviceInfo, DeviceList},
     device_context::{DeviceContext, Mtu},
     memory_region::MemoryRegion,
     protection_domain::ProtectionDomain,
     queue_pair::{
-        ExtendedQueuePair, PostSendError, PostSendGuard, QueuePair, QueuePairAttribute, QueuePairState,
-        SetScatterGatherEntry, WorkRequestFlags,
+        ExtendedQueuePair, PostSendGuard, QueuePair, QueuePairAttribute, QueuePairState, SetScatterGatherEntry,
+        WorkRequestFlags,
     },
     AccessFlags,
 };
 
-const RING_BUFFER_ELEMENTS: usize = 16;
-const MEM_REGION_SIZE: usize = size_of::<Slot>() * RING_BUFFER_ELEMENTS;
-
 pub struct RdmaEndpoint {
     pub ctx: Arc<DeviceContext>,
     _pd: Arc<ProtectionDomain>,
-    _send_buf: Arc<Vec<u8>>,
+    send_rb: Box<RingBuffer<RING_BUFFER_ELEMENTS>>,
     send_mr: Arc<MemoryRegion>,
-    _recv_buf: Arc<Vec<u8>>,
+    recv_rb: Box<RingBuffer<RING_BUFFER_ELEMENTS>>,
     recv_mr: Arc<MemoryRegion>,
     cq: Arc<ExtendedCompletionQueue>,
     pub qp: ExtendedQueuePair,
+    current_write_id: u64,
 }
 
 impl RdmaEndpoint {
@@ -53,12 +51,12 @@ impl RdmaEndpoint {
 
         let mr_access = AccessFlags::LocalWrite | AccessFlags::RemoteWrite | AccessFlags::RemoteRead;
 
-        let send_buf = Arc::new(vec![0; MEM_REGION_SIZE]);
-        let send_mr = unsafe { pd.reg_mr(send_buf.as_ptr() as usize, send_buf.len(), mr_access) }
+        let send_rb = RingBuffer::new_boxed();
+        let send_mr = unsafe { pd.reg_mr(send_rb.as_ptr() as usize, send_rb.len(), mr_access) }
             .context("Failed to register send memory region")?;
 
-        let recv_buf = Arc::new(vec![0; MEM_REGION_SIZE]);
-        let recv_mr = unsafe { pd.reg_mr(recv_buf.as_ptr() as usize, recv_buf.len(), mr_access) }
+        let recv_rb = RingBuffer::new_boxed();
+        let recv_mr = unsafe { pd.reg_mr(recv_rb.as_ptr() as usize, recv_rb.len(), mr_access) }
             .context("Failed to register receive memory region")?;
 
         let cq_builder = context.create_cq_builder();
@@ -83,12 +81,13 @@ impl RdmaEndpoint {
         Ok(RdmaEndpoint {
             ctx: context,
             _pd: pd,
-            _send_buf: send_buf,
+            send_rb,
             send_mr,
-            _recv_buf: recv_buf,
+            recv_rb,
             recv_mr,
             cq,
             qp,
+            current_write_id: 0,
         })
     }
 
@@ -138,82 +137,74 @@ impl RdmaEndpoint {
         Ok(())
     }
 
-    pub fn write_slot_remote(&mut self, remote: &MemoryRegionInfo, write_id: u64, slot_id: u32) -> Result<()> {
-        let mut guard = self.qp.start_post_send();
+    pub fn write_slot_remote(&mut self, remote: &MemoryRegionInfo) -> Result<u64> {
+        // let lkey = self.send_mr.lkey();
+
+        // debug_assert!(local_offset + len <= self.send_rb.len());
+        // debug_assert!(remote_offset + len <= remote.size as usize);
+
+        //
+
+        // let mut guard = self.qp.start_post_send();
+
+        // let wr = guard
+        //     .construct_wr(wr_id, WorkRequestFlags::Signaled)
+        //     .setup_write(remote.rkey, remote.addr + remote_offset as u64);
+
+        // unsafe { wr.setup_sge(lkey, base_ptr + local_offset as u64, len as u32) };
+
+        // guard.post().context("failed to post RDMA write")?;
+
+        // Ok(wr_id)
         let lkey = self.send_mr.lkey();
-        let base_ptr = self.send_mr.get_ptr() as u64;
+        let wr_id = self.create_write_id();
+        let head_wr_id = self.create_write_id();
 
-        let len = size_of::<Slot>();
-        let local_offset = (slot_id as usize % RING_BUFFER_ELEMENTS) * len;
-        let remote_offset = (slot_id as usize % RING_BUFFER_ELEMENTS) * len;
+        let segments = self.send_rb.wrapping_read_slot_base_ptrs(1)?;
+        let base_ptr = segments.first_part.ptr as u64;
+        let offset = segments.first_part.offset as u64;
 
-        debug_assert!(local_offset + len <= MEM_REGION_SIZE);
-        debug_assert!(remote_offset + len <= remote.size as usize);
+        let mut guard = self.qp.start_post_send();
 
         let wr = guard
-            .construct_wr(write_id, WorkRequestFlags::Signaled)
-            .setup_write(remote.rkey, remote.addr + remote_offset as u64);
+            .construct_wr(wr_id, WorkRequestFlags::none())
+            .setup_write(remote.rkey, remote.addr + offset);
+        unsafe { wr.setup_sge(lkey, base_ptr, std::mem::size_of::<Slot>() as u32 * 1) };
 
-        unsafe { wr.setup_sge(lkey, base_ptr + local_offset as u64, len as u32) };
+        let head_update_wr = guard
+            .construct_wr(head_wr_id, WorkRequestFlags::Signaled)
+            .setup_write(remote.rkey, remote.addr + self.send_rb.abs_head_offset() as u64);
+        unsafe { head_update_wr.setup_sge(lkey, self.send_rb.abs_head_ptr() as u64, 8) };
 
-        guard.post().context("failed to post RDMA write")
+        guard.post().context("failed to post RDMA write")?;
+
+        Ok(head_wr_id)
     }
 
-    // pub fn write(&mut self, remote: &MemoryRegionInfo, write_id: u64) -> Result<()> {
-    //     let mut guard = self.qp.start_post_send();
-    //     let lkey = self.send_mr.lkey();
-    //     let ptr = self.send_mr.get_ptr() as u64;
-    //     let len = remote.size;
+    pub fn complete_sent_slot_local(&mut self) {
+        self.send_rb.advance_tail();
+    }
 
-    //     let wr = guard
-    //         .construct_wr(write_id, WorkRequestFlags::Signaled)
-    //         .setup_write(remote.rkey, remote.addr);
-
-    //     unsafe { wr.setup_sge(lkey, ptr, len) };
-
-    //     guard.post().context("failed to post RDMA write")
-    // }
-
-    // pub fn read(&mut self, remote: &MemoryRegionInfo, read_id: u64) -> Result<()> {
-    //     let mut guard = self.qp.start_post_send();
-    //     let lkey = self.recv_mr.lkey();
-    //     let ptr = self.recv_mr.get_ptr() as u64;
-    //     let len = self.size;
-
-    //     let wr = guard
-    //         .construct_wr(read_id, WorkRequestFlags::Signaled)
-    //         .setup_read(remote.rkey, remote.addr);
-
-    //     unsafe { wr.setup_sge(lkey, ptr, len) };
-
-    //     guard.post().context("failed to post RDMA read")
-    // }
+    fn create_write_id(&mut self) -> u64 {
+        let id = self.current_write_id;
+        self.current_write_id = self.current_write_id.wrapping_add(1);
+        id
+    }
 
     pub fn memory_region_info(&self) -> MemoryRegionInfo {
         MemoryRegionInfo {
             addr: self.recv_mr.get_ptr() as u64,
             rkey: self.recv_mr.rkey(),
-            size: MEM_REGION_SIZE as u32,
+            size: self.recv_mr.region_len() as u32,
         }
     }
 
-    pub fn write_slot_local(&mut self, slot_id: u32, value: Slot) {
-        let slot_index = slot_id as usize % RING_BUFFER_ELEMENTS;
-        unsafe {
-            (self.send_mr.get_ptr() as *mut Slot)
-                .add(slot_index)
-                .write_volatile(value);
-        }
+    pub fn write_slot_local(&mut self, value: Slot) -> Result<()> {
+        self.send_rb.write_slot(value)
     }
 
-    pub fn local_send_slot_mut(&mut self, slot_id: u32) -> &mut Slot {
-        let slot_index = slot_id as usize % RING_BUFFER_ELEMENTS;
-        unsafe { &mut *((self.send_mr.get_ptr() as *mut Slot).add(slot_index)) }
-    }
-
-    pub fn read_slot_local(&self, slot_id: u32) -> Slot {
-        let slot_index = slot_id as usize % RING_BUFFER_ELEMENTS;
-        unsafe { (self.recv_mr.get_ptr() as *const Slot).add(slot_index).read_volatile() }
+    pub fn read_slot_local(&mut self) -> Option<Slot> {
+        self.recv_rb.read_slot()
     }
 
     pub fn wait_for_completion(&self, expected_wr_id: u64) -> Result<()> {

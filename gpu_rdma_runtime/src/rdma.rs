@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::constants::RING_BUFFER_ELEMENTS;
@@ -5,7 +6,7 @@ use crate::{
     control_protocol::{MemoryRegionInfo, RdmaDestination},
     ring_buffer::{slot::Slot, RingBuffer},
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use sideway::ibverbs::{
     address::AddressHandleAttribute,
     completion::{ExtendedCompletionQueue, GenericCompletionQueue, PollCompletionQueueError, WorkCompletionStatus},
@@ -14,8 +15,8 @@ use sideway::ibverbs::{
     memory_region::MemoryRegion,
     protection_domain::ProtectionDomain,
     queue_pair::{
-        ExtendedQueuePair, PostSendGuard, QueuePair, QueuePairAttribute, QueuePairState, SetScatterGatherEntry,
-        WorkRequestFlags,
+        ExtendedQueuePair, PostSendGuard, QueuePair, QueuePairAttribute, QueuePairState, SetInlineData,
+        SetScatterGatherEntry, WorkRequestFlags,
     },
     AccessFlags,
 };
@@ -30,6 +31,8 @@ pub struct RdmaEndpoint {
     cq: Arc<ExtendedCompletionQueue>,
     pub qp: ExtendedQueuePair,
     current_write_id: u64,
+    completed_write_ids: HashSet<u64>,
+    posted_slots: u64,
 }
 
 impl RdmaEndpoint {
@@ -67,6 +70,8 @@ impl RdmaEndpoint {
 
         let mut qp = builder
             .setup_max_inline_data(128)
+            .setup_max_recv_wr(1024)
+            .setup_max_send_wr(1024)
             .setup_send_cq(cq_for_qp.clone())
             .setup_recv_cq(cq_for_qp)
             .build_ex()?;
@@ -88,6 +93,8 @@ impl RdmaEndpoint {
             cq,
             qp,
             current_write_id: 0,
+            completed_write_ids: HashSet::new(),
+            posted_slots: 0,
         })
     }
 
@@ -114,7 +121,7 @@ impl RdmaEndpoint {
             .setup_path_mtu(mtu)
             .setup_dest_qp_num(remote_context.qp_number)
             .setup_rq_psn(remote_context.packet_seq_num)
-            .setup_max_dest_read_atomic(0)
+            .setup_max_dest_read_atomic(1)
             .setup_min_rnr_timer(0)
             .setup_address_vector(&ah_attr);
 
@@ -128,7 +135,7 @@ impl RdmaEndpoint {
             .setup_timeout(12)
             .setup_retry_cnt(7)
             .setup_rnr_retry(7)
-            .setup_max_read_atomic(0);
+            .setup_max_read_atomic(1);
 
         self.qp
             .modify(&attr)
@@ -138,50 +145,55 @@ impl RdmaEndpoint {
     }
 
     pub fn write_slot_remote(&mut self, remote: &MemoryRegionInfo) -> Result<u64> {
-        // let lkey = self.send_mr.lkey();
+        self.write_slots_remote(remote, 1)
+    }
 
-        // debug_assert!(local_offset + len <= self.send_rb.len());
-        // debug_assert!(remote_offset + len <= remote.size as usize);
+    pub fn write_slots_remote(&mut self, remote: &MemoryRegionInfo, count: usize) -> Result<u64> {
+        ensure!(count > 0, "RDMA batch must not be empty");
+        ensure!(count < RING_BUFFER_ELEMENTS, "RDMA batch exceeds ring capacity");
+        ensure!(
+            self.posted_slots + count as u64 <= self.send_rb.available_read_slots(),
+            "not enough unposted slots for RDMA batch"
+        );
+        ensure!(
+            remote.size as usize >= self.send_rb.len(),
+            "remote input region is smaller than the ring buffer"
+        );
 
-        //
-
-        // let mut guard = self.qp.start_post_send();
-
-        // let wr = guard
-        //     .construct_wr(wr_id, WorkRequestFlags::Signaled)
-        //     .setup_write(remote.rkey, remote.addr + remote_offset as u64);
-
-        // unsafe { wr.setup_sge(lkey, base_ptr + local_offset as u64, len as u32) };
-
-        // guard.post().context("failed to post RDMA write")?;
-
-        // Ok(wr_id)
         let lkey = self.send_mr.lkey();
-        let wr_id = self.create_write_id();
         let head_wr_id = self.create_write_id();
-
-        let segments = self.send_rb.wrapping_read_slot_base_ptrs(1)?;
-        let base_ptr = segments.first_part.ptr as u64;
-        let offset = segments.first_part.offset as u64;
-
+        let slot_index = ((self.send_rb.tail_idx() + self.posted_slots) & (RING_BUFFER_ELEMENTS as u64 - 1)) as usize;
+        let first_count = count.min(RING_BUFFER_ELEMENTS - slot_index);
+        let second_count = count - first_count;
+        let head = self.send_rb.head_idx().to_ne_bytes();
         let mut guard = self.qp.start_post_send();
 
-        let wr = guard
-            .construct_wr(wr_id, WorkRequestFlags::none())
-            .setup_write(remote.rkey, remote.addr + offset);
-        unsafe { wr.setup_sge(lkey, base_ptr, std::mem::size_of::<Slot>() as u32 * 1) };
+        post_slot_segment(
+            &mut guard,
+            lkey,
+            self.send_rb.slots_ptr(),
+            remote,
+            slot_index,
+            first_count,
+        );
+        if second_count > 0 {
+            post_slot_segment(&mut guard, lkey, self.send_rb.slots_ptr(), remote, 0, second_count);
+        }
 
         let head_update_wr = guard
             .construct_wr(head_wr_id, WorkRequestFlags::Signaled)
             .setup_write(remote.rkey, remote.addr + self.send_rb.abs_head_offset() as u64);
-        unsafe { head_update_wr.setup_sge(lkey, self.send_rb.abs_head_ptr() as u64, 8) };
+        head_update_wr.setup_inline_data(&head);
 
         guard.post().context("failed to post RDMA write")?;
+        self.posted_slots += count as u64;
 
         Ok(head_wr_id)
     }
 
-    pub fn complete_sent_slot_local(&mut self) {
+    pub fn complete_round_trip_local(&mut self) {
+        assert!(self.posted_slots > 0, "no outstanding slot to complete");
+        self.posted_slots -= 1;
         self.send_rb.advance_tail();
     }
 
@@ -207,15 +219,15 @@ impl RdmaEndpoint {
         self.recv_rb.read_slot()
     }
 
-    pub fn wait_for_completion(&self, expected_wr_id: u64) -> Result<()> {
+    pub fn wait_for_completion(&mut self, expected_wr_id: u64) -> Result<()> {
         loop {
+            if self.completed_write_ids.remove(&expected_wr_id) {
+                return Ok(());
+            }
+
             match self.cq.start_poll() {
                 Ok(mut poller) => {
                     for wc in &mut poller {
-                        if wc.wr_id() != expected_wr_id {
-                            continue;
-                        }
-
                         if wc.status() != WorkCompletionStatus::Success as u32 {
                             bail!(
                                 "send completion failed: status={}, vendor_err={}",
@@ -223,8 +235,7 @@ impl RdmaEndpoint {
                                 wc.vendor_err()
                             );
                         }
-
-                        return Ok(());
+                        self.completed_write_ids.insert(wc.wr_id());
                     }
                 }
                 Err(PollCompletionQueueError::CompletionQueueEmpty) => {
@@ -235,5 +246,23 @@ impl RdmaEndpoint {
                 }
             }
         }
+    }
+}
+
+fn post_slot_segment<G: PostSendGuard>(
+    guard: &mut G,
+    lkey: u32,
+    slots: *const Slot,
+    remote: &MemoryRegionInfo,
+    index: usize,
+    count: usize,
+) {
+    let byte_count = count * std::mem::size_of::<Slot>();
+    let offset = RingBuffer::<RING_BUFFER_ELEMENTS>::slot_offset(index) as u64;
+    let write = guard
+        .construct_wr(0, WorkRequestFlags::none())
+        .setup_write(remote.rkey, remote.addr + offset);
+    unsafe {
+        write.setup_sge(lkey, slots.add(index) as u64, byte_count as u32);
     }
 }

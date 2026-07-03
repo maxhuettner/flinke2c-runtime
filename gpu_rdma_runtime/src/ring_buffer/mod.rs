@@ -1,5 +1,4 @@
 use anyhow::Result;
-use core::str;
 use std::{mem::offset_of, ptr::read_volatile};
 
 use crate::ring_buffer::slot::Slot;
@@ -27,6 +26,22 @@ pub struct RingBuffer<const N: usize> {
 }
 
 impl<const N: usize> RingBuffer<N> {
+    pub const fn producer_head_offset() -> usize {
+        offset_of!(RingBuffer<N>, producer_head)
+    }
+
+    pub const fn consumer_tail_offset() -> usize {
+        offset_of!(RingBuffer<N>, consumer_tail)
+    }
+
+    pub const fn slots_offset() -> usize {
+        offset_of!(RingBuffer<N>, slots)
+    }
+
+    pub const fn slot_offset(index: usize) -> usize {
+        Self::slots_offset() + index * size_of::<Slot>()
+    }
+
     /// SAFETY: If the RingBuffer only has zero-valid fields, this is safe to call and the resulting RingBuffer can be used as normal.
     /// When the RingBuffer implementation changes and non-zero-valid fields are added, this function must be updated to properly initialize those fields before returning the RingBuffer.
     pub fn new_boxed() -> Box<Self> {
@@ -110,15 +125,15 @@ impl<const N: usize> RingBuffer<N> {
     }
 
     pub fn abs_slot_offset(&self) -> usize {
-        offset_of!(RingBuffer<N>, slots)
+        Self::slots_offset()
     }
 
     pub fn abs_head_offset(&self) -> usize {
-        offset_of!(RingBuffer<N>, producer_head)
+        Self::producer_head_offset()
     }
 
     pub fn abs_tail_offset(&self) -> usize {
-        offset_of!(RingBuffer<N>, consumer_tail)
+        Self::consumer_tail_offset()
     }
 
     pub fn rel_slot_head_offset(&self) -> usize {
@@ -224,7 +239,7 @@ impl<const N: usize> RingBuffer<N> {
 
 #[cfg(test)]
 mod tests {
-    use crate::constants::RING_BUFFER_ELEMENTS;
+    use crate::{constants::RING_BUFFER_ELEMENTS, control_protocol::MAX_ITEM_SIZE};
 
     use super::*;
 
@@ -237,7 +252,7 @@ mod tests {
         assert!(!rb.is_full());
         let value = "test".as_bytes();
 
-        let mut payload = [0u8; 1024];
+        let mut payload = [0u8; MAX_ITEM_SIZE];
         payload[..value.len()].copy_from_slice(value);
 
         for _ in 0..N_ELEMENTS as u64 - 1 {
@@ -269,7 +284,7 @@ mod tests {
         let mut rb = RingBuffer::<N_ELEMENTS>::new_boxed();
         let value = "test".as_bytes();
 
-        let mut payload = [0u8; 1024];
+        let mut payload = [0u8; MAX_ITEM_SIZE];
         payload[..value.len()].copy_from_slice(value);
 
         for _ in 0..N_ELEMENTS as u64 - 1 {
@@ -296,7 +311,7 @@ mod tests {
         let wrap_value = "test4".as_bytes();
 
         for value in test_values {
-            let mut payload = [0u8; 1024];
+            let mut payload = [0u8; MAX_ITEM_SIZE];
             payload[..value.len()].copy_from_slice(value);
             rb.write_slot(Slot {
                 len: value.len() as u32,
@@ -315,7 +330,7 @@ mod tests {
         assert_eq!(rb.head_idx(), 3);
         assert_eq!(rb.tail_idx(), 1);
 
-        let mut payload = [0u8; 1024];
+        let mut payload = [0u8; MAX_ITEM_SIZE];
         payload[..wrap_value.len()].copy_from_slice(wrap_value);
         rb.write_slot(Slot {
             len: wrap_value.len() as u32,

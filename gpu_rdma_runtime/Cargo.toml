@@ -11,13 +11,11 @@ default = []
 anyhow = "1.0"
 clap = { version = "4.5.4", features = ["derive", "env"] }
 libloading = "0.8"
+rdma-mummy-sys = "0.2.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sideway = "0.4.1"
 rand = "0.8"
-
-[build-dependencies]
-cc = "1.1"
 
 [[bin]]
 name = "rdma_test_client"

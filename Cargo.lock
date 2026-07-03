@@ -337,10 +337,10 @@ name = "gpu-rdma-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cc",
  "clap",
  "libloading 0.8.9",
  "rand",
+ "rdma-mummy-sys",
  "serde",
  "serde_json",
  "sideway",

@@ -3,6 +3,7 @@ use anyhow::Result;
 pub mod constants;
 pub mod control_helpers;
 pub mod control_protocol;
+pub mod gpu_runtime;
 pub mod rdma;
 pub mod ring_buffer;
 pub mod wire_codec;

@@ -9,6 +9,8 @@ pub struct Slot {
     pub value: [u8; MAX_ITEM_SIZE],
 }
 
+const _: [(); size_of::<u32>() + MAX_ITEM_SIZE] = [(); size_of::<Slot>()];
+
 impl Default for Slot {
     fn default() -> Self {
         Slot {

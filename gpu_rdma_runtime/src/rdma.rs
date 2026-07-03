@@ -182,7 +182,11 @@ impl RdmaEndpoint {
 
         let head_update_wr = guard
             .construct_wr(head_wr_id, WorkRequestFlags::Signaled)
-            .setup_write(remote.rkey, remote.addr + self.send_rb.abs_head_offset() as u64);
+            .setup_write_imm(
+                remote.rkey,
+                remote.addr + self.send_rb.abs_head_offset() as u64,
+                (count as u32).to_be(),
+            );
         head_update_wr.setup_inline_data(&head);
 
         guard.post().context("failed to post RDMA write")?;

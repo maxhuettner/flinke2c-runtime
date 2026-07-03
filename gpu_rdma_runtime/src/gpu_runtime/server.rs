@@ -99,14 +99,16 @@ fn process_slots(
     let mut processed = 0u64;
 
     while processed < iterations {
-        let input_head = endpoint.read_input_head()?;
-        let available = input_head.wrapping_sub(state.input_tail) & mask;
-        if available == 0 {
-            std::hint::spin_loop();
-            continue;
-        }
-
-        let count = available.min(batch_size as u64).min(iterations - processed) as u32;
+        let count = endpoint.wait_for_input_batch()?;
+        ensure!(
+            count as usize <= batch_size,
+            "peer sent batch of {count} slots, exceeding configured batch size {batch_size}"
+        );
+        ensure!(
+            count as u64 <= iterations - processed,
+            "peer batch crosses benchmark phase boundary"
+        );
+        endpoint.flush_input_writes()?;
         endpoint.process(state.input_tail, state.output_head, count)?;
         endpoint.write_output_batch(&remote.writable, state.output_head, count)?;
 

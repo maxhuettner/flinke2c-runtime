@@ -7,13 +7,16 @@ only to exchange QP, memory-region, GID, and path-MTU metadata.
 
 1. Rust allocates two GPU-resident ring buffers through the CUDA Driver API.
 2. Rust exports and registers them with `ibv_reg_dmabuf_mr`.
-3. The client writes input slots and then their producer head directly to GPU memory.
-4. The server launches `process_slots`; one CUDA thread maps one slot.
+3. The client writes a contiguous input batch and publishes it with an RDMA
+   Write-with-Immediate producer-head update.
+4. The server receives one CQ notification per batch, establishes GPUDirect
+   memory ordering, and launches `process_slots`; one CUDA thread maps one slot.
 5. The server posts ordered one-sided RDMA writes directly from the GPU output ring.
 6. The client consumes the returned slots in their original order.
 
-The CPU posts verbs work requests. Standard `libibverbs` does not let the CUDA
-kernel itself initiate these network operations.
+The GPU-node CPU only orchestrates complete batches; tuple data never stages in
+host memory. Standard `libibverbs` still requires the CPU to launch CUDA work
+and post output work requests.
 
 ## Structure
 

@@ -32,7 +32,6 @@ type CuCtxSetCurrent = unsafe extern "C" fn(CuContext) -> CuResult;
 type CuMemAlloc = unsafe extern "C" fn(*mut CuDevicePtr, usize) -> CuResult;
 type CuMemFree = unsafe extern "C" fn(CuDevicePtr) -> CuResult;
 type CuMemsetD8 = unsafe extern "C" fn(CuDevicePtr, u8, usize) -> CuResult;
-type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, CuDevicePtr, usize) -> CuResult;
 type CuMemGetHandleForAddressRange = unsafe extern "C" fn(*mut c_void, CuDevicePtr, usize, u32, u64) -> CuResult;
 type CuModuleLoadData = unsafe extern "C" fn(*mut CuModule, *const c_void) -> CuResult;
 type CuModuleUnload = unsafe extern "C" fn(CuModule) -> CuResult;
@@ -51,6 +50,7 @@ type CuLaunchKernel = unsafe extern "C" fn(
     *mut *mut c_void,
 ) -> CuResult;
 type CuCtxSynchronize = unsafe extern "C" fn() -> CuResult;
+type CuFlushGpudirectRdmaWrites = unsafe extern "C" fn(u32, u32) -> CuResult;
 type CuGetErrorString = unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResult;
 
 struct CudaApi {
@@ -63,13 +63,13 @@ struct CudaApi {
     memory_allocate: CuMemAlloc,
     memory_free: CuMemFree,
     memory_set: CuMemsetD8,
-    copy_device_to_host: CuMemcpyDtoH,
     memory_get_range_handle: CuMemGetHandleForAddressRange,
     module_load_data: CuModuleLoadData,
     module_unload: CuModuleUnload,
     module_get_function: CuModuleGetFunction,
     launch_kernel: CuLaunchKernel,
     context_synchronize: CuCtxSynchronize,
+    flush_gpudirect_writes: Option<CuFlushGpudirectRdmaWrites>,
     error_string: CuGetErrorString,
 }
 
@@ -86,13 +86,13 @@ impl CudaApi {
                 memory_allocate: load_symbol(&library, b"cuMemAlloc_v2\0")?,
                 memory_free: load_symbol(&library, b"cuMemFree_v2\0")?,
                 memory_set: load_symbol(&library, b"cuMemsetD8_v2\0")?,
-                copy_device_to_host: load_symbol(&library, b"cuMemcpyDtoH_v2\0")?,
                 memory_get_range_handle: load_symbol(&library, b"cuMemGetHandleForAddressRange\0")?,
                 module_load_data: load_symbol(&library, b"cuModuleLoadData\0")?,
                 module_unload: load_symbol(&library, b"cuModuleUnload\0")?,
                 module_get_function: load_symbol(&library, b"cuModuleGetFunction\0")?,
                 launch_kernel: load_symbol(&library, b"cuLaunchKernel\0")?,
                 context_synchronize: load_symbol(&library, b"cuCtxSynchronize\0")?,
+                flush_gpudirect_writes: load_optional_symbol(&library, b"cuFlushGPUDirectRDMAWrites\0"),
                 error_string: load_symbol(&library, b"cuGetErrorString\0")?,
                 _library: library,
             }))
@@ -117,6 +117,10 @@ impl CudaApi {
 
 unsafe fn load_symbol<T: Copy>(library: &Library, name: &[u8]) -> Result<T> {
     Ok(*unsafe { library.get::<T>(name) }?)
+}
+
+unsafe fn load_optional_symbol<T: Copy>(library: &Library, name: &[u8]) -> Option<T> {
+    unsafe { library.get::<T>(name) }.ok().map(|symbol| *symbol)
 }
 
 struct CudaContext {
@@ -325,20 +329,21 @@ impl CudaRuntime {
         &self.output
     }
 
-    pub fn read_input_head(&self) -> Result<u64> {
+    pub fn flush_gpudirect_writes(&self) -> Result<()> {
+        const TARGET_CURRENT_CONTEXT: u32 = 0;
+        const SCOPE_TO_OWNER: u32 = 100;
+        const CUDA_ERROR_NOT_SUPPORTED: CuResult = 801;
+
         self.context.make_current()?;
-        let mut head = 0u64;
-        self.context.api.check(
-            unsafe {
-                (self.context.api.copy_device_to_host)(
-                    (&mut head as *mut u64).cast(),
-                    self.input.pointer,
-                    std::mem::size_of::<u64>(),
-                )
-            },
-            "read GPU input head",
-        )?;
-        Ok(head)
+        let Some(flush) = self.context.api.flush_gpudirect_writes else {
+            return Ok(());
+        };
+        let status = unsafe { flush(TARGET_CURRENT_CONTEXT, SCOPE_TO_OWNER) };
+        if status == CUDA_ERROR_NOT_SUPPORTED {
+            // The following CPU-submitted kernel launch still establishes ordering.
+            return Ok(());
+        }
+        self.context.api.check(status, "flush GPUDirect RDMA writes")
     }
 
     pub fn process(&self, input_tail: u64, output_head: u64, count: u32) -> Result<()> {

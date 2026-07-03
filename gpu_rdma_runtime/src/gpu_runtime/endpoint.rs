@@ -28,7 +28,8 @@ type RuntimeRing = RingBuffer<RING_BUFFER_ELEMENTS>;
 pub struct GpuRdmaEndpoint {
     pub ctx: Arc<DeviceContext>,
     pub qp: ExtendedQueuePair,
-    cq: Arc<ExtendedCompletionQueue>,
+    send_cq: Arc<ExtendedCompletionQueue>,
+    receive_cq: Arc<ExtendedCompletionQueue>,
     input_mr: DmaBufMemoryRegion,
     output_mr: DmaBufMemoryRegion,
     _pd: Arc<ProtectionDomain>,
@@ -67,15 +68,21 @@ impl GpuRdmaEndpoint {
         let output_mr = unsafe { DmaBufMemoryRegion::register(Arc::clone(&pd), cuda.output(), local_access) }
             .context("register GPUDirect output ring")?;
 
-        let cq = ctx.create_cq_builder().build_ex().context("create completion queue")?;
-        let generic_cq = GenericCompletionQueue::from(Arc::clone(&cq));
+        let send_cq = ctx
+            .create_cq_builder()
+            .build_ex()
+            .context("create send completion queue")?;
+        let receive_cq = ctx
+            .create_cq_builder()
+            .build_ex()
+            .context("create receive completion queue")?;
         let mut qp = pd
             .create_qp_builder()
             .setup_max_inline_data(128)
-            .setup_max_recv_wr(1)
+            .setup_max_recv_wr(RING_BUFFER_ELEMENTS as u32)
             .setup_max_send_wr(1024)
-            .setup_send_cq(generic_cq.clone())
-            .setup_recv_cq(generic_cq)
+            .setup_send_cq(GenericCompletionQueue::from(Arc::clone(&send_cq)))
+            .setup_recv_cq(GenericCompletionQueue::from(Arc::clone(&receive_cq)))
             .build_ex()
             .context("create RDMA queue pair")?;
 
@@ -85,11 +92,13 @@ impl GpuRdmaEndpoint {
             .setup_port(ib_port)
             .setup_access_flags(AccessFlags::RemoteWrite | AccessFlags::RemoteRead);
         qp.modify(&attr).context("move QP to INIT")?;
+        post_receive_notifications(&mut qp, RING_BUFFER_ELEMENTS)?;
 
         Ok(Self {
             ctx,
             qp,
-            cq,
+            send_cq,
+            receive_cq,
             input_mr,
             output_mr,
             _pd: pd,
@@ -143,12 +152,36 @@ impl GpuRdmaEndpoint {
         }
     }
 
-    pub fn read_input_head(&self) -> Result<u64> {
-        self.cuda.read_input_head()
-    }
-
     pub fn process(&self, input_tail: u64, output_head: u64, count: u32) -> Result<()> {
         self.cuda.process(input_tail, output_head, count)
+    }
+
+    pub fn flush_input_writes(&self) -> Result<()> {
+        self.cuda.flush_gpudirect_writes()
+    }
+
+    pub fn wait_for_input_batch(&mut self) -> Result<u32> {
+        loop {
+            match self.receive_cq.start_poll() {
+                Ok(mut poller) => {
+                    if let Some(completion) = poller.next() {
+                        if completion.status() != WorkCompletionStatus::Success as u32 {
+                            bail!(
+                                "RDMA input notification failed: status={}, vendor_err={}",
+                                completion.status(),
+                                completion.vendor_err()
+                            );
+                        }
+                        let count = u32::from_be(completion.imm_data());
+                        ensure!(count > 0, "RDMA input notification contains an empty batch");
+                        post_receive_notifications(&mut self.qp, 1)?;
+                        return Ok(count);
+                    }
+                }
+                Err(PollCompletionQueueError::CompletionQueueEmpty) => std::hint::spin_loop(),
+                Err(error) => return Err(error).context("poll RDMA input notifications"),
+            }
+        }
     }
 
     pub fn write_output_batch(&mut self, remote: &MemoryRegionInfo, output_head: u64, count: u32) -> Result<()> {
@@ -190,7 +223,7 @@ impl GpuRdmaEndpoint {
 
     fn wait_for_completion(&self, expected_wr_id: u64) -> Result<()> {
         loop {
-            match self.cq.start_poll() {
+            match self.send_cq.start_poll() {
                 Ok(mut poller) => {
                     if let Some(completion) = poller.next() {
                         if completion.status() != WorkCompletionStatus::Success as u32 {
@@ -213,6 +246,14 @@ impl GpuRdmaEndpoint {
             }
         }
     }
+}
+
+fn post_receive_notifications(qp: &mut ExtendedQueuePair, count: usize) -> Result<()> {
+    let mut guard = qp.start_post_recv();
+    for _ in 0..count {
+        guard.construct_wr(0);
+    }
+    guard.post().context("post RDMA input notification receives")
 }
 
 fn post_output_segment<G: PostSendGuard>(

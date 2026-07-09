@@ -73,9 +73,31 @@ impl<const N: usize> RingBuffer<N> {
         self.producer_head = (head + 1) & (N as u64 - 1)
     }
 
+    pub fn advance_head_by(&mut self, count: u64) -> Result<()> {
+        if count > self.available_write_slots() {
+            return Err(anyhow::anyhow!(
+                "cannot publish {count} elements into a ring with {} writable slots",
+                self.available_write_slots()
+            ));
+        }
+        self.producer_head = (self.head_idx() + count) & (N as u64 - 1);
+        Ok(())
+    }
+
     pub fn advance_tail(&mut self) {
         let tail = self.tail_idx();
         self.consumer_tail = (tail + 1) & (N as u64 - 1)
+    }
+
+    pub fn advance_tail_by(&mut self, count: u64) -> Result<()> {
+        if count > self.available_read_slots() {
+            return Err(anyhow::anyhow!(
+                "cannot consume {count} elements from a ring with {} readable slots",
+                self.available_read_slots()
+            ));
+        }
+        self.consumer_tail = (self.tail_idx() + count) & (N as u64 - 1);
+        Ok(())
     }
 
     pub fn write_slot(&mut self, value: Slot) -> Result<()> {
@@ -86,6 +108,10 @@ impl<const N: usize> RingBuffer<N> {
         self.slots[slot_index] = value;
         self.advance_head();
         Ok(())
+    }
+
+    pub fn fill_slots(&mut self, value: Slot) {
+        self.slots.fill(value);
     }
 
     pub fn read_slot(&mut self) -> Option<Slot> {
@@ -352,6 +378,28 @@ mod tests {
         assert_eq!(rb.head_idx(), 0);
         assert_eq!(rb.tail_idx(), 0);
         assert!(rb.read_slot().is_none());
+    }
+
+    #[test]
+    fn publishes_completed_batches() {
+        let mut rb = RingBuffer::<8>::new_boxed();
+
+        rb.advance_head_by(6).unwrap();
+        assert_eq!(rb.head_idx(), 6);
+        assert_eq!(rb.available_read_slots(), 6);
+        assert!(rb.advance_head_by(2).is_err());
+
+        for _ in 0..4 {
+            rb.advance_tail();
+        }
+        rb.advance_head_by(4).unwrap();
+        assert_eq!(rb.head_idx(), 2);
+        assert_eq!(rb.available_read_slots(), 6);
+
+        rb.advance_tail_by(5).unwrap();
+        assert_eq!(rb.tail_idx(), 1);
+        assert_eq!(rb.available_read_slots(), 1);
+        assert!(rb.advance_tail_by(2).is_err());
     }
 
     #[test]

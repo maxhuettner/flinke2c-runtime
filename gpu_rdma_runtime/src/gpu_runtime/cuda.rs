@@ -19,8 +19,11 @@ type CuContext = *mut c_void;
 type CuDevicePtr = u64;
 type CuModule = *mut c_void;
 type CuFunction = *mut c_void;
+type CuStream = *mut c_void;
+type CuEvent = *mut c_void;
 
 const CUDA_SUCCESS: CuResult = 0;
+const CUDA_ERROR_NOT_READY: CuResult = 600;
 const DMA_BUF_HANDLE_TYPE: u32 = 1;
 const GPU_DMA_PAGE_SIZE: usize = 2 * 1024 * 1024;
 
@@ -36,6 +39,13 @@ type CuMemGetHandleForAddressRange = unsafe extern "C" fn(*mut c_void, CuDeviceP
 type CuModuleLoadData = unsafe extern "C" fn(*mut CuModule, *const c_void) -> CuResult;
 type CuModuleUnload = unsafe extern "C" fn(CuModule) -> CuResult;
 type CuModuleGetFunction = unsafe extern "C" fn(*mut CuFunction, CuModule, *const c_char) -> CuResult;
+type CuStreamCreate = unsafe extern "C" fn(*mut CuStream, u32) -> CuResult;
+type CuStreamDestroy = unsafe extern "C" fn(CuStream) -> CuResult;
+type CuEventCreate = unsafe extern "C" fn(*mut CuEvent, u32) -> CuResult;
+type CuEventDestroy = unsafe extern "C" fn(CuEvent) -> CuResult;
+type CuEventRecord = unsafe extern "C" fn(CuEvent, CuStream) -> CuResult;
+type CuEventQuery = unsafe extern "C" fn(CuEvent) -> CuResult;
+type CuEventSynchronize = unsafe extern "C" fn(CuEvent) -> CuResult;
 type CuLaunchKernel = unsafe extern "C" fn(
     CuFunction,
     u32,
@@ -49,7 +59,6 @@ type CuLaunchKernel = unsafe extern "C" fn(
     *mut *mut c_void,
     *mut *mut c_void,
 ) -> CuResult;
-type CuCtxSynchronize = unsafe extern "C" fn() -> CuResult;
 type CuFlushGpudirectRdmaWrites = unsafe extern "C" fn(u32, u32) -> CuResult;
 type CuGetErrorString = unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResult;
 
@@ -67,8 +76,14 @@ struct CudaApi {
     module_load_data: CuModuleLoadData,
     module_unload: CuModuleUnload,
     module_get_function: CuModuleGetFunction,
+    stream_create: CuStreamCreate,
+    stream_destroy: CuStreamDestroy,
+    event_create: CuEventCreate,
+    event_destroy: CuEventDestroy,
+    event_record: CuEventRecord,
+    event_query: CuEventQuery,
+    event_synchronize: CuEventSynchronize,
     launch_kernel: CuLaunchKernel,
-    context_synchronize: CuCtxSynchronize,
     flush_gpudirect_writes: Option<CuFlushGpudirectRdmaWrites>,
     error_string: CuGetErrorString,
 }
@@ -90,8 +105,14 @@ impl CudaApi {
                 module_load_data: load_symbol(&library, b"cuModuleLoadData\0")?,
                 module_unload: load_symbol(&library, b"cuModuleUnload\0")?,
                 module_get_function: load_symbol(&library, b"cuModuleGetFunction\0")?,
+                stream_create: load_symbol(&library, b"cuStreamCreate\0")?,
+                stream_destroy: load_symbol(&library, b"cuStreamDestroy_v2\0")?,
+                event_create: load_symbol(&library, b"cuEventCreate\0")?,
+                event_destroy: load_symbol(&library, b"cuEventDestroy_v2\0")?,
+                event_record: load_symbol(&library, b"cuEventRecord\0")?,
+                event_query: load_symbol(&library, b"cuEventQuery\0")?,
+                event_synchronize: load_symbol(&library, b"cuEventSynchronize\0")?,
                 launch_kernel: load_symbol(&library, b"cuLaunchKernel\0")?,
-                context_synchronize: load_symbol(&library, b"cuCtxSynchronize\0")?,
                 flush_gpudirect_writes: load_optional_symbol(&library, b"cuFlushGPUDirectRDMAWrites\0"),
                 error_string: load_symbol(&library, b"cuGetErrorString\0")?,
                 _library: library,
@@ -249,7 +270,6 @@ struct CudaKernel {
     api: Arc<CudaApi>,
     module: CuModule,
     process_slots: CuFunction,
-    commit_positions: CuFunction,
 }
 
 impl CudaKernel {
@@ -269,22 +289,14 @@ impl CudaKernel {
                 unsafe { (context.api.module_get_function)(&mut process_slots, module, c"process_slots".as_ptr()) },
                 "resolve process_slots kernel",
             )?;
-            let mut commit_positions = ptr::null_mut();
-            context.api.check(
-                unsafe {
-                    (context.api.module_get_function)(&mut commit_positions, module, c"commit_ring_positions".as_ptr())
-                },
-                "resolve commit_ring_positions kernel",
-            )?;
-            Ok((process_slots, commit_positions))
+            Ok(process_slots)
         })();
 
         match result {
-            Ok((process_slots, commit_positions)) => Ok(Self {
+            Ok(process_slots) => Ok(Self {
                 api: Arc::clone(&context.api),
                 module,
                 process_slots,
-                commit_positions,
             }),
             Err(error) => {
                 unsafe { (context.api.module_unload)(module) };
@@ -294,6 +306,52 @@ impl CudaKernel {
     }
 }
 
+struct CudaLane {
+    api: Arc<CudaApi>,
+    stream: CuStream,
+    event: CuEvent,
+}
+
+impl CudaLane {
+    fn create(context: &CudaContext) -> Result<Self> {
+        const STREAM_NON_BLOCKING: u32 = 1;
+        const EVENT_DISABLE_TIMING: u32 = 2;
+
+        let mut stream = ptr::null_mut();
+        context.api.check(
+            unsafe { (context.api.stream_create)(&mut stream, STREAM_NON_BLOCKING) },
+            "create CUDA stream",
+        )?;
+        let mut event = ptr::null_mut();
+        if let Err(error) = context.api.check(
+            unsafe { (context.api.event_create)(&mut event, EVENT_DISABLE_TIMING) },
+            "create CUDA event",
+        ) {
+            unsafe { (context.api.stream_destroy)(stream) };
+            return Err(error);
+        }
+        Ok(Self {
+            api: Arc::clone(&context.api),
+            stream,
+            event,
+        })
+    }
+}
+
+impl Drop for CudaLane {
+    fn drop(&mut self) {
+        unsafe {
+            (self.api.event_destroy)(self.event);
+            (self.api.stream_destroy)(self.stream);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CudaBatch {
+    lane: usize,
+}
+
 impl Drop for CudaKernel {
     fn drop(&mut self) {
         unsafe { (self.api.module_unload)(self.module) };
@@ -301,22 +359,30 @@ impl Drop for CudaKernel {
 }
 
 pub struct CudaRuntime {
+    lanes: Vec<CudaLane>,
     kernel: CudaKernel,
     input: CudaBuffer,
     output: CudaBuffer,
+    next_lane: usize,
     context: CudaContext,
 }
 
 impl CudaRuntime {
-    pub fn create(device: u32, kernel_path: &Path) -> Result<Self> {
+    pub fn create(device: u32, kernel_path: &Path, pipeline_depth: usize) -> Result<Self> {
+        ensure!(pipeline_depth > 0, "CUDA pipeline depth must be greater than zero");
         let context = CudaContext::create(device)?;
         let input = CudaBuffer::allocate(&context)?;
         let output = CudaBuffer::allocate(&context)?;
         let kernel = CudaKernel::load(&context, kernel_path)?;
+        let lanes = (0..pipeline_depth)
+            .map(|_| CudaLane::create(&context))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
+            lanes,
             kernel,
             input,
             output,
+            next_lane: 0,
             context,
         })
     }
@@ -346,9 +412,17 @@ impl CudaRuntime {
         self.context.api.check(status, "flush GPUDirect RDMA writes")
     }
 
-    pub fn process(&self, input_tail: u64, output_head: u64, count: u32) -> Result<()> {
+    pub fn pipeline_depth(&self) -> usize {
+        self.lanes.len()
+    }
+
+    pub fn submit(&mut self, input_tail: u64, output_head: u64, count: u32) -> Result<CudaBatch> {
         ensure!(count > 0, "CUDA batch must not be empty");
         self.context.make_current()?;
+
+        let lane_index = self.next_lane;
+        self.next_lane = (self.next_lane + 1) % self.lanes.len();
+        let lane = &self.lanes[lane_index];
 
         let mut input = self.input.pointer;
         let mut output = self.output.pointer;
@@ -362,55 +436,46 @@ impl CudaRuntime {
             (&mut output_head_arg as *mut u64).cast(),
             (&mut count_arg as *mut u32).cast(),
         ];
-        let blocks = count.div_ceil(THREADS_PER_BLOCK);
         self.context.api.check(
             unsafe {
                 (self.context.api.launch_kernel)(
                     self.kernel.process_slots,
-                    blocks,
+                    count,
                     1,
                     1,
                     THREADS_PER_BLOCK,
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    lane.stream,
                     arguments.as_mut_ptr(),
                     ptr::null_mut(),
                 )
             },
             "launch process_slots",
         )?;
-
-        input_tail_arg = (input_tail + count as u64) & (RING_BUFFER_ELEMENTS as u64 - 1);
-        output_head_arg = (output_head + count as u64) & (RING_BUFFER_ELEMENTS as u64 - 1);
-        let mut commit_arguments = [
-            (&mut input as *mut u64).cast(),
-            (&mut output as *mut u64).cast(),
-            (&mut input_tail_arg as *mut u64).cast(),
-            (&mut output_head_arg as *mut u64).cast(),
-        ];
         self.context.api.check(
-            unsafe {
-                (self.context.api.launch_kernel)(
-                    self.kernel.commit_positions,
-                    1,
-                    1,
-                    1,
-                    1,
-                    1,
-                    1,
-                    0,
-                    ptr::null_mut(),
-                    commit_arguments.as_mut_ptr(),
-                    ptr::null_mut(),
-                )
-            },
-            "launch commit_ring_positions",
+            unsafe { (self.context.api.event_record)(lane.event, lane.stream) },
+            "record CUDA batch completion",
         )?;
+        Ok(CudaBatch { lane: lane_index })
+    }
+
+    pub fn is_complete(&self, batch: CudaBatch) -> Result<bool> {
+        self.context.make_current()?;
+        let status = unsafe { (self.context.api.event_query)(self.lanes[batch.lane].event) };
+        if status == CUDA_ERROR_NOT_READY {
+            return Ok(false);
+        }
+        self.context.api.check(status, "query CUDA batch completion")?;
+        Ok(true)
+    }
+
+    pub fn wait(&self, batch: CudaBatch) -> Result<()> {
+        self.context.make_current()?;
         self.context.api.check(
-            unsafe { (self.context.api.context_synchronize)() },
-            "synchronize CUDA processing",
+            unsafe { (self.context.api.event_synchronize)(self.lanes[batch.lane].event) },
+            "wait for CUDA batch completion",
         )
     }
 }

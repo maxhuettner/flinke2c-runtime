@@ -1,19 +1,22 @@
 mod linux_impl {
     use std::collections::VecDeque;
     use std::net::TcpStream;
+    use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
+    use std::thread;
     use std::time::{Duration, Instant};
 
-    use anyhow::{ensure, Context, Result};
+    use anyhow::{anyhow, ensure, Context, Result};
     use clap::Parser;
     use gpu_rdma_runtime::constants::RING_BUFFER_ELEMENTS;
     use gpu_rdma_runtime::control_helpers::{recv_json, send_json, CliMtu};
     use gpu_rdma_runtime::control_protocol::{EndpointBootstrap, RdmaDestination, MAX_ITEM_SIZE};
-    use gpu_rdma_runtime::rdma::RdmaEndpoint;
+    use gpu_rdma_runtime::rdma::{RdmaEndpoint, RdmaReceiver, RdmaSender};
     use gpu_rdma_runtime::ring_buffer::slot::Slot;
     use sideway::ibverbs::device_context::Mtu;
     use sideway::ibverbs::queue_pair::QueuePair;
 
     const MAX_IN_FLIGHT_SENDS: usize = 256;
+    const INPUT_PATTERN_PERIOD: usize = 251;
 
     #[derive(Parser, Debug)]
     #[command(name = "rdma-test-client")]
@@ -41,6 +44,12 @@ mod linux_impl {
         batch_size: usize,
         #[arg(long)]
         skip_validation: bool,
+        #[arg(long)]
+        pre_generate_inputs: bool,
+        #[arg(long)]
+        throughput_only: bool,
+        #[arg(long)]
+        profile_stages: bool,
     }
 
     struct PendingRequest {
@@ -51,6 +60,45 @@ mod linux_impl {
     struct PhaseResult {
         elapsed: Duration,
         latencies_ns: Vec<u64>,
+        producer_timings: WorkerTimings,
+        consumer_timings: WorkerTimings,
+    }
+
+    #[derive(Default)]
+    struct WorkerTimings {
+        enabled: bool,
+        batches: u64,
+        prepare: Duration,
+        post: Duration,
+        wait: Duration,
+        auxiliary: Duration,
+    }
+
+    struct ProducedBatch {
+        count: usize,
+        requests: Vec<PendingRequest>,
+    }
+
+    struct ConsumerFeedback {
+        completed_slots: usize,
+        receive_wrs: usize,
+    }
+
+    struct PreparedInputs {
+        slots: Vec<Slot>,
+    }
+
+    impl PreparedInputs {
+        fn new(payload_len: usize) -> Self {
+            let slots = (0..INPUT_PATTERN_PERIOD)
+                .map(|sequence| input_slot(sequence as u64, payload_len))
+                .collect();
+            Self { slots }
+        }
+
+        fn get(&self, sequence: u64) -> Slot {
+            self.slots[sequence as usize % INPUT_PATTERN_PERIOD]
+        }
     }
 
     pub fn run() -> Result<()> {
@@ -72,6 +120,15 @@ mod linux_impl {
             args.iterations <= usize::MAX as u64,
             "--iterations is too large for latency collection"
         );
+        ensure!(
+            !args.throughput_only || args.skip_validation,
+            "--throughput-only requires --skip-validation"
+        );
+
+        let prepared_inputs = args.pre_generate_inputs.then(|| {
+            println!("pre-generating the {INPUT_PATTERN_PERIOD} distinct input payloads");
+            PreparedInputs::new(args.size as usize)
+        });
 
         let mut stream = TcpStream::connect(&args.server).with_context(|| format!("connect {}", args.server))?;
         let mut endpoint = RdmaEndpoint::build(args.ib_device.as_deref(), args.ib_port)?;
@@ -99,36 +156,53 @@ mod linux_impl {
         println!("client QP connected with {path_mtu:?}");
 
         let payload_len = args.size as usize;
-        let mut next_sequence = 0u64;
-        if args.warmup_iterations > 0 {
+        let (mut sender, receiver) = endpoint.split();
+        if args.throughput_only {
+            let slot = prepared_inputs
+                .as_ref()
+                .map(|inputs| inputs.get(0))
+                .unwrap_or_else(|| input_slot(0, payload_len));
+            sender.preload_send_ring(slot);
+            println!("preloaded registered send ring for throughput-only mode");
+        }
+        let (sender, receiver, next_sequence) = if args.warmup_iterations > 0 {
             println!("warming up with {} round trips", args.warmup_iterations);
-            run_phase(
-                &mut endpoint,
+            let (sender, receiver, _) = run_phase(
+                sender,
+                receiver,
                 &server,
-                &mut next_sequence,
+                0,
                 args.warmup_iterations,
                 payload_len,
                 args.in_flight,
                 args.batch_size,
                 !args.skip_validation,
                 false,
+                false,
+                prepared_inputs.as_ref(),
             )?;
-        }
+            (sender, receiver, args.warmup_iterations)
+        } else {
+            (sender, receiver, 0)
+        };
 
         println!(
             "measuring {} round trips with at most {} in flight",
             args.iterations, args.in_flight
         );
-        let result = run_phase(
-            &mut endpoint,
+        let (_, _, result) = run_phase(
+            sender,
+            receiver,
             &server,
-            &mut next_sequence,
+            next_sequence,
             args.iterations,
             payload_len,
             args.in_flight,
             args.batch_size,
             !args.skip_validation,
-            true,
+            !args.throughput_only,
+            args.profile_stages,
+            prepared_inputs.as_ref(),
         )?;
         print_result(&args, result);
         Ok(())
@@ -136,119 +210,294 @@ mod linux_impl {
 
     #[allow(clippy::too_many_arguments)]
     fn run_phase(
-        endpoint: &mut RdmaEndpoint,
+        sender: RdmaSender,
+        receiver: RdmaReceiver,
         server: &EndpointBootstrap,
-        next_sequence: &mut u64,
+        first_sequence: u64,
         iterations: u64,
         payload_len: usize,
         request_window: usize,
         batch_size: usize,
         validate: bool,
         measure: bool,
-    ) -> Result<PhaseResult> {
-        let first_sequence = *next_sequence;
+        profile_stages: bool,
+        prepared_inputs: Option<&PreparedInputs>,
+    ) -> Result<(RdmaSender, RdmaReceiver, PhaseResult)> {
         let last_sequence = first_sequence
             .checked_add(iterations)
             .context("sequence number overflow")?;
-        let mut next_to_send = first_sequence;
-        let mut pending = VecDeque::with_capacity(request_window);
-        let mut send_completions = VecDeque::with_capacity(MAX_IN_FLIGHT_SENDS);
-        let mut latencies_ns = Vec::with_capacity(if measure { iterations as usize } else { 0 });
+        let channel_capacity = request_window.div_ceil(batch_size) + 1;
+        let (produced_tx, produced_rx) = sync_channel(channel_capacity);
+        let (feedback_tx, feedback_rx) = sync_channel(channel_capacity);
         let started = Instant::now();
+        let (sender, receiver, latencies_ns, producer_timings, consumer_timings) =
+            thread::scope(|scope| -> Result<_> {
+                let producer = scope.spawn(|| {
+                    run_producer(
+                        sender,
+                        &server.writable,
+                        first_sequence,
+                        last_sequence,
+                        payload_len,
+                        request_window,
+                        batch_size,
+                        measure,
+                        validate || measure,
+                        !measure && !validate,
+                        profile_stages,
+                        prepared_inputs,
+                        produced_tx,
+                        feedback_rx,
+                    )
+                });
+                let consumer = scope.spawn(|| {
+                    run_consumer(
+                        receiver,
+                        first_sequence,
+                        last_sequence,
+                        payload_len,
+                        validate,
+                        measure,
+                        profile_stages,
+                        produced_rx,
+                        feedback_tx,
+                    )
+                });
+                let (sender, producer_timings) = producer.join().map_err(|_| anyhow!("producer thread panicked"))??;
+                let (receiver, latencies, consumer_timings) =
+                    consumer.join().map_err(|_| anyhow!("consumer thread panicked"))??;
+                Ok((sender, receiver, latencies, producer_timings, consumer_timings))
+            })?;
+        Ok((
+            sender,
+            receiver,
+            PhaseResult {
+                elapsed: started.elapsed(),
+                latencies_ns,
+                producer_timings,
+                consumer_timings,
+            },
+        ))
+    }
 
-        while *next_sequence < last_sequence {
-            while next_to_send < last_sequence && pending.len() < request_window {
-                if send_completions.len() >= MAX_IN_FLIGHT_SENDS {
-                    wait_oldest_send(endpoint, &mut send_completions)?;
-                }
+    #[allow(clippy::too_many_arguments)]
+    fn run_producer(
+        mut sender: RdmaSender,
+        remote: &gpu_rdma_runtime::control_protocol::MemoryRegionInfo,
+        first_sequence: u64,
+        last_sequence: u64,
+        payload_len: usize,
+        request_window: usize,
+        batch_size: usize,
+        measure: bool,
+        track_requests: bool,
+        use_preloaded_ring: bool,
+        profile_stages: bool,
+        prepared_inputs: Option<&PreparedInputs>,
+        produced: SyncSender<ProducedBatch>,
+        feedback: Receiver<ConsumerFeedback>,
+    ) -> Result<(RdmaSender, WorkerTimings)> {
+        let mut next_to_send = first_sequence;
+        let mut outstanding = 0usize;
+        let mut send_completions = VecDeque::with_capacity(MAX_IN_FLIGHT_SENDS);
+        let mut timings = WorkerTimings {
+            enabled: profile_stages,
+            ..WorkerTimings::default()
+        };
 
-                let capacity = batch_size
-                    .min(request_window - pending.len())
-                    .min((last_sequence - next_to_send) as usize);
-                let mut batch = Vec::with_capacity(capacity);
-                for _ in 0..capacity {
+        while next_to_send < last_sequence {
+            let reclaiming = profile_stages.then(Instant::now);
+            drain_feedback(&mut sender, &feedback, &mut outstanding)?;
+            add_elapsed(&mut timings.auxiliary, reclaiming);
+            while outstanding >= request_window {
+                let waiting = profile_stages.then(Instant::now);
+                apply_feedback(
+                    &mut sender,
+                    feedback.recv().context("consumer stopped before producer completed")?,
+                    &mut outstanding,
+                )?;
+                add_elapsed(&mut timings.wait, waiting);
+            }
+            if send_completions.len() >= MAX_IN_FLIGHT_SENDS {
+                let waiting = profile_stages.then(Instant::now);
+                wait_oldest_send(&mut sender, &mut send_completions)?;
+                add_elapsed(&mut timings.auxiliary, waiting);
+            }
+
+            let preparing = profile_stages.then(Instant::now);
+            let count = batch_size
+                .min(request_window - outstanding)
+                .min((last_sequence - next_to_send) as usize);
+            let mut requests = Vec::with_capacity(if track_requests { count } else { 0 });
+            if use_preloaded_ring {
+                sender.publish_preloaded_slots(count)?;
+                next_to_send += count as u64;
+            } else {
+                for _ in 0..count {
                     let request_started = measure.then(Instant::now);
-                    let slot = input_slot(next_to_send, payload_len);
-                    if endpoint.write_slot_local(slot).is_err() {
-                        break;
+                    let slot = prepared_inputs
+                        .map(|inputs| inputs.get(next_to_send))
+                        .unwrap_or_else(|| input_slot(next_to_send, payload_len));
+                    sender.write_slot_local(slot)?;
+                    if track_requests {
+                        requests.push(PendingRequest {
+                            sequence: next_to_send,
+                            started: request_started,
+                        });
                     }
-                    batch.push(PendingRequest {
-                        sequence: next_to_send,
-                        started: request_started,
-                    });
                     next_to_send += 1;
                 }
-                if batch.is_empty() {
-                    break;
-                }
-
-                let wr_id = endpoint.write_slots_remote(&server.writable, batch.len())?;
-                send_completions.push_back(wr_id);
-                pending.extend(batch);
             }
+            add_elapsed(&mut timings.prepare, preparing);
 
-            let drained = drain_responses(
-                endpoint,
-                &mut pending,
-                next_sequence,
-                payload_len,
-                validate,
-                &mut latencies_ns,
+            let posting = profile_stages.then(Instant::now);
+            let wr_id = sender.write_slots_remote(remote, count)?;
+            add_elapsed(&mut timings.post, posting);
+            timings.batches += 1;
+            send_completions.push_back(wr_id);
+            outstanding += count;
+            let publishing = profile_stages.then(Instant::now);
+            produced
+                .send(ProducedBatch { count, requests })
+                .context("consumer stopped before producer completed")?;
+            add_elapsed(&mut timings.auxiliary, publishing);
+        }
+
+        while outstanding > 0 {
+            let waiting = profile_stages.then(Instant::now);
+            apply_feedback(
+                &mut sender,
+                feedback
+                    .recv()
+                    .context("consumer stopped before all responses arrived")?,
+                &mut outstanding,
             )?;
-            if drained == 0 {
-                if !send_completions.is_empty() {
-                    wait_oldest_send(endpoint, &mut send_completions)?;
-                } else {
-                    std::hint::spin_loop();
-                }
-            }
+            add_elapsed(&mut timings.wait, waiting);
         }
-
         while !send_completions.is_empty() {
-            wait_oldest_send(endpoint, &mut send_completions)?;
+            let waiting = profile_stages.then(Instant::now);
+            wait_oldest_send(&mut sender, &mut send_completions)?;
+            add_elapsed(&mut timings.auxiliary, waiting);
         }
-        ensure!(pending.is_empty(), "responses completed with pending requests");
-        Ok(PhaseResult {
-            elapsed: started.elapsed(),
-            latencies_ns,
-        })
+        Ok((sender, timings))
     }
 
-    fn wait_oldest_send(endpoint: &mut RdmaEndpoint, completions: &mut VecDeque<u64>) -> Result<()> {
-        let wr_id = completions.pop_front().context("no send completion available")?;
-        endpoint.wait_for_completion(wr_id)
-    }
-
-    fn drain_responses(
-        endpoint: &mut RdmaEndpoint,
-        pending: &mut VecDeque<PendingRequest>,
-        next_sequence: &mut u64,
+    #[allow(clippy::too_many_arguments)]
+    fn run_consumer(
+        mut receiver: RdmaReceiver,
+        first_sequence: u64,
+        last_sequence: u64,
         payload_len: usize,
         validate: bool,
-        latencies_ns: &mut Vec<u64>,
-    ) -> Result<usize> {
-        let mut drained = 0;
-        while let Some(slot) = endpoint.read_slot_local() {
-            let request = pending
-                .pop_front()
-                .context("received a response without a pending request")?;
-            ensure!(
-                request.sequence == *next_sequence,
-                "response order mismatch: expected {}, pending {}",
-                *next_sequence,
-                request.sequence
-            );
-            if validate {
-                validate_response(&slot, request.sequence, payload_len)?;
+        measure: bool,
+        profile_stages: bool,
+        produced: Receiver<ProducedBatch>,
+        feedback: SyncSender<ConsumerFeedback>,
+    ) -> Result<(RdmaReceiver, Vec<u64>, WorkerTimings)> {
+        let mut next_sequence = first_sequence;
+        let mut pending = VecDeque::new();
+        let mut pending_count = 0usize;
+        let mut latencies_ns = Vec::with_capacity(if measure {
+            (last_sequence - first_sequence) as usize
+        } else {
+            0
+        });
+        let mut timings = WorkerTimings {
+            enabled: profile_stages,
+            ..WorkerTimings::default()
+        };
+
+        while next_sequence < last_sequence {
+            let waiting = profile_stages.then(Instant::now);
+            let batches = loop {
+                let batches = receiver.poll_output_batches()?;
+                if !batches.is_empty() {
+                    break batches;
+                }
+                std::hint::spin_loop();
+            };
+            add_elapsed(&mut timings.wait, waiting);
+            timings.batches += batches.len() as u64;
+            let consuming = profile_stages.then(Instant::now);
+            let completed_slots = batches.iter().map(|count| *count as usize).sum();
+            while pending_count < completed_slots {
+                let batch = produced
+                    .recv()
+                    .context("producer stopped before all responses arrived")?;
+                pending_count += batch.count;
+                pending.extend(batch.requests);
             }
-            if let Some(started) = request.started {
-                latencies_ns.push(duration_ns(started.elapsed()));
+            if validate || measure {
+                for _ in 0..completed_slots {
+                    let slot = receiver
+                        .read_slot_local()
+                        .context("output notification published a missing slot")?;
+                    let request = pending
+                        .pop_front()
+                        .context("received a response without a pending request")?;
+                    ensure!(
+                        request.sequence == next_sequence,
+                        "response order mismatch: expected {next_sequence}, pending {}",
+                        request.sequence
+                    );
+                    if validate {
+                        validate_response(&slot, request.sequence, payload_len)?;
+                    }
+                    if let Some(started) = request.started {
+                        latencies_ns.push(duration_ns(started.elapsed()));
+                    }
+                    next_sequence += 1;
+                }
+            } else {
+                receiver.discard_slots(completed_slots)?;
+                next_sequence += completed_slots as u64;
             }
-            endpoint.complete_round_trip_local();
-            *next_sequence += 1;
-            drained += 1;
+            pending_count -= completed_slots;
+            add_elapsed(&mut timings.prepare, consuming);
+            let sending_feedback = profile_stages.then(Instant::now);
+            feedback
+                .send(ConsumerFeedback {
+                    completed_slots,
+                    receive_wrs: batches.len(),
+                })
+                .context("producer stopped before consumer completed")?;
+            add_elapsed(&mut timings.post, sending_feedback);
         }
-        Ok(drained)
+        ensure!(pending_count == 0, "responses completed with pending requests");
+        ensure!(pending.is_empty(), "responses completed with pending metadata");
+        Ok((receiver, latencies_ns, timings))
+    }
+
+    fn drain_feedback(
+        sender: &mut RdmaSender,
+        feedback: &Receiver<ConsumerFeedback>,
+        outstanding: &mut usize,
+    ) -> Result<()> {
+        loop {
+            match feedback.try_recv() {
+                Ok(message) => apply_feedback(sender, message, outstanding)?,
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Disconnected) => {
+                    return Err(anyhow!("consumer stopped before producer completed"));
+                }
+            }
+        }
+    }
+
+    fn apply_feedback(sender: &mut RdmaSender, feedback: ConsumerFeedback, outstanding: &mut usize) -> Result<()> {
+        ensure!(
+            feedback.completed_slots <= *outstanding,
+            "consumer returned more credits than the producer has outstanding"
+        );
+        sender.complete_round_trips(feedback.completed_slots)?;
+        sender.replenish_output_notifications(feedback.receive_wrs)?;
+        *outstanding -= feedback.completed_slots;
+        Ok(())
+    }
+
+    fn wait_oldest_send(sender: &mut RdmaSender, completions: &mut VecDeque<u64>) -> Result<()> {
+        let wr_id = completions.pop_front().context("no send completion available")?;
+        sender.wait_for_completion(wr_id)
     }
 
     fn print_result(args: &Args, mut result: PhaseResult) {
@@ -256,8 +505,6 @@ mod linux_impl {
         let throughput = args.iterations as f64 / result.elapsed.as_secs_f64();
         let one_way_gbps = throughput * args.size as f64 * 8.0 / 1_000_000_000.0;
         let round_trip_gbps = one_way_gbps * 2.0;
-        let mean_ns = result.latencies_ns.iter().map(|value| *value as u128).sum::<u128>() as f64
-            / result.latencies_ns.len() as f64;
 
         println!("benchmark result:");
         println!("  tuples:             {}", args.iterations);
@@ -265,29 +512,71 @@ mod linux_impl {
         println!("  throughput:         {:.2} tuples/s", throughput);
         println!("  input goodput:      {:.3} Gbit/s", one_way_gbps);
         println!("  bidirectional data: {:.3} Gbit/s", round_trip_gbps);
-        println!("  latency mean:       {:.3} us", mean_ns / 1_000.0);
-        println!(
-            "  latency p50:        {:.3} us",
-            percentile(&result.latencies_ns, 0.50) / 1_000.0
-        );
-        println!(
-            "  latency p95:        {:.3} us",
-            percentile(&result.latencies_ns, 0.95) / 1_000.0
-        );
-        println!(
-            "  latency p99:        {:.3} us",
-            percentile(&result.latencies_ns, 0.99) / 1_000.0
-        );
-        println!(
-            "  latency p99.9:      {:.3} us",
-            percentile(&result.latencies_ns, 0.999) / 1_000.0
-        );
-        println!(
-            "  latency max:        {:.3} us",
-            result.latencies_ns.last().copied().unwrap_or(0) as f64 / 1_000.0
-        );
+        if result.latencies_ns.is_empty() {
+            println!("  latency:            disabled");
+        } else {
+            let mean_ns = result.latencies_ns.iter().map(|value| *value as u128).sum::<u128>() as f64
+                / result.latencies_ns.len() as f64;
+            println!("  latency mean:       {:.3} us", mean_ns / 1_000.0);
+            println!(
+                "  latency p50:        {:.3} us",
+                percentile(&result.latencies_ns, 0.50) / 1_000.0
+            );
+            println!(
+                "  latency p95:        {:.3} us",
+                percentile(&result.latencies_ns, 0.95) / 1_000.0
+            );
+            println!(
+                "  latency p99:        {:.3} us",
+                percentile(&result.latencies_ns, 0.99) / 1_000.0
+            );
+            println!(
+                "  latency p99.9:      {:.3} us",
+                percentile(&result.latencies_ns, 0.999) / 1_000.0
+            );
+            println!(
+                "  latency max:        {:.3} us",
+                result.latencies_ns.last().copied().unwrap_or(0) as f64 / 1_000.0
+            );
+        }
         println!("  validation:         {}", !args.skip_validation);
+        println!("  pre-generated input: {}", args.pre_generate_inputs);
+        println!("  throughput only:    {}", args.throughput_only);
         println!("  batch size:         {}", args.batch_size);
+        print_worker_timings(
+            "producer",
+            &result.producer_timings,
+            ["prepare", "RDMA post", "credit wait", "control/send CQ"],
+        );
+        print_worker_timings(
+            "consumer",
+            &result.consumer_timings,
+            ["consume", "feedback", "output CQ wait", "auxiliary"],
+        );
+    }
+
+    fn print_worker_timings(name: &str, timings: &WorkerTimings, labels: [&str; 4]) {
+        if !timings.enabled || timings.batches == 0 {
+            return;
+        }
+        println!("{name} timings (average per batch):");
+        for (label, duration) in
+            labels
+                .into_iter()
+                .zip([timings.prepare, timings.post, timings.wait, timings.auxiliary])
+        {
+            println!("  {label:<16} {:.3} us", average_us(duration, timings.batches));
+        }
+    }
+
+    fn add_elapsed(total: &mut Duration, started: Option<Instant>) {
+        if let Some(started) = started {
+            *total += started.elapsed();
+        }
+    }
+
+    fn average_us(duration: Duration, count: u64) -> f64 {
+        duration.as_secs_f64() * 1_000_000.0 / count as f64
     }
 
     fn percentile(sorted: &[u64], quantile: f64) -> f64 {

@@ -15,8 +15,8 @@ use sideway::ibverbs::{
     memory_region::MemoryRegion,
     protection_domain::ProtectionDomain,
     queue_pair::{
-        ExtendedQueuePair, PostSendGuard, QueuePair, QueuePairAttribute, QueuePairState, SetInlineData,
-        SetScatterGatherEntry, WorkRequestFlags,
+        ExtendedQueuePair, PostSendGuard, QueuePair, QueuePairAttribute, QueuePairState, SetScatterGatherEntry,
+        WorkRequestFlags,
     },
     AccessFlags,
 };
@@ -28,11 +28,30 @@ pub struct RdmaEndpoint {
     send_mr: Arc<MemoryRegion>,
     recv_rb: Box<RingBuffer<RING_BUFFER_ELEMENTS>>,
     recv_mr: Arc<MemoryRegion>,
-    cq: Arc<ExtendedCompletionQueue>,
+    send_cq: Arc<ExtendedCompletionQueue>,
+    receive_cq: Arc<ExtendedCompletionQueue>,
     pub qp: ExtendedQueuePair,
     current_write_id: u64,
     completed_write_ids: HashSet<u64>,
     posted_slots: u64,
+}
+
+pub struct RdmaSender {
+    _ctx: Arc<DeviceContext>,
+    _pd: Arc<ProtectionDomain>,
+    send_rb: Box<RingBuffer<RING_BUFFER_ELEMENTS>>,
+    send_mr: Arc<MemoryRegion>,
+    send_cq: Arc<ExtendedCompletionQueue>,
+    qp: ExtendedQueuePair,
+    current_write_id: u64,
+    completed_write_ids: HashSet<u64>,
+    posted_slots: u64,
+}
+
+pub struct RdmaReceiver {
+    recv_rb: Box<RingBuffer<RING_BUFFER_ELEMENTS>>,
+    _recv_mr: Arc<MemoryRegion>,
+    receive_cq: Arc<ExtendedCompletionQueue>,
 }
 
 impl RdmaEndpoint {
@@ -52,28 +71,29 @@ impl RdmaEndpoint {
 
         let pd = context.alloc_pd()?;
 
-        let mr_access = AccessFlags::LocalWrite | AccessFlags::RemoteWrite | AccessFlags::RemoteRead;
+        let send_access = AccessFlags::LocalWrite;
+        let receive_access =
+            AccessFlags::LocalWrite | AccessFlags::RemoteWrite | AccessFlags::RemoteRead | AccessFlags::RelaxedOrdering;
 
         let send_rb = RingBuffer::new_boxed();
-        let send_mr = unsafe { pd.reg_mr(send_rb.as_ptr() as usize, send_rb.len(), mr_access) }
+        let send_mr = unsafe { pd.reg_mr(send_rb.as_ptr() as usize, send_rb.len(), send_access) }
             .context("Failed to register send memory region")?;
 
         let recv_rb = RingBuffer::new_boxed();
-        let recv_mr = unsafe { pd.reg_mr(recv_rb.as_ptr() as usize, recv_rb.len(), mr_access) }
+        let recv_mr = unsafe { pd.reg_mr(recv_rb.as_ptr() as usize, recv_rb.len(), receive_access) }
             .context("Failed to register receive memory region")?;
 
-        let cq_builder = context.create_cq_builder();
-        let cq = cq_builder.build_ex()?;
-        let cq_for_qp = GenericCompletionQueue::from(Arc::clone(&cq));
+        let send_cq = context.create_cq_builder().build_ex()?;
+        let receive_cq = context.create_cq_builder().build_ex()?;
 
         let mut builder = pd.create_qp_builder();
 
         let mut qp = builder
             .setup_max_inline_data(128)
-            .setup_max_recv_wr(1024)
+            .setup_max_recv_wr(RING_BUFFER_ELEMENTS as u32)
             .setup_max_send_wr(1024)
-            .setup_send_cq(cq_for_qp.clone())
-            .setup_recv_cq(cq_for_qp)
+            .setup_send_cq(GenericCompletionQueue::from(Arc::clone(&send_cq)))
+            .setup_recv_cq(GenericCompletionQueue::from(Arc::clone(&receive_cq)))
             .build_ex()?;
 
         let mut attr = QueuePairAttribute::new();
@@ -82,6 +102,7 @@ impl RdmaEndpoint {
             .setup_port(ib_port)
             .setup_access_flags(AccessFlags::RemoteWrite | AccessFlags::RemoteRead);
         qp.modify(&attr)?;
+        post_receive_notifications(&mut qp, RING_BUFFER_ELEMENTS)?;
 
         Ok(RdmaEndpoint {
             ctx: context,
@@ -90,7 +111,8 @@ impl RdmaEndpoint {
             send_mr,
             recv_rb,
             recv_mr,
-            cq,
+            send_cq,
+            receive_cq,
             qp,
             current_write_id: 0,
             completed_write_ids: HashSet::new(),
@@ -144,8 +166,59 @@ impl RdmaEndpoint {
         Ok(())
     }
 
-    pub fn write_slot_remote(&mut self, remote: &MemoryRegionInfo) -> Result<u64> {
-        self.write_slots_remote(remote, 1)
+    pub fn memory_region_info(&self) -> MemoryRegionInfo {
+        MemoryRegionInfo {
+            addr: self.recv_mr.get_ptr() as u64,
+            rkey: self.recv_mr.rkey(),
+            size: self.recv_mr.region_len() as u32,
+        }
+    }
+
+    pub fn split(self) -> (RdmaSender, RdmaReceiver) {
+        let Self {
+            ctx,
+            _pd,
+            send_rb,
+            send_mr,
+            recv_rb,
+            recv_mr,
+            send_cq,
+            receive_cq,
+            qp,
+            current_write_id,
+            completed_write_ids,
+            posted_slots,
+        } = self;
+        (
+            RdmaSender {
+                _ctx: ctx,
+                _pd,
+                send_rb,
+                send_mr,
+                send_cq,
+                qp,
+                current_write_id,
+                completed_write_ids,
+                posted_slots,
+            },
+            RdmaReceiver {
+                recv_rb,
+                _recv_mr: recv_mr,
+                receive_cq,
+            },
+        )
+    }
+}
+
+impl RdmaSender {
+    pub fn preload_send_ring(&mut self, value: Slot) {
+        self.send_rb.fill_slots(value);
+    }
+
+    pub fn publish_preloaded_slots(&mut self, count: usize) -> Result<()> {
+        ensure!(count > 0, "preloaded batch must not be empty");
+        ensure!(count < RING_BUFFER_ELEMENTS, "preloaded batch exceeds ring capacity");
+        self.send_rb.advance_head_by(count as u64)
     }
 
     pub fn write_slots_remote(&mut self, remote: &MemoryRegionInfo, count: usize) -> Result<u64> {
@@ -165,40 +238,43 @@ impl RdmaEndpoint {
         let slot_index = ((self.send_rb.tail_idx() + self.posted_slots) & (RING_BUFFER_ELEMENTS as u64 - 1)) as usize;
         let first_count = count.min(RING_BUFFER_ELEMENTS - slot_index);
         let second_count = count - first_count;
-        let head = self.send_rb.head_idx().to_ne_bytes();
         let mut guard = self.qp.start_post_send();
 
-        post_slot_segment(
-            &mut guard,
-            lkey,
-            self.send_rb.slots_ptr(),
-            remote,
-            slot_index,
-            first_count,
-        );
         if second_count > 0 {
-            post_slot_segment(&mut guard, lkey, self.send_rb.slots_ptr(), remote, 0, second_count);
-        }
-
-        let head_update_wr = guard
-            .construct_wr(head_wr_id, WorkRequestFlags::Signaled)
-            .setup_write_imm(
-                remote.rkey,
-                remote.addr + self.send_rb.abs_head_offset() as u64,
-                (count as u32).to_be(),
+            post_slot_segment(
+                &mut guard,
+                lkey,
+                self.send_rb.slots_ptr(),
+                remote,
+                slot_index,
+                first_count,
+                None,
             );
-        head_update_wr.setup_inline_data(&head);
+            post_slot_segment(
+                &mut guard,
+                lkey,
+                self.send_rb.slots_ptr(),
+                remote,
+                0,
+                second_count,
+                Some((head_wr_id, count as u32)),
+            );
+        } else {
+            post_slot_segment(
+                &mut guard,
+                lkey,
+                self.send_rb.slots_ptr(),
+                remote,
+                slot_index,
+                first_count,
+                Some((head_wr_id, count as u32)),
+            );
+        }
 
         guard.post().context("failed to post RDMA write")?;
         self.posted_slots += count as u64;
 
         Ok(head_wr_id)
-    }
-
-    pub fn complete_round_trip_local(&mut self) {
-        assert!(self.posted_slots > 0, "no outstanding slot to complete");
-        self.posted_slots -= 1;
-        self.send_rb.advance_tail();
     }
 
     fn create_write_id(&mut self) -> u64 {
@@ -207,20 +283,8 @@ impl RdmaEndpoint {
         id
     }
 
-    pub fn memory_region_info(&self) -> MemoryRegionInfo {
-        MemoryRegionInfo {
-            addr: self.recv_mr.get_ptr() as u64,
-            rkey: self.recv_mr.rkey(),
-            size: self.recv_mr.region_len() as u32,
-        }
-    }
-
     pub fn write_slot_local(&mut self, value: Slot) -> Result<()> {
         self.send_rb.write_slot(value)
-    }
-
-    pub fn read_slot_local(&mut self) -> Option<Slot> {
-        self.recv_rb.read_slot()
     }
 
     pub fn wait_for_completion(&mut self, expected_wr_id: u64) -> Result<()> {
@@ -229,7 +293,7 @@ impl RdmaEndpoint {
                 return Ok(());
             }
 
-            match self.cq.start_poll() {
+            match self.send_cq.start_poll() {
                 Ok(mut poller) => {
                     for wc in &mut poller {
                         if wc.status() != WorkCompletionStatus::Success as u32 {
@@ -251,6 +315,55 @@ impl RdmaEndpoint {
             }
         }
     }
+
+    pub fn complete_round_trips(&mut self, count: usize) -> Result<()> {
+        ensure!(
+            count as u64 <= self.posted_slots,
+            "received credits for more slots than are outstanding"
+        );
+        for _ in 0..count {
+            self.posted_slots -= 1;
+            self.send_rb.advance_tail();
+        }
+        Ok(())
+    }
+
+    pub fn replenish_output_notifications(&mut self, count: usize) -> Result<()> {
+        post_receive_notifications(&mut self.qp, count)
+    }
+}
+
+impl RdmaReceiver {
+    pub fn read_slot_local(&mut self) -> Option<Slot> {
+        self.recv_rb.read_slot()
+    }
+
+    pub fn discard_slots(&mut self, count: usize) -> Result<()> {
+        self.recv_rb.advance_tail_by(count as u64)
+    }
+
+    pub fn poll_output_batches(&mut self) -> Result<Vec<u32>> {
+        let completions = match self.receive_cq.start_poll() {
+            Ok(mut poller) => poller
+                .by_ref()
+                .map(|completion| (completion.status(), completion.vendor_err(), completion.imm_data()))
+                .collect::<Vec<_>>(),
+            Err(PollCompletionQueueError::CompletionQueueEmpty) => return Ok(Vec::new()),
+            Err(error) => return Err(error).context("poll RDMA output notifications"),
+        };
+
+        let mut batches = Vec::with_capacity(completions.len());
+        for (status, vendor_err, immediate) in completions {
+            if status != WorkCompletionStatus::Success as u32 {
+                bail!("RDMA output notification failed: status={status}, vendor_err={vendor_err}");
+            }
+            let count = u32::from_be(immediate);
+            ensure!(count > 0, "RDMA output notification contains an empty batch");
+            self.recv_rb.advance_head_by(u64::from(count))?;
+            batches.push(count);
+        }
+        Ok(batches)
+    }
 }
 
 fn post_slot_segment<G: PostSendGuard>(
@@ -260,13 +373,36 @@ fn post_slot_segment<G: PostSendGuard>(
     remote: &MemoryRegionInfo,
     index: usize,
     count: usize,
+    completion: Option<(u64, u32)>,
 ) {
     let byte_count = count * std::mem::size_of::<Slot>();
     let offset = RingBuffer::<RING_BUFFER_ELEMENTS>::slot_offset(index) as u64;
-    let write = guard
-        .construct_wr(0, WorkRequestFlags::none())
-        .setup_write(remote.rkey, remote.addr + offset);
-    unsafe {
-        write.setup_sge(lkey, slots.add(index) as u64, byte_count as u32);
+    if let Some((wr_id, immediate)) = completion {
+        let write = guard.construct_wr(wr_id, WorkRequestFlags::Signaled).setup_write_imm(
+            remote.rkey,
+            remote.addr + offset,
+            immediate.to_be(),
+        );
+        unsafe {
+            write.setup_sge(lkey, slots.add(index) as u64, byte_count as u32);
+        }
+    } else {
+        let write = guard
+            .construct_wr(0, WorkRequestFlags::none())
+            .setup_write(remote.rkey, remote.addr + offset);
+        unsafe {
+            write.setup_sge(lkey, slots.add(index) as u64, byte_count as u32);
+        }
     }
+}
+
+fn post_receive_notifications(qp: &mut ExtendedQueuePair, count: usize) -> Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    let mut guard = qp.start_post_recv();
+    for _ in 0..count {
+        guard.construct_wr(0);
+    }
+    guard.post().context("post RDMA output notification receives")
 }

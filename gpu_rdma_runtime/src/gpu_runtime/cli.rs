@@ -27,6 +27,10 @@ struct Args {
     warmup_iterations: u64,
     #[arg(long, default_value_t = 16)]
     batch_size: usize,
+    #[arg(long, default_value_t = 4)]
+    pipeline_depth: usize,
+    #[arg(long)]
+    profile_stages: bool,
     #[arg(long, default_value_t = 0)]
     cuda_device: u32,
 }
@@ -41,6 +45,8 @@ pub fn run() -> Result<()> {
         iterations: args.iterations,
         warmup_iterations: args.warmup_iterations,
         batch_size: args.batch_size,
+        pipeline_depth: args.pipeline_depth,
+        profile_stages: args.profile_stages,
         cuda_device: args.cuda_device,
         kernel_path: &args.kernel,
     })

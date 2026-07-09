@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -20,10 +21,11 @@ use crate::constants::RING_BUFFER_ELEMENTS;
 use crate::control_protocol::{MemoryRegionInfo, RdmaDestination};
 use crate::ring_buffer::{slot::Slot, RingBuffer};
 
-use super::cuda::CudaRuntime;
+use super::cuda::{CudaBatch, CudaRuntime};
 use super::memory_region::DmaBufMemoryRegion;
 
 type RuntimeRing = RingBuffer<RING_BUFFER_ELEMENTS>;
+const OUTPUT_SIGNAL_INTERVAL: usize = 32;
 
 pub struct GpuRdmaEndpoint {
     pub ctx: Arc<DeviceContext>,
@@ -35,6 +37,8 @@ pub struct GpuRdmaEndpoint {
     _pd: Arc<ProtectionDomain>,
     cuda: CudaRuntime,
     next_write_id: u64,
+    output_batches_since_signal: usize,
+    pending_output_completions: VecDeque<u64>,
 }
 
 impl GpuRdmaEndpoint {
@@ -43,8 +47,9 @@ impl GpuRdmaEndpoint {
         ib_port: u8,
         cuda_device: u32,
         kernel_path: &std::path::Path,
+        pipeline_depth: usize,
     ) -> Result<Self> {
-        let cuda = CudaRuntime::create(cuda_device, kernel_path)?;
+        let cuda = CudaRuntime::create(cuda_device, kernel_path, pipeline_depth)?;
         let device_list = DeviceList::new().context("get RDMA device list")?;
         let device = match ib_device {
             Some(name) => device_list
@@ -60,7 +65,8 @@ impl GpuRdmaEndpoint {
 
         let remote_access = (ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
             | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
-            | ibv_access_flags::IBV_ACCESS_REMOTE_READ)
+            | ibv_access_flags::IBV_ACCESS_REMOTE_READ
+            | ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING)
             .0 as i32;
         let local_access = ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0 as i32;
         let input_mr = unsafe { DmaBufMemoryRegion::register(Arc::clone(&pd), cuda.input(), remote_access) }
@@ -104,6 +110,8 @@ impl GpuRdmaEndpoint {
             _pd: pd,
             cuda,
             next_write_id: 0,
+            output_batches_since_signal: 0,
+            pending_output_completions: VecDeque::new(),
         })
     }
 
@@ -152,8 +160,20 @@ impl GpuRdmaEndpoint {
         }
     }
 
-    pub fn process(&self, input_tail: u64, output_head: u64, count: u32) -> Result<()> {
-        self.cuda.process(input_tail, output_head, count)
+    pub fn pipeline_depth(&self) -> usize {
+        self.cuda.pipeline_depth()
+    }
+
+    pub fn submit_process(&mut self, input_tail: u64, output_head: u64, count: u32) -> Result<CudaBatch> {
+        self.cuda.submit(input_tail, output_head, count)
+    }
+
+    pub fn process_complete(&self, batch: CudaBatch) -> Result<bool> {
+        self.cuda.is_complete(batch)
+    }
+
+    pub fn wait_for_process(&self, batch: CudaBatch) -> Result<()> {
+        self.cuda.wait(batch)
     }
 
     pub fn flush_input_writes(&self) -> Result<()> {
@@ -162,29 +182,40 @@ impl GpuRdmaEndpoint {
 
     pub fn wait_for_input_batch(&mut self) -> Result<u32> {
         loop {
-            match self.receive_cq.start_poll() {
-                Ok(mut poller) => {
-                    if let Some(completion) = poller.next() {
-                        if completion.status() != WorkCompletionStatus::Success as u32 {
-                            bail!(
-                                "RDMA input notification failed: status={}, vendor_err={}",
-                                completion.status(),
-                                completion.vendor_err()
-                            );
-                        }
-                        let count = u32::from_be(completion.imm_data());
-                        ensure!(count > 0, "RDMA input notification contains an empty batch");
-                        post_receive_notifications(&mut self.qp, 1)?;
-                        return Ok(count);
-                    }
-                }
-                Err(PollCompletionQueueError::CompletionQueueEmpty) => std::hint::spin_loop(),
-                Err(error) => return Err(error).context("poll RDMA input notifications"),
+            if let Some(count) = self.try_input_batch()? {
+                return Ok(count);
             }
+            std::hint::spin_loop();
         }
     }
 
-    pub fn write_output_batch(&mut self, remote: &MemoryRegionInfo, output_head: u64, count: u32) -> Result<()> {
+    pub fn try_input_batch(&mut self) -> Result<Option<u32>> {
+        let completion = match self.receive_cq.start_poll() {
+            Ok(mut poller) => poller
+                .next()
+                .map(|completion| (completion.status(), completion.vendor_err(), completion.imm_data())),
+            Err(PollCompletionQueueError::CompletionQueueEmpty) => return Ok(None),
+            Err(error) => return Err(error).context("poll RDMA input notifications"),
+        };
+        let Some((status, vendor_err, immediate)) = completion else {
+            return Ok(None);
+        };
+        if status != WorkCompletionStatus::Success as u32 {
+            bail!("RDMA input notification failed: status={status}, vendor_err={vendor_err}");
+        }
+        let count = u32::from_be(immediate);
+        ensure!(count > 0, "RDMA input notification contains an empty batch");
+        post_receive_notifications(&mut self.qp, 1)?;
+        Ok(Some(count))
+    }
+
+    pub fn write_output_batch(
+        &mut self,
+        remote: &MemoryRegionInfo,
+        output_head: u64,
+        count: u32,
+        phase_end: bool,
+    ) -> Result<()> {
         ensure!(count > 0, "output batch must not be empty");
         ensure!(
             count < RING_BUFFER_ELEMENTS as u32,
@@ -195,8 +226,14 @@ impl GpuRdmaEndpoint {
             "remote output region is smaller than the ring buffer"
         );
 
-        let wr_id = self.next_write_id;
-        self.next_write_id = self.next_write_id.wrapping_add(1);
+        let signaled = phase_end || self.output_batches_since_signal + 1 >= OUTPUT_SIGNAL_INTERVAL;
+        let wr_id = if signaled {
+            let id = self.next_write_id;
+            self.next_write_id = self.next_write_id.wrapping_add(1);
+            Some(id)
+        } else {
+            None
+        };
         let local_base = self.cuda.output().pointer();
         let mask = RING_BUFFER_ELEMENTS as u64 - 1;
         let lkey = self.output_mr.lkey();
@@ -205,46 +242,75 @@ impl GpuRdmaEndpoint {
         let first_index = (output_head & mask) as usize;
         let first_count = (count as usize).min(RING_BUFFER_ELEMENTS - first_index);
         let second_count = count as usize - first_count;
-        post_output_segment(&mut guard, lkey, local_base, remote, first_index, first_count);
         if second_count > 0 {
-            post_output_segment(&mut guard, lkey, local_base, remote, 0, second_count);
-        }
-
-        let head_offset = RuntimeRing::producer_head_offset() as u64;
-        let head_write = guard
-            .construct_wr(wr_id, WorkRequestFlags::Signaled)
-            .setup_write(remote.rkey, remote.addr + head_offset);
-        unsafe {
-            head_write.setup_sge(lkey, local_base + head_offset, size_of::<u64>() as u32);
+            post_output_segment(&mut guard, lkey, local_base, remote, first_index, first_count, None);
+            post_output_segment(
+                &mut guard,
+                lkey,
+                local_base,
+                remote,
+                0,
+                second_count,
+                Some((wr_id.unwrap_or(0), signaled, count)),
+            );
+        } else {
+            post_output_segment(
+                &mut guard,
+                lkey,
+                local_base,
+                remote,
+                first_index,
+                first_count,
+                Some((wr_id.unwrap_or(0), signaled, count)),
+            );
         }
         guard.post().context("post GPU output RDMA writes")?;
-        self.wait_for_completion(wr_id)
+
+        if let Some(wr_id) = wr_id {
+            self.pending_output_completions.push_back(wr_id);
+            self.output_batches_since_signal = 0;
+        } else {
+            self.output_batches_since_signal += 1;
+        }
+        self.reap_output_completions().map(|_| ())
     }
 
-    fn wait_for_completion(&self, expected_wr_id: u64) -> Result<()> {
-        loop {
-            match self.send_cq.start_poll() {
-                Ok(mut poller) => {
-                    if let Some(completion) = poller.next() {
-                        if completion.status() != WorkCompletionStatus::Success as u32 {
-                            bail!(
-                                "RDMA write failed: status={}, vendor_err={}",
-                                completion.status(),
-                                completion.vendor_err()
-                            );
-                        }
-                        ensure!(
-                            completion.wr_id() == expected_wr_id,
-                            "unexpected RDMA completion {} (expected {expected_wr_id})",
-                            completion.wr_id()
-                        );
-                        return Ok(());
-                    }
-                }
-                Err(PollCompletionQueueError::CompletionQueueEmpty) => std::hint::spin_loop(),
-                Err(error) => return Err(error).context("poll RDMA completion queue"),
+    pub fn finish_output(&mut self) -> Result<()> {
+        ensure!(
+            self.output_batches_since_signal == 0,
+            "the final output batch must request a completion"
+        );
+        while !self.pending_output_completions.is_empty() {
+            if self.reap_output_completions()? == 0 {
+                std::hint::spin_loop();
             }
         }
+        Ok(())
+    }
+
+    fn reap_output_completions(&mut self) -> Result<usize> {
+        let completions = match self.send_cq.start_poll() {
+            Ok(mut poller) => poller
+                .by_ref()
+                .map(|completion| (completion.status(), completion.vendor_err(), completion.wr_id()))
+                .collect::<Vec<_>>(),
+            Err(PollCompletionQueueError::CompletionQueueEmpty) => return Ok(0),
+            Err(error) => return Err(error).context("poll RDMA completion queue"),
+        };
+        for (status, vendor_err, wr_id) in &completions {
+            if *status != WorkCompletionStatus::Success as u32 {
+                bail!("RDMA write failed: status={status}, vendor_err={vendor_err}");
+            }
+            let expected = self
+                .pending_output_completions
+                .pop_front()
+                .context("received an unexpected RDMA output completion")?;
+            ensure!(
+                *wr_id == expected,
+                "unexpected RDMA completion {wr_id} (expected {expected})"
+            );
+        }
+        Ok(completions.len())
     }
 }
 
@@ -263,13 +329,29 @@ fn post_output_segment<G: PostSendGuard>(
     remote: &MemoryRegionInfo,
     index: usize,
     count: usize,
+    notification: Option<(u64, bool, u32)>,
 ) {
     let offset = RuntimeRing::slot_offset(index) as u64;
     let byte_count = count * size_of::<Slot>();
-    let write = guard
-        .construct_wr(0, WorkRequestFlags::none())
-        .setup_write(remote.rkey, remote.addr + offset);
-    unsafe {
-        write.setup_sge(lkey, local_base + offset, byte_count as u32);
+    if let Some((wr_id, signaled, immediate)) = notification {
+        let flags = if signaled {
+            WorkRequestFlags::Signaled
+        } else {
+            WorkRequestFlags::none()
+        };
+        let write =
+            guard
+                .construct_wr(wr_id, flags)
+                .setup_write_imm(remote.rkey, remote.addr + offset, immediate.to_be());
+        unsafe {
+            write.setup_sge(lkey, local_base + offset, byte_count as u32);
+        }
+    } else {
+        let write = guard
+            .construct_wr(0, WorkRequestFlags::none())
+            .setup_write(remote.rkey, remote.addr + offset);
+        unsafe {
+            write.setup_sge(lkey, local_base + offset, byte_count as u32);
+        }
     }
 }

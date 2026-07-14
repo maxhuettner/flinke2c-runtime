@@ -29,6 +29,8 @@ struct Args {
     profile_stages: bool,
     #[arg(long, default_value_t = 0)]
     cuda_device: u32,
+    #[arg(long, default_value_t = 4)]
+    cuda_pipeline_depth: usize,
 }
 
 pub fn run() -> Result<()> {
@@ -43,6 +45,7 @@ pub fn run() -> Result<()> {
         batch_size: args.batch_size,
         profile_stages: args.profile_stages,
         cuda_device: args.cuda_device,
+        cuda_pipeline_depth: args.cuda_pipeline_depth,
         kernel_path: &args.kernel,
     })
 }

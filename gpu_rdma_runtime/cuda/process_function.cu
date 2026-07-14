@@ -61,6 +61,7 @@ extern "C" __global__ void process_slots(
     const uint32_t copy_len = source.len < MAX_ITEM_SIZE ? source.len : MAX_ITEM_SIZE;
     for (uint32_t i = threadIdx.x; i < copy_len; i += blockDim.x)
         destination.value[i] = source.value[i];
+    __syncthreads();
     if (threadIdx.x != 0) return;
     destination.len = copy_len;
     destination.timestamp_ns = source.timestamp_ns;
@@ -88,4 +89,15 @@ extern "C" __global__ void process_slots(
         if (pos > destination.len) return;
     }
     if (framed) put_be32(destination.value, destination.len - 4);
+}
+
+// Runs after process_slots on the same CUDA stream. The producer pointer is
+// therefore visible only after every block of the batch has completed.
+extern "C" __global__ void publish_output_head(
+    RingBuffer* output, uint64_t* completed_head, uint64_t value) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        __threadfence_system();
+        output->producer_head = value;
+        *completed_head = value;
+    }
 }

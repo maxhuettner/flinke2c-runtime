@@ -26,6 +26,7 @@ pub struct ServerConfig<'a> {
     pub batch_size: usize,
     pub profile_stages: bool,
     pub cuda_device: u32,
+    pub cuda_pipeline_depth: usize,
     pub kernel_path: &'a Path,
 }
 
@@ -38,7 +39,7 @@ pub fn run(config: ServerConfig<'_>) -> Result<()> {
         "--batch-size must be in 1..{RING_BUFFER_ELEMENTS}"
     );
     let mut endpoint =
-        GpuRdmaEndpoint::build(config.ib_device, config.ib_port, config.cuda_device, config.kernel_path)?;
+        GpuRdmaEndpoint::build(config.ib_device, config.ib_port, config.cuda_device, config.cuda_pipeline_depth, config.kernel_path)?;
     let active_mtu = endpoint.ctx.query_port(config.ib_port)?.active_mtu();
     let gid = endpoint.ctx.query_gid(config.ib_port, config.gid_index.into())?;
     let listener = TcpListener::bind(("0.0.0.0", config.port))
@@ -178,18 +179,18 @@ impl StageTimings {
         }
         println!("stage timings (overlapped, average per batch):");
         println!(
-            "  receive/collect:     {:.3} us",
+            "  input notify/collect:{:.3} us",
             average_us(self.receive, self.batches)
         );
-        println!("  GPUDirect flush:     {:.3} us", average_us(self.flush, self.batches));
-        println!("  CUDA submit:         {:.3} us", average_us(self.submit, self.batches));
+        println!("  input visibility:    {:.3} us", average_us(self.flush, self.batches));
+        println!("  CUDA kernel launch:  {:.3} us", average_us(self.submit, self.batches));
         println!(
-            "  CUDA retirement wait:{:.3} us",
+            "  CUDA completion wait:{:.3} us",
             average_us(self.cuda_wait, self.batches)
         );
-        println!("  RDMA output submit:  {:.3} us", average_us(self.output, self.batches));
+        println!("  output RDMA submit:  {:.3} us", average_us(self.output, self.batches));
         println!(
-            "  final output drain:  {:.3} us",
+            "  output completion:   {:.3} us",
             self.output_drain.as_secs_f64() * 1_000_000.0
         );
     }

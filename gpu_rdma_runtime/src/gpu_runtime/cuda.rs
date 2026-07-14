@@ -27,7 +27,6 @@ const CUDA_SUCCESS: CuResult = 0;
 const CUDA_ERROR_NOT_READY: CuResult = 600;
 const DMA_BUF_HANDLE_TYPE: u32 = 1;
 const GPU_DMA_PAGE_SIZE: usize = 2 * 1024 * 1024;
-const CUDA_PIPELINE_DEPTH: usize = 4;
 pub const MAX_PROCESS_FIELDS: usize = 32;
 
 #[repr(C)]
@@ -303,6 +302,7 @@ struct CudaKernel {
     api: Arc<CudaApi>,
     module: CuModule,
     process_slots: CuFunction,
+    publish_output_head: CuFunction,
 }
 
 impl CudaKernel {
@@ -322,14 +322,20 @@ impl CudaKernel {
                 unsafe { (context.api.module_get_function)(&mut process_slots, module, c"process_slots".as_ptr()) },
                 "resolve process_slots kernel",
             )?;
-            Ok(process_slots)
+            let mut publish_output_head = ptr::null_mut();
+            context.api.check(
+                unsafe { (context.api.module_get_function)(&mut publish_output_head, module, c"publish_output_head".as_ptr()) },
+                "resolve publish_output_head kernel",
+            )?;
+            Ok((process_slots, publish_output_head))
         })();
 
         match result {
-            Ok(process_slots) => Ok(Self {
+            Ok((process_slots, publish_output_head)) => Ok(Self {
                 api: Arc::clone(&context.api),
                 module,
                 process_slots,
+                publish_output_head,
             }),
             Err(error) => {
                 unsafe { (context.api.module_unload)(module) };
@@ -401,12 +407,15 @@ pub struct CudaRuntime {
 }
 
 impl CudaRuntime {
-    pub fn create(device: u32, kernel_path: &Path) -> Result<Self> {
+    pub fn create(device: u32, pipeline_depth: usize, kernel_path: &Path) -> Result<Self> {
+        ensure!((1..=64).contains(&pipeline_depth), "CUDA pipeline depth must be in 1..=64");
         let context = CudaContext::create(device)?;
         let input = CudaBuffer::allocate(&context)?;
         let output = CudaBuffer::allocate(&context)?;
         let kernel = CudaKernel::load(&context, kernel_path)?;
-        let lanes = (0..CUDA_PIPELINE_DEPTH)
+        // A single ordered stream guarantees that the GPU-published producer
+        // head can never skip an unfinished batch.
+        let lanes = (0..pipeline_depth)
             .map(|_| CudaLane::create(&context))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {

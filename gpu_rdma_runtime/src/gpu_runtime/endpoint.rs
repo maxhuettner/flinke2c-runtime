@@ -47,9 +47,10 @@ impl GpuRdmaEndpoint {
         ib_device: Option<&str>,
         ib_port: u8,
         cuda_device: u32,
+        cuda_pipeline_depth: usize,
         kernel_path: &std::path::Path,
     ) -> Result<Self> {
-        let cuda = CudaRuntime::create(cuda_device, kernel_path)?;
+        let cuda = CudaRuntime::create(cuda_device, cuda_pipeline_depth, kernel_path)?;
         let device_list = DeviceList::new().context("get RDMA device list")?;
         let device = match ib_device {
             Some(name) => device_list

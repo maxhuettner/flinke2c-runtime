@@ -3,20 +3,27 @@ mod linux_impl {
     use std::net::TcpStream;
     use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
     use std::thread;
-    use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use anyhow::{anyhow, ensure, Context, Result};
-    use clap::Parser;
+    use clap::{Parser, ValueEnum};
     use gpu_rdma_runtime::constants::RING_BUFFER_ELEMENTS;
-    use gpu_rdma_runtime::control_helpers::{recv_json, send_json, CliMtu};
-    use gpu_rdma_runtime::control_protocol::{EndpointBootstrap, RdmaDestination, MAX_ITEM_SIZE};
+    use gpu_rdma_runtime::control_helpers::{mtu_value, recv_json, send_json, CliMtu};
+    use gpu_rdma_runtime::control_protocol::{BootstrapHello, ClientRole, EndpointBootstrap, InputDone, ProcessingFunction, ProcessingSpec, RdmaDestination, WireFieldType, MAX_ITEM_SIZE};
     use gpu_rdma_runtime::rdma::{RdmaEndpoint, RdmaReceiver, RdmaSender};
     use gpu_rdma_runtime::ring_buffer::slot::Slot;
+    use gpu_rdma_runtime::wire_codec::encode_row_i32_payload;
     use sideway::ibverbs::device_context::Mtu;
     use sideway::ibverbs::queue_pair::QueuePair;
 
     const MAX_IN_FLIGHT_SENDS: usize = 256;
     const INPUT_PATTERN_PERIOD: usize = 251;
+
+    #[derive(Clone, Copy, Debug, ValueEnum)]
+    enum Role {
+        Pre,
+        Post,
+    }
 
     #[derive(Parser, Debug)]
     #[command(name = "rdma-test-client")]
@@ -24,6 +31,8 @@ mod linux_impl {
     struct Args {
         #[arg(long)]
         server: String,
+        #[arg(long, value_enum)]
+        role: Role,
         #[arg(long)]
         ib_device: Option<String>,
         #[arg(long, default_value_t = 1)]
@@ -38,9 +47,9 @@ mod linux_impl {
         iterations: u64,
         #[arg(long, default_value_t = 0)]
         warmup_iterations: u64,
-        #[arg(long, default_value_t = 256)]
+        #[arg(long, default_value_t = RING_BUFFER_ELEMENTS - 1)]
         in_flight: usize,
-        #[arg(long, default_value_t = 16)]
+        #[arg(long, default_value_t = 64)]
         batch_size: usize,
         #[arg(long)]
         skip_validation: bool,
@@ -50,6 +59,8 @@ mod linux_impl {
         throughput_only: bool,
         #[arg(long)]
         profile_stages: bool,
+        #[arg(long)]
+        measure_latency: bool,
     }
 
     struct PendingRequest {
@@ -131,6 +142,11 @@ mod linux_impl {
         });
 
         let mut stream = TcpStream::connect(&args.server).with_context(|| format!("connect {}", args.server))?;
+        let role = match args.role {
+            Role::Pre => ClientRole::Pre,
+            Role::Post => ClientRole::Post,
+        };
+        send_json(&mut stream, &BootstrapHello { role })?;
         let mut endpoint = RdmaEndpoint::build(args.ib_device.as_deref(), args.ib_port)?;
         let active_mtu = endpoint.ctx.query_port(args.ib_port)?.active_mtu();
 
@@ -148,7 +164,8 @@ mod linux_impl {
                 packet_seq_num,
             },
             writable: endpoint.memory_region_info(),
-            path_mtu: active_mtu as u32,
+            path_mtu: mtu_value(active_mtu),
+            processing: ProcessingSpec { function: ProcessingFunction::Increment, field_index: 0, fields: vec![WireFieldType::Int32] },
         };
         println!("client sending bootstrap: {local:?}");
         send_json(&mut stream, &local)?;
@@ -157,6 +174,21 @@ mod linux_impl {
 
         let payload_len = args.size as usize;
         let (mut sender, receiver) = endpoint.split();
+        if matches!(args.role, Role::Pre) {
+            run_pre_client(
+                &mut sender,
+                &server.writable,
+                &mut stream,
+                &args,
+                payload_len,
+                prepared_inputs.as_ref(),
+            )?;
+        } else {
+            run_post_client(&mut sender, receiver, &mut stream, &args, payload_len)?;
+        }
+        return Ok(());
+
+        #[allow(unreachable_code)]
         if args.throughput_only {
             let slot = prepared_inputs
                 .as_ref()
@@ -206,6 +238,171 @@ mod linux_impl {
         )?;
         print_result(&args, result);
         Ok(())
+    }
+
+    fn run_pre_client(
+        sender: &mut RdmaSender,
+        remote: &gpu_rdma_runtime::control_protocol::MemoryRegionInfo,
+        stream: &mut TcpStream,
+        args: &Args,
+        payload_len: usize,
+        prepared_inputs: Option<&PreparedInputs>,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let mut sequence = 0u64;
+        if args.warmup_iterations > 0 {
+            publish_phase(
+                sender,
+                remote,
+                stream,
+                args,
+                payload_len,
+                prepared_inputs,
+                sequence,
+                args.warmup_iterations,
+                false,
+            )?;
+            sequence += args.warmup_iterations;
+        }
+        publish_phase(
+            sender,
+            remote,
+            stream,
+            args,
+            payload_len,
+            prepared_inputs,
+            sequence,
+            args.iterations,
+            true,
+        )?;
+        let total = args.warmup_iterations + args.iterations;
+        println!(
+            "pre client published {} slots in {:.2?} ({:.2} slots/s)",
+            total,
+            started.elapsed(),
+            total as f64 / started.elapsed().as_secs_f64()
+        );
+        Ok(())
+    }
+
+    fn publish_phase(
+        sender: &mut RdmaSender,
+        remote: &gpu_rdma_runtime::control_protocol::MemoryRegionInfo,
+        stream: &mut TcpStream,
+        args: &Args,
+        payload_len: usize,
+        prepared_inputs: Option<&PreparedInputs>,
+        first_sequence: u64,
+        phase_slots: u64,
+        send_done: bool,
+    ) -> Result<()> {
+        let phase_end = first_sequence + phase_slots;
+        let mut next_sequence = first_sequence;
+        let mut outstanding = 0usize;
+        let mut send_completions = VecDeque::new();
+
+        while next_sequence < phase_end || outstanding > 0 {
+            while next_sequence < phase_end && outstanding < args.in_flight {
+                let count = args.batch_size.min((phase_end - next_sequence) as usize);
+                while sender.available_send_slots() < count as u64 {
+                    let credit: u32 = recv_json(stream).context("receive GPU input credit")?;
+                    let credit = credit as usize;
+                    ensure!(credit > 0 && credit <= outstanding, "invalid GPU input credit {credit}");
+                    sender.complete_round_trips(credit)?;
+                    outstanding -= credit;
+                }
+                for offset in 0..count {
+                    let sequence = next_sequence + offset as u64;
+                    let mut slot = prepared_inputs
+                        .map(|inputs| inputs.get(sequence))
+                        .unwrap_or_else(|| input_slot(sequence, payload_len));
+                    retag_row(&mut slot, sequence)?;
+                    slot.timestamp_ns = now_ns();
+                    sender.write_slot_local(slot)?;
+                }
+                let wr_id = sender.write_slots_remote(remote, count)?;
+                send_completions.push_back(wr_id);
+                outstanding += count;
+                next_sequence += count as u64;
+                if send_completions.len() >= MAX_IN_FLIGHT_SENDS {
+                    let wr_id = send_completions.pop_front().context("missing send completion")?;
+                    sender.wait_for_completion(wr_id)?;
+                }
+            }
+
+            let credit: u32 = recv_json(stream).context("receive GPU input credit")?;
+            let credit = credit as usize;
+            ensure!(credit > 0 && credit <= outstanding, "invalid GPU input credit {credit}");
+            sender.complete_round_trips(credit)?;
+            outstanding -= credit;
+        }
+
+        while let Some(wr_id) = send_completions.pop_front() {
+            sender.wait_for_completion(wr_id)?;
+        }
+        if send_done {
+            send_json(stream, &InputDone { done: true, slots: phase_end })
+                .context("send PRE input-done message")?;
+        }
+        Ok(())
+    }
+
+    fn run_post_client(
+        sender: &mut RdmaSender,
+        mut receiver: RdmaReceiver,
+        stream: &mut TcpStream,
+        args: &Args,
+        payload_len: usize,
+    ) -> Result<()> {
+        let total = args.warmup_iterations + args.iterations;
+        let started = Instant::now();
+        let mut sequence = 0u64;
+        let mut latencies_ns = Vec::with_capacity(if args.measure_latency { total as usize } else { 0 });
+        while sequence < total {
+            let batches = loop {
+                let batches = receiver.poll_output_batches()?;
+                if !batches.is_empty() {
+                    break batches;
+                }
+                std::hint::spin_loop();
+            };
+            for count in batches.iter().copied() {
+                for _ in 0..count {
+                    let slot = receiver.read_slot_local().context("completed RDMA slot missing")?;
+                    if !args.skip_validation {
+                        validate_response(&slot, sequence, payload_len)?;
+                    }
+                    if args.measure_latency {
+                        ensure!(slot.timestamp_ns > 0, "response {sequence} has no send timestamp");
+                        latencies_ns.push(now_ns().saturating_sub(slot.timestamp_ns));
+                    }
+                    sequence += 1;
+                }
+            }
+            sender.replenish_output_notifications(batches.len())?;
+            send_json(stream, &completed_slots_as_u32(&batches)?)?;
+        }
+        println!(
+            "post client received {} slots in {:.2?} ({:.2} slots/s)",
+            total,
+            started.elapsed(),
+            total as f64 / started.elapsed().as_secs_f64()
+        );
+        if args.measure_latency {
+            latencies_ns.sort_unstable();
+            println!(
+                "latency p50={:.3} us p95={:.3} us p99={:.3} us",
+                percentile(&latencies_ns, 0.50) / 1_000.0,
+                percentile(&latencies_ns, 0.95) / 1_000.0,
+                percentile(&latencies_ns, 0.99) / 1_000.0,
+            );
+        }
+        Ok(())
+    }
+
+    fn completed_slots_as_u32(batches: &[u32]) -> Result<u32> {
+        let count: u64 = batches.iter().map(|count| u64::from(*count)).sum();
+        count.try_into().context("output credit exceeds u32")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -588,35 +785,50 @@ mod linux_impl {
         duration.as_nanos().min(u64::MAX as u128) as u64
     }
 
-    fn input_slot(sequence: u64, payload_len: usize) -> Slot {
+    fn now_ns() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or(0)
+    }
+
+    fn input_slot(sequence: u64, _payload_len: usize) -> Slot {
         let mut value = [0u8; MAX_ITEM_SIZE];
-        value[..payload_len].fill(input_byte(sequence));
+        let mut encoded = Vec::with_capacity(17);
+        encode_row_i32_payload(0, sequence as i64, sequence as i32, &mut encoded);
+        value[..encoded.len()].copy_from_slice(&encoded);
         Slot {
-            len: payload_len as u32,
+            len: encoded.len() as u32,
+            timestamp_ns: 0,
             value,
         }
     }
 
-    fn validate_response(slot: &Slot, sequence: u64, payload_len: usize) -> Result<()> {
-        ensure!(
-            slot.len as usize == payload_len,
-            "response {sequence} has an invalid length"
-        );
-        let expected = input_byte(sequence).wrapping_add(1);
-        ensure!(
-            slot.value[..payload_len].iter().all(|byte| *byte == expected),
-            "response {sequence} is out of order or contains invalid mapped data"
-        );
+    fn retag_row(slot: &mut Slot, sequence: u64) -> Result<()> {
+        ensure!(slot.len >= 17, "serialized benchmark row is truncated");
+        slot.value[4..12].copy_from_slice(&(sequence as i64).to_be_bytes());
+        slot.value[13..17].copy_from_slice(&(sequence as i32).to_be_bytes());
         Ok(())
     }
 
-    fn input_byte(sequence: u64) -> u8 {
-        (sequence % 251) as u8
+    fn validate_response(slot: &Slot, sequence: u64, _payload_len: usize) -> Result<()> {
+        ensure!(slot.len == 17, "response {sequence} has an invalid length");
+        let (op, row_id, value) = gpu_rdma_runtime::wire_codec::decode_row_i32_payload(&slot.value[..17])?;
+        ensure!(op == 0, "response {sequence} has an invalid op");
+        ensure!(row_id == sequence as i64, "response order mismatch for {sequence}: row id {row_id}");
+        ensure!(value == sequence as i32 + 1, "response {sequence} has an invalid incremented value");
+        Ok(())
     }
 
     fn parse_mtu(raw: u32) -> Result<Mtu> {
-        ensure!((1..=5).contains(&raw), "server sent invalid path_mtu {raw}");
-        Ok(Mtu::from(raw))
+        Ok(match raw {
+            256 => Mtu::Mtu256,
+            512 => Mtu::Mtu512,
+            1024 => Mtu::Mtu1024,
+            2048 => Mtu::Mtu2048,
+            4096 => Mtu::Mtu4096,
+            other => anyhow::bail!("server sent invalid path_mtu {other}"),
+        })
     }
 }
 

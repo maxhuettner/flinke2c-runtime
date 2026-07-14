@@ -9,6 +9,7 @@ use anyhow::{ensure, Context, Result};
 use libloading::Library;
 
 use crate::constants::RING_BUFFER_ELEMENTS;
+use crate::control_protocol::{ProcessingFunction, ProcessingSpec, WireFieldType};
 use crate::ring_buffer::RingBuffer;
 
 use super::THREADS_PER_BLOCK;
@@ -26,6 +27,38 @@ const CUDA_SUCCESS: CuResult = 0;
 const CUDA_ERROR_NOT_READY: CuResult = 600;
 const DMA_BUF_HANDLE_TYPE: u32 = 1;
 const GPU_DMA_PAGE_SIZE: usize = 2 * 1024 * 1024;
+const CUDA_PIPELINE_DEPTH: usize = 4;
+pub const MAX_PROCESS_FIELDS: usize = 32;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CudaProcessSpec {
+    pub function: u32,
+    pub field_index: u32,
+    pub field_count: u32,
+    pub field_types: [u32; MAX_PROCESS_FIELDS],
+}
+
+impl CudaProcessSpec {
+    pub fn from_protocol(spec: &ProcessingSpec) -> Result<Self> {
+        ensure!(spec.field_index < spec.fields.len() as u32, "processing field index is out of range");
+        ensure!(spec.fields.len() <= MAX_PROCESS_FIELDS, "processing schema has too many fields");
+        let function = match spec.function {
+            ProcessingFunction::Increment => 1,
+        };
+        let mut field_types = [0u32; MAX_PROCESS_FIELDS];
+        for (index, field) in spec.fields.iter().enumerate() {
+            field_types[index] = match field {
+                WireFieldType::Int32 => 1,
+                WireFieldType::Int64 => 2,
+                WireFieldType::DecimalBytes => 3,
+                WireFieldType::Bytes => 4,
+                WireFieldType::TimestampMillis => 5,
+            };
+        }
+        Ok(Self { function, field_index: spec.field_index, field_count: spec.fields.len() as u32, field_types })
+    }
+}
 
 type CuInit = unsafe extern "C" fn(u32) -> CuResult;
 type CuDeviceGet = unsafe extern "C" fn(*mut CuDevice, i32) -> CuResult;
@@ -368,13 +401,12 @@ pub struct CudaRuntime {
 }
 
 impl CudaRuntime {
-    pub fn create(device: u32, kernel_path: &Path, pipeline_depth: usize) -> Result<Self> {
-        ensure!(pipeline_depth > 0, "CUDA pipeline depth must be greater than zero");
+    pub fn create(device: u32, kernel_path: &Path) -> Result<Self> {
         let context = CudaContext::create(device)?;
         let input = CudaBuffer::allocate(&context)?;
         let output = CudaBuffer::allocate(&context)?;
         let kernel = CudaKernel::load(&context, kernel_path)?;
-        let lanes = (0..pipeline_depth)
+        let lanes = (0..CUDA_PIPELINE_DEPTH)
             .map(|_| CudaLane::create(&context))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
@@ -416,7 +448,7 @@ impl CudaRuntime {
         self.lanes.len()
     }
 
-    pub fn submit(&mut self, input_tail: u64, output_head: u64, count: u32) -> Result<CudaBatch> {
+    pub fn submit(&mut self, input_tail: u64, output_head: u64, count: u32, spec: CudaProcessSpec) -> Result<CudaBatch> {
         ensure!(count > 0, "CUDA batch must not be empty");
         self.context.make_current()?;
 
@@ -429,12 +461,14 @@ impl CudaRuntime {
         let mut input_tail_arg = input_tail;
         let mut output_head_arg = output_head;
         let mut count_arg = count;
+        let mut spec_arg = spec;
         let mut arguments = [
             (&mut input as *mut u64).cast(),
             (&mut output as *mut u64).cast(),
             (&mut input_tail_arg as *mut u64).cast(),
             (&mut output_head_arg as *mut u64).cast(),
             (&mut count_arg as *mut u32).cast(),
+            (&mut spec_arg as *mut CudaProcessSpec).cast(),
         ];
         self.context.api.check(
             unsafe {

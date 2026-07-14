@@ -10,6 +10,52 @@ pub struct RowF32 {
     pub value: Option<f32>,
 }
 
+/// Benchmark row matching the external row wire layout with one INT32 field:
+/// op(i32 BE), row_id(i64 BE), null bitmap, value(i32 BE).
+pub fn encode_row_i32_payload(op: i32, row_id: i64, value: i32, out: &mut Vec<u8>) {
+    out.clear();
+    out.extend_from_slice(&op.to_be_bytes());
+    out.extend_from_slice(&row_id.to_be_bytes());
+    out.push(0);
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+/// Appends a Flink `DECIMAL_UNSCALED_BYTES` value:
+/// `[int32_be byte_length][minimal two's-complement big-endian bytes]`.
+///
+/// DECIMAL(23, 3) uses this representation. In particular, zero is encoded
+/// as one byte (`00`), never as a zero-length value.
+pub fn append_decimal_unscaled_bytes(unscaled: i128, out: &mut Vec<u8>) {
+    let bytes = unscaled.to_be_bytes();
+    let negative = unscaled < 0;
+    let mut first = 0;
+    while first < bytes.len() - 1 {
+        let current = bytes[first];
+        let next = bytes[first + 1];
+        let redundant_positive = !negative && current == 0 && next & 0x80 == 0;
+        let redundant_negative = negative && current == 0xff && next & 0x80 != 0;
+        if redundant_positive || redundant_negative {
+            first += 1;
+        } else {
+            break;
+        }
+    }
+    let encoded = &bytes[first..];
+    out.extend_from_slice(&(encoded.len() as i32).to_be_bytes());
+    out.extend_from_slice(encoded);
+}
+
+pub fn decode_row_i32_payload(payload: &[u8]) -> Result<(i32, i64, i32)> {
+    if payload.len() < 17 {
+        bail!("truncated INT32 row payload");
+    }
+    let op = i32::from_be_bytes(payload[0..4].try_into()?);
+    let row_id = i64::from_be_bytes(payload[4..12].try_into()?);
+    anyhow::ensure!(payload[12] & 1 == 0, "benchmark INT32 field is null");
+    let value = i32::from_be_bytes(payload[13..17].try_into()?);
+    Ok((op, row_id, value))
+}
+
 pub fn write_i32_be_stream<W: Write>(w: &mut W, v: i32) -> Result<()> {
     w.write_all(&v.to_be_bytes()).context("write i32 be")
 }
@@ -100,4 +146,30 @@ pub fn decode_row_f32_payload(payload: &[u8]) -> Result<RowF32> {
     };
 
     Ok(RowF32 { op, row_id, value })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::append_decimal_unscaled_bytes;
+
+    #[test]
+    fn decimal_zero_has_one_zero_byte() {
+        let mut encoded = Vec::new();
+        append_decimal_unscaled_bytes(0, &mut encoded);
+        assert_eq!(encoded, [0, 0, 0, 1, 0]);
+    }
+
+    #[test]
+    fn decimal_12345_matches_flink_bytes() {
+        let mut encoded = Vec::new();
+        append_decimal_unscaled_bytes(12_345, &mut encoded);
+        assert_eq!(encoded, [0, 0, 0, 2, 0x30, 0x39]);
+    }
+
+    #[test]
+    fn decimal_negative_matches_flink_bytes() {
+        let mut encoded = Vec::new();
+        append_decimal_unscaled_bytes(-12_345, &mut encoded);
+        assert_eq!(encoded, [0, 0, 0, 2, 0xcf, 0xc7]);
+    }
 }

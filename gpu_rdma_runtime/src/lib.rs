@@ -4,6 +4,8 @@ pub mod constants;
 pub mod control_helpers;
 pub mod control_protocol;
 pub mod gpu_runtime;
+#[cfg(feature = "jni")]
+pub mod jni_bridge;
 pub mod rdma;
 pub mod ring_buffer;
 pub mod wire_codec;

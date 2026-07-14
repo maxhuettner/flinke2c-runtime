@@ -1,13 +1,15 @@
 # GPU RDMA Runtime
 
-The server and test client exchange slots through an RC queue pair. TCP is used
-only to exchange QP, memory-region, GID, and path-MTU metadata.
+The server exchanges slots through two RC queue pairs: a pre client publishes
+input to the GPU and a post client receives GPU output. TCP exchanges the
+client role plus QP, memory-region, GID, and path-MTU metadata and waits for
+both roles to complete bootstrap before connecting either QP.
 
 ## Data path
 
 1. Rust allocates two GPU-resident ring buffers through the CUDA Driver API.
 2. Rust exports and registers them with `ibv_reg_dmabuf_mr`.
-3. The client publishes a contiguous input batch with one RDMA
+3. The pre client publishes a contiguous input batch with one RDMA
    Write-with-Immediate. Ring wrap requires one preceding plain write.
 4. The server drains available CQ notifications, establishes GPUDirect memory
    ordering once for the group, and launches batches onto independent CUDA streams.
@@ -15,7 +17,7 @@ only to exchange QP, memory-region, GID, and path-MTU metadata.
 6. CUDA events retire batches in input order while later batches execute concurrently.
 7. The server publishes each ordered output batch directly from the GPU ring with
    RDMA Write-with-Immediate, again using one preceding write only at ring wrap.
-8. The client receive CQE publishes the batch to its local consumer in order.
+8. The post client receive CQE publishes the batch to its local consumer in order.
 
 The GPU-node CPU only orchestrates complete batches; tuple data never stages in
 host memory. Standard `libibverbs` still requires the CPU to launch CUDA work
@@ -23,9 +25,11 @@ and post output work requests.
 
 The immediate value carries the batch count. Each peer maintains its monotonic
 ring position locally, so producer-head metadata does not cross the network.
-The benchmark client runs input production/QP posting and output CQ polling in
-separate threads. The producer exclusively owns the QP; the consumer returns
-credits and receive-WR replenishment requests once per completed batch group.
+The pre and post clients each own one QP. The pre client only produces and the
+post client only consumes. Both directions use credit-based flow control: the
+GPU returns input credits after a batch has been retired, and the post client
+returns output credits after it consumes a batch. The default ring capacity is
+65536 slots; clients block only when their corresponding ring is full.
 
 ## Structure
 
@@ -57,21 +61,38 @@ cargo build --release --bins
 CMake writes `cuda/process_function.ptx`. Rebuilding this file is sufficient
 after changing `process_one`; no C++ host executable is involved.
 
+## Flink JNI client
+
+The Flink integration uses the optional `jni` feature. It keeps one
+role-specific QP and CQ,
+registered rings, and the TCP bootstrap in Rust while exposing only batch
+operations to Java:
+
+```bash
+cargo build --release --features jni
+```
+
+The resulting `libgpu_rdma_runtime` native library must be installed where the
+Flink TaskManager can load it. Java loads it with
+`System.loadLibrary("gpu_rdma_runtime")`. The native client sends either `pre`
+or `post` in the length-prefixed JSON bootstrap. Use
+`RustRdmaRingBuffer.Factory.PRE` for the input operator and
+`RustRdmaRingBuffer.Factory.POST` for the output operator. No RDMA-CM
+connection is used on this path.
+
 ## Run
 
 On the GPU server (GPU1 is closest to `mlx5_0` in the example topology):
 
 ```bash
 target/release/rdma_gpu_server \
-  --kernel cuda/process_function.ptx \
+  --port 50001 \
   --ib-device mlx5_0 \
   --ib-port 1 \
   --gid-index 3 \
   --cuda-device 1 \
-  --port 50001 \
   --warmup-iterations 10000 \
-  --batch-size 16 \
-  --pipeline-depth 4 \
+  --batch-size 64 \
   --profile-stages \
   --iterations 1000000
 ```
@@ -80,19 +101,45 @@ On the peer:
 
 ```bash
 target/release/rdma_test_client \
+  --role pre \
   --server 192.168.1.17:50001 \
   --ib-device mlx5_0 \
   --ib-port 1 \
   --gid-index 3 \
   --warmup-iterations 10000 \
   --iterations 1000000 \
-  --in-flight 256 \
-  --batch-size 16 \
-  --size 2048
+  --batch-size 64 \
+  --size 2048 \
+  --pre-generate-inputs \
+  --skip-validation \
+  --throughput-only
+
+target/release/rdma_test_client \
+  --role post \
+  --server 192.168.1.17:50001 \
+  --ib-device mlx5_0 \
+  --ib-port 1 \
+  --gid-index 3 \
+  --warmup-iterations 10000 \
+  --iterations 1000000 \
+  --batch-size 64 \
+  --size 2048 \
+  --skip-validation \
+  --throughput-only
 ```
 
 The bootstrap negotiates the lower active RDMA MTU. Both peers must still use
 compatible RoCE GIDs, normally the same RoCE version and IP-family entry.
+
+The server can also run without `--iterations`. In that mode it processes
+input until PRE closes its session and sends the input-done message; POST then
+drains the final output batch and can close normally:
+
+```bash
+target/release/rdma_gpu_server --port 50001 \
+  --ib-device mlx5_1 --ib-port 1 --gid-index 3 --cuda-device 0 \
+  --warmup-iterations 0 --batch-size 64 --profile-stages
+```
 
 The client reports actual per-request p50/p95/p99/p99.9 round-trip latency and
 application goodput. Use the same warm-up and measured iteration counts on both
@@ -115,11 +162,10 @@ Add `--profile-stages` to the client only for diagnosis. It reports batch-level
 producer preparation/post/credit times and consumer CQ/processing/feedback times.
 
 `--batch-size` controls how many tuples share one RDMA notification and CUDA
-launch. `--pipeline-depth` controls how many server-side CUDA batches can overlap.
-The client `--in-flight` window must contain at least two batches to expose useful
-pipeline parallelism; a good starting point is
-`in-flight >= batch-size * pipeline-depth`. The scheduler never waits for all
-pipeline lanes to fill, so smaller client windows remain valid.
+launch. The server uses a fixed four-lane CUDA pipeline. The client `--in-flight`
+window must contain at least two batches to expose useful pipeline parallelism;
+`in-flight >= batch-size * 4` is a good starting point. The scheduler never waits
+for all pipeline lanes to fill, so smaller client windows remain valid.
 
 For the built-in byte map, edit only `process_one` in `cuda/process_map.cuh` and
 rebuild the PTX. The stable kernel distributes tuple bytes across the block.

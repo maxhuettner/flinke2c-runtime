@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::constants::RING_BUFFER_ELEMENTS;
+use crate::constants::{RECEIVE_WR_DEPTH, RING_BUFFER_ELEMENTS};
 use crate::{
     control_protocol::{MemoryRegionInfo, RdmaDestination},
     ring_buffer::{slot::Slot, RingBuffer},
@@ -90,7 +90,7 @@ impl RdmaEndpoint {
 
         let mut qp = builder
             .setup_max_inline_data(128)
-            .setup_max_recv_wr(RING_BUFFER_ELEMENTS as u32)
+            .setup_max_recv_wr(RECEIVE_WR_DEPTH as u32)
             .setup_max_send_wr(1024)
             .setup_send_cq(GenericCompletionQueue::from(Arc::clone(&send_cq)))
             .setup_recv_cq(GenericCompletionQueue::from(Arc::clone(&receive_cq)))
@@ -102,7 +102,7 @@ impl RdmaEndpoint {
             .setup_port(ib_port)
             .setup_access_flags(AccessFlags::RemoteWrite | AccessFlags::RemoteRead);
         qp.modify(&attr)?;
-        post_receive_notifications(&mut qp, RING_BUFFER_ELEMENTS)?;
+        post_receive_notifications(&mut qp, RECEIVE_WR_DEPTH)?;
 
         Ok(RdmaEndpoint {
             ctx: context,
@@ -211,6 +211,14 @@ impl RdmaEndpoint {
 }
 
 impl RdmaSender {
+    pub fn available_send_slots(&self) -> u64 {
+        self.send_rb.available_write_slots()
+    }
+
+    pub fn posted_slots(&self) -> u64 {
+        self.posted_slots
+    }
+
     pub fn preload_send_ring(&mut self, value: Slot) {
         self.send_rb.fill_slots(value);
     }
@@ -321,10 +329,8 @@ impl RdmaSender {
             count as u64 <= self.posted_slots,
             "received credits for more slots than are outstanding"
         );
-        for _ in 0..count {
-            self.posted_slots -= 1;
-            self.send_rb.advance_tail();
-        }
+        self.posted_slots -= count as u64;
+        self.send_rb.advance_tail_by(count as u64)?;
         Ok(())
     }
 

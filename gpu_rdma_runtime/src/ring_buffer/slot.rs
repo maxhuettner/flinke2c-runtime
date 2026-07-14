@@ -6,15 +6,17 @@ use crate::control_protocol::MAX_ITEM_SIZE;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Slot {
     pub len: u32,
+    pub timestamp_ns: u64,
     pub value: [u8; MAX_ITEM_SIZE],
 }
 
-const _: [(); size_of::<u32>() + MAX_ITEM_SIZE] = [(); size_of::<Slot>()];
+const _: [(); 16 + MAX_ITEM_SIZE] = [(); size_of::<Slot>()];
 
 impl Default for Slot {
     fn default() -> Self {
         Slot {
             len: 0,
+            timestamp_ns: 0,
             value: [0; MAX_ITEM_SIZE],
         }
     }

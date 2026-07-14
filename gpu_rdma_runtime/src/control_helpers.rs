@@ -8,6 +8,16 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use sideway::ibverbs::device_context::Mtu;
 
+pub fn mtu_value(mtu: Mtu) -> u32 {
+    match mtu {
+        Mtu::Mtu256 => 256,
+        Mtu::Mtu512 => 512,
+        Mtu::Mtu1024 => 1024,
+        Mtu::Mtu2048 => 2048,
+        Mtu::Mtu4096 => 4096,
+    }
+}
+
 pub fn send_json<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
     let len = bytes.len() as u32;

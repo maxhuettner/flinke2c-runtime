@@ -17,11 +17,11 @@ use sideway::ibverbs::{
     AccessFlags,
 };
 
-use crate::constants::RING_BUFFER_ELEMENTS;
+use crate::constants::{RECEIVE_WR_DEPTH, RING_BUFFER_ELEMENTS};
 use crate::control_protocol::{MemoryRegionInfo, RdmaDestination};
 use crate::ring_buffer::{slot::Slot, RingBuffer};
 
-use super::cuda::{CudaBatch, CudaRuntime};
+use super::cuda::{CudaBatch, CudaProcessSpec, CudaRuntime};
 use super::memory_region::DmaBufMemoryRegion;
 
 type RuntimeRing = RingBuffer<RING_BUFFER_ELEMENTS>;
@@ -29,7 +29,8 @@ const OUTPUT_SIGNAL_INTERVAL: usize = 32;
 
 pub struct GpuRdmaEndpoint {
     pub ctx: Arc<DeviceContext>,
-    pub qp: ExtendedQueuePair,
+    pub input_qp: ExtendedQueuePair,
+    pub output_qp: ExtendedQueuePair,
     send_cq: Arc<ExtendedCompletionQueue>,
     receive_cq: Arc<ExtendedCompletionQueue>,
     input_mr: DmaBufMemoryRegion,
@@ -47,9 +48,8 @@ impl GpuRdmaEndpoint {
         ib_port: u8,
         cuda_device: u32,
         kernel_path: &std::path::Path,
-        pipeline_depth: usize,
     ) -> Result<Self> {
-        let cuda = CudaRuntime::create(cuda_device, kernel_path, pipeline_depth)?;
+        let cuda = CudaRuntime::create(cuda_device, kernel_path)?;
         let device_list = DeviceList::new().context("get RDMA device list")?;
         let device = match ib_device {
             Some(name) => device_list
@@ -82,27 +82,44 @@ impl GpuRdmaEndpoint {
             .create_cq_builder()
             .build_ex()
             .context("create receive completion queue")?;
-        let mut qp = pd
+        let mut input_qp = pd
             .create_qp_builder()
             .setup_max_inline_data(128)
-            .setup_max_recv_wr(RING_BUFFER_ELEMENTS as u32)
+            .setup_max_recv_wr(RECEIVE_WR_DEPTH as u32)
             .setup_max_send_wr(1024)
             .setup_send_cq(GenericCompletionQueue::from(Arc::clone(&send_cq)))
             .setup_recv_cq(GenericCompletionQueue::from(Arc::clone(&receive_cq)))
             .build_ex()
             .context("create RDMA queue pair")?;
 
+        let mut output_qp = pd
+            .create_qp_builder()
+            .setup_max_inline_data(128)
+            .setup_max_recv_wr(1)
+            .setup_max_send_wr(1024)
+            .setup_send_cq(GenericCompletionQueue::from(Arc::clone(&send_cq)))
+            .setup_recv_cq(GenericCompletionQueue::from(Arc::clone(&receive_cq)))
+            .build_ex()
+            .context("create RDMA output queue pair")?;
+
         let mut attr = QueuePairAttribute::new();
         attr.setup_state(QueuePairState::Init)
             .setup_pkey_index(0)
             .setup_port(ib_port)
             .setup_access_flags(AccessFlags::RemoteWrite | AccessFlags::RemoteRead);
-        qp.modify(&attr).context("move QP to INIT")?;
-        post_receive_notifications(&mut qp, RING_BUFFER_ELEMENTS)?;
+        input_qp.modify(&attr).context("move input QP to INIT")?;
+        post_receive_notifications(&mut input_qp, RECEIVE_WR_DEPTH)?;
+        let mut attr = QueuePairAttribute::new();
+        attr.setup_state(QueuePairState::Init)
+            .setup_pkey_index(0)
+            .setup_port(ib_port)
+            .setup_access_flags(AccessFlags::RemoteWrite | AccessFlags::RemoteRead);
+        output_qp.modify(&attr).context("move output QP to INIT")?;
 
         Ok(Self {
             ctx,
-            qp,
+            input_qp,
+            output_qp,
             send_cq,
             receive_cq,
             input_mr,
@@ -115,7 +132,7 @@ impl GpuRdmaEndpoint {
         })
     }
 
-    pub fn connect(
+    pub fn connect_input(
         &mut self,
         remote: &RdmaDestination,
         ib_port: u8,
@@ -140,7 +157,7 @@ impl GpuRdmaEndpoint {
             .setup_max_dest_read_atomic(1)
             .setup_min_rnr_timer(0)
             .setup_address_vector(&address);
-        self.qp.modify(&attr).context("move QP to RTR")?;
+        self.input_qp.modify(&attr).context("move input QP to RTR")?;
 
         let mut attr = QueuePairAttribute::new();
         attr.setup_state(QueuePairState::ReadyToSend)
@@ -149,7 +166,18 @@ impl GpuRdmaEndpoint {
             .setup_retry_cnt(7)
             .setup_rnr_retry(7)
             .setup_max_read_atomic(1);
-        self.qp.modify(&attr).context("move QP to RTS")
+        self.input_qp.modify(&attr).context("move input QP to RTS")
+    }
+
+    pub fn connect_output(
+        &mut self,
+        remote: &RdmaDestination,
+        ib_port: u8,
+        packet_seq_num: u32,
+        mtu: Mtu,
+        gid_index: u8,
+    ) -> Result<()> {
+        connect_qp(&mut self.output_qp, remote, ib_port, packet_seq_num, mtu, gid_index)
     }
 
     pub fn input_region_info(&self) -> MemoryRegionInfo {
@@ -160,12 +188,20 @@ impl GpuRdmaEndpoint {
         }
     }
 
+    pub fn output_region_info(&self) -> MemoryRegionInfo {
+        MemoryRegionInfo {
+            addr: self.cuda.output().pointer(),
+            rkey: self.output_mr.rkey(),
+            size: self.cuda.output().allocation_size() as u32,
+        }
+    }
+
     pub fn pipeline_depth(&self) -> usize {
         self.cuda.pipeline_depth()
     }
 
-    pub fn submit_process(&mut self, input_tail: u64, output_head: u64, count: u32) -> Result<CudaBatch> {
-        self.cuda.submit(input_tail, output_head, count)
+    pub fn submit_process(&mut self, input_tail: u64, output_head: u64, count: u32, spec: CudaProcessSpec) -> Result<CudaBatch> {
+        self.cuda.submit(input_tail, output_head, count, spec)
     }
 
     pub fn process_complete(&self, batch: CudaBatch) -> Result<bool> {
@@ -205,7 +241,7 @@ impl GpuRdmaEndpoint {
         }
         let count = u32::from_be(immediate);
         ensure!(count > 0, "RDMA input notification contains an empty batch");
-        post_receive_notifications(&mut self.qp, 1)?;
+        post_receive_notifications(&mut self.input_qp, 1)?;
         Ok(Some(count))
     }
 
@@ -237,7 +273,7 @@ impl GpuRdmaEndpoint {
         let local_base = self.cuda.output().pointer();
         let mask = RING_BUFFER_ELEMENTS as u64 - 1;
         let lkey = self.output_mr.lkey();
-        let mut guard = self.qp.start_post_send();
+        let mut guard = self.output_qp.start_post_send();
 
         let first_index = (output_head & mask) as usize;
         let first_count = (count as usize).min(RING_BUFFER_ELEMENTS - first_index);
@@ -312,6 +348,41 @@ impl GpuRdmaEndpoint {
         }
         Ok(completions.len())
     }
+}
+
+fn connect_qp(
+    qp: &mut ExtendedQueuePair,
+    remote: &RdmaDestination,
+    ib_port: u8,
+    packet_seq_num: u32,
+    mtu: Mtu,
+    gid_index: u8,
+) -> Result<()> {
+    let mut address = AddressHandleAttribute::new();
+    address
+        .setup_dest_lid(0)
+        .setup_port(ib_port)
+        .setup_service_level(0)
+        .setup_grh_src_gid_index(gid_index)
+        .setup_grh_dest_gid(&remote.gid)
+        .setup_grh_hop_limit(1);
+    let mut attr = QueuePairAttribute::new();
+    attr.setup_state(QueuePairState::ReadyToReceive)
+        .setup_path_mtu(mtu)
+        .setup_dest_qp_num(remote.qp_number)
+        .setup_rq_psn(remote.packet_seq_num)
+        .setup_max_dest_read_atomic(1)
+        .setup_min_rnr_timer(0)
+        .setup_address_vector(&address);
+    qp.modify(&attr).context("move QP to RTR")?;
+    let mut attr = QueuePairAttribute::new();
+    attr.setup_state(QueuePairState::ReadyToSend)
+        .setup_sq_psn(packet_seq_num)
+        .setup_timeout(12)
+        .setup_retry_cnt(7)
+        .setup_rnr_retry(7)
+        .setup_max_read_atomic(1);
+    qp.modify(&attr).context("move QP to RTS")
 }
 
 fn post_receive_notifications(qp: &mut ExtendedQueuePair, count: usize) -> Result<()> {

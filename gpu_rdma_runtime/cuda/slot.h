@@ -5,15 +5,16 @@
 #include <cstddef>
 
 constexpr uint32_t MAX_ITEM_SIZE = 2048;
-constexpr uint32_t RING_BUFFER_ELEMENTS = 1024;
+constexpr uint32_t RING_BUFFER_ELEMENTS = 65536;
 constexpr uint32_t BATCH_SIZE = 16;
 
 struct Slot {
     uint32_t len;
+    uint64_t timestamp_ns;
     uint8_t value[MAX_ITEM_SIZE];
 };
 
-static_assert(sizeof(Slot) == sizeof(uint32_t) + MAX_ITEM_SIZE, "Slot layout must match Rust");
+static_assert(sizeof(Slot) == 16 + MAX_ITEM_SIZE, "Slot layout must match Rust");
 
 struct RingBuffer {
     uint64_t producer_head;

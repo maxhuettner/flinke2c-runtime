@@ -3,8 +3,6 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 
-use crate::constants::RING_BUFFER_ELEMENTS;
-
 use super::server::{self, ServerConfig};
 
 #[derive(Debug, Parser)]
@@ -21,14 +19,12 @@ struct Args {
     ib_port: u8,
     #[arg(long, short = 'g', default_value_t = 0)]
     gid_index: u8,
-    #[arg(long, default_value_t = RING_BUFFER_ELEMENTS as u64 - 1)]
-    iterations: u64,
+    #[arg(long)]
+    iterations: Option<u64>,
     #[arg(long, default_value_t = 0)]
     warmup_iterations: u64,
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 64)]
     batch_size: usize,
-    #[arg(long, default_value_t = 4)]
-    pipeline_depth: usize,
     #[arg(long)]
     profile_stages: bool,
     #[arg(long, default_value_t = 0)]
@@ -45,7 +41,6 @@ pub fn run() -> Result<()> {
         iterations: args.iterations,
         warmup_iterations: args.warmup_iterations,
         batch_size: args.batch_size,
-        pipeline_depth: args.pipeline_depth,
         profile_stages: args.profile_stages,
         cuda_device: args.cuda_device,
         kernel_path: &args.kernel,

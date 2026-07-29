@@ -142,7 +142,7 @@ pub extern "system" fn Java_org_apache_flink_table_runtime_functions_table_exter
     match result {
         Ok(handle) => handle,
         Err(error) => {
-            fail(&mut env, error);
+            fail(&mut env, format!("{error:#}"));
             0
         }
     }

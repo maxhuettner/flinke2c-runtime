@@ -53,10 +53,15 @@ returns output credits after it consumes a batch. The default ring capacity is
 From `gpu_rdma_runtime`:
 
 ```bash
-cmake --fresh -S cuda -B cuda/build -DCMAKE_BUILD_TYPE=Release
+# Use `rm -rf cuda/build` first only when replacing an incompatible old
+# configuration; `cmake --fresh` is unavailable on older CMake versions.
+cmake -S cuda -B cuda/build -DCMAKE_BUILD_TYPE=Release
 cmake --build cuda/build -j
 cargo build --release --bins
 ```
+
+The CUDA project requires CMake 3.22 or newer. If configure reports a lower
+version, upgrade CMake before building the PTX.
 
 CMake writes `cuda/process_function.ptx`. Rebuilding this file is sufficient
 after changing `process_one`; no C++ host executable is involved.
@@ -171,3 +176,29 @@ For the built-in byte map, edit only `process_one` in `cuda/process_map.cuh` and
 rebuild the PTX. The stable kernel distributes tuple bytes across the block.
 Use `--profile-stages` only for diagnosis; its per-stage clocks add overhead and
 the reported stages overlap, so their averages are not additive.
+
+## GPU price imputation
+
+The processing kernel also supports the stateful KNN price imputer used by
+`org.example.flinke2c.ImputationFunction`. Select it in both RDMA Flink
+operators with:
+
+```text
+rdmaProcessingSpec={"function":"IMPUTE","field_index":0,"fields":["DECIMAL_BYTES","INT64","INT64","BYTES","BYTES","TIMESTAMP_MILLIS","BYTES"]}
+```
+
+The seven fields must be ordered as `price DECIMAL(23,3)`, `auction BIGINT`,
+`bidder BIGINT`, `channel STRING`, `url STRING`, `dateTime TIMESTAMP(3)`, and
+`extra STRING`. Null non-price fields are replaced with the same defaults as
+the Java UDF. A null price uses inverse-distance-weighted KNN with `K=10`, the
+newest 512 observations, and a 5,000-observation GPU ring. Only real prices
+enter history.
+
+Rows in a batch are logically processed in input order. The GPU evaluates
+missing rows in parallel, but each row includes earlier real prices from its
+batch. CUDA event dependencies order history commits between pipeline lanes,
+so batching and the multi-stream pipeline do not change neighbor selection.
+Like the Java UDF, this state is session-local and is not checkpointed.
+Distance and weighting use GPU `double`; an imputed value exactly on a decimal
+halfway boundary can round differently from `BigDecimal.valueOf(...).setScale`
+by one unit in the last (`0.001`) place.

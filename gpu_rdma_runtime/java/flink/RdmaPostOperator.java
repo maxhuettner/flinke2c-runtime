@@ -35,7 +35,6 @@ import java.util.List;
 /** POST: consumes completed RDMA output slots in CQ publication order. */
 @Internal
 public final class RdmaPostOperator extends RdmaOperator {
-
     private static final long serialVersionUID = 1L;
 
     private transient ArrayDeque<byte[]> completedSlots;

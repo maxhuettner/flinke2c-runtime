@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.28)
+cmake_minimum_required(VERSION 3.22)
 project(flinke2c_gpu_kernels LANGUAGES CUDA)
 
 set(FLINKE2C_CUDA_ARCHITECTURE "compute_80" CACHE STRING

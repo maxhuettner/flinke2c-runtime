@@ -40,10 +40,33 @@ pub struct CudaProcessSpec {
 
 impl CudaProcessSpec {
     pub fn from_protocol(spec: &ProcessingSpec) -> Result<Self> {
-        ensure!(spec.field_index < spec.fields.len() as u32, "processing field index is out of range");
-        ensure!(spec.fields.len() <= MAX_PROCESS_FIELDS, "processing schema has too many fields");
+        ensure!(
+            spec.field_index < spec.fields.len() as u32,
+            "processing field index is out of range"
+        );
+        ensure!(
+            spec.fields.len() <= MAX_PROCESS_FIELDS,
+            "processing schema has too many fields"
+        );
         let function = match spec.function {
             ProcessingFunction::Increment => 1,
+            ProcessingFunction::Impute => {
+                const IMPUTATION_SCHEMA: [WireFieldType; 7] = [
+                    WireFieldType::DecimalBytes,
+                    WireFieldType::Int64,
+                    WireFieldType::Int64,
+                    WireFieldType::Bytes,
+                    WireFieldType::Bytes,
+                    WireFieldType::TimestampMillis,
+                    WireFieldType::Bytes,
+                ];
+                ensure!(
+                    spec.field_index == 0 && spec.fields.as_slice() == IMPUTATION_SCHEMA.as_slice(),
+                    "IMPUTE requires field_index 0 and fields \
+                     [DECIMAL_BYTES, INT64, INT64, BYTES, BYTES, TIMESTAMP_MILLIS, BYTES]"
+                );
+                2
+            }
         };
         let mut field_types = [0u32; MAX_PROCESS_FIELDS];
         for (index, field) in spec.fields.iter().enumerate() {
@@ -55,7 +78,12 @@ impl CudaProcessSpec {
                 WireFieldType::TimestampMillis => 5,
             };
         }
-        Ok(Self { function, field_index: spec.field_index, field_count: spec.fields.len() as u32, field_types })
+        Ok(Self {
+            function,
+            field_index: spec.field_index,
+            field_count: spec.fields.len() as u32,
+            field_types,
+        })
     }
 }
 
@@ -73,6 +101,7 @@ type CuModuleUnload = unsafe extern "C" fn(CuModule) -> CuResult;
 type CuModuleGetFunction = unsafe extern "C" fn(*mut CuFunction, CuModule, *const c_char) -> CuResult;
 type CuStreamCreate = unsafe extern "C" fn(*mut CuStream, u32) -> CuResult;
 type CuStreamDestroy = unsafe extern "C" fn(CuStream) -> CuResult;
+type CuStreamWaitEvent = unsafe extern "C" fn(CuStream, CuEvent, u32) -> CuResult;
 type CuEventCreate = unsafe extern "C" fn(*mut CuEvent, u32) -> CuResult;
 type CuEventDestroy = unsafe extern "C" fn(CuEvent) -> CuResult;
 type CuEventRecord = unsafe extern "C" fn(CuEvent, CuStream) -> CuResult;
@@ -110,6 +139,7 @@ struct CudaApi {
     module_get_function: CuModuleGetFunction,
     stream_create: CuStreamCreate,
     stream_destroy: CuStreamDestroy,
+    stream_wait_event: CuStreamWaitEvent,
     event_create: CuEventCreate,
     event_destroy: CuEventDestroy,
     event_record: CuEventRecord,
@@ -139,6 +169,7 @@ impl CudaApi {
                 module_get_function: load_symbol(&library, b"cuModuleGetFunction\0")?,
                 stream_create: load_symbol(&library, b"cuStreamCreate\0")?,
                 stream_destroy: load_symbol(&library, b"cuStreamDestroy_v2\0")?,
+                stream_wait_event: load_symbol(&library, b"cuStreamWaitEvent\0")?,
                 event_create: load_symbol(&library, b"cuEventCreate\0")?,
                 event_destroy: load_symbol(&library, b"cuEventDestroy_v2\0")?,
                 event_record: load_symbol(&library, b"cuEventRecord\0")?,
@@ -302,6 +333,7 @@ struct CudaKernel {
     api: Arc<CudaApi>,
     module: CuModule,
     process_slots: CuFunction,
+    commit_imputation_history: CuFunction,
     publish_output_head: CuFunction,
 }
 
@@ -324,17 +356,31 @@ impl CudaKernel {
             )?;
             let mut publish_output_head = ptr::null_mut();
             context.api.check(
-                unsafe { (context.api.module_get_function)(&mut publish_output_head, module, c"publish_output_head".as_ptr()) },
+                unsafe {
+                    (context.api.module_get_function)(&mut publish_output_head, module, c"publish_output_head".as_ptr())
+                },
                 "resolve publish_output_head kernel",
             )?;
-            Ok((process_slots, publish_output_head))
+            let mut commit_imputation_history = ptr::null_mut();
+            context.api.check(
+                unsafe {
+                    (context.api.module_get_function)(
+                        &mut commit_imputation_history,
+                        module,
+                        c"commit_imputation_history".as_ptr(),
+                    )
+                },
+                "resolve commit_imputation_history kernel",
+            )?;
+            Ok((process_slots, commit_imputation_history, publish_output_head))
         })();
 
         match result {
-            Ok((process_slots, publish_output_head)) => Ok(Self {
+            Ok((process_slots, commit_imputation_history, publish_output_head)) => Ok(Self {
                 api: Arc::clone(&context.api),
                 module,
                 process_slots,
+                commit_imputation_history,
                 publish_output_head,
             }),
             Err(error) => {
@@ -403,12 +449,16 @@ pub struct CudaRuntime {
     input: CudaBuffer,
     output: CudaBuffer,
     next_lane: usize,
+    last_imputation_lane: Option<usize>,
     context: CudaContext,
 }
 
 impl CudaRuntime {
     pub fn create(device: u32, pipeline_depth: usize, kernel_path: &Path) -> Result<Self> {
-        ensure!((1..=64).contains(&pipeline_depth), "CUDA pipeline depth must be in 1..=64");
+        ensure!(
+            (1..=64).contains(&pipeline_depth),
+            "CUDA pipeline depth must be in 1..=64"
+        );
         let context = CudaContext::create(device)?;
         let input = CudaBuffer::allocate(&context)?;
         let output = CudaBuffer::allocate(&context)?;
@@ -424,6 +474,7 @@ impl CudaRuntime {
             input,
             output,
             next_lane: 0,
+            last_imputation_lane: None,
             context,
         })
     }
@@ -457,13 +508,29 @@ impl CudaRuntime {
         self.lanes.len()
     }
 
-    pub fn submit(&mut self, input_tail: u64, output_head: u64, count: u32, spec: CudaProcessSpec) -> Result<CudaBatch> {
+    pub fn submit(
+        &mut self,
+        input_tail: u64,
+        output_head: u64,
+        count: u32,
+        spec: CudaProcessSpec,
+    ) -> Result<CudaBatch> {
         ensure!(count > 0, "CUDA batch must not be empty");
         self.context.make_current()?;
 
         let lane_index = self.next_lane;
         self.next_lane = (self.next_lane + 1) % self.lanes.len();
         let lane = &self.lanes[lane_index];
+
+        if spec.function == 2 {
+            if let Some(previous_lane) = self.last_imputation_lane {
+                self.context.api.check(
+                    unsafe { (self.context.api.stream_wait_event)(lane.stream, self.lanes[previous_lane].event, 0) },
+                    "order stateful imputation batches",
+                )?;
+            }
+            self.last_imputation_lane = Some(lane_index);
+        }
 
         let mut input = self.input.pointer;
         let mut output = self.output.pointer;
@@ -497,6 +564,32 @@ impl CudaRuntime {
             },
             "launch process_slots",
         )?;
+        if spec.function == 2 {
+            let mut history_arguments = [
+                (&mut input as *mut u64).cast(),
+                (&mut input_tail_arg as *mut u64).cast(),
+                (&mut count_arg as *mut u32).cast(),
+                (&mut spec_arg as *mut CudaProcessSpec).cast(),
+            ];
+            self.context.api.check(
+                unsafe {
+                    (self.context.api.launch_kernel)(
+                        self.kernel.commit_imputation_history,
+                        1,
+                        1,
+                        1,
+                        1,
+                        1,
+                        1,
+                        0,
+                        lane.stream,
+                        history_arguments.as_mut_ptr(),
+                        ptr::null_mut(),
+                    )
+                },
+                "launch commit_imputation_history",
+            )?;
+        }
         self.context.api.check(
             unsafe { (self.context.api.event_record)(lane.event, lane.stream) },
             "record CUDA batch completion",
@@ -525,4 +618,45 @@ impl CudaRuntime {
 
 fn round_up(value: usize, alignment: usize) -> usize {
     value.div_ceil(alignment) * alignment
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn imputation_spec() -> ProcessingSpec {
+        ProcessingSpec {
+            function: ProcessingFunction::Impute,
+            field_index: 0,
+            fields: vec![
+                WireFieldType::DecimalBytes,
+                WireFieldType::Int64,
+                WireFieldType::Int64,
+                WireFieldType::Bytes,
+                WireFieldType::Bytes,
+                WireFieldType::TimestampMillis,
+                WireFieldType::Bytes,
+            ],
+        }
+    }
+
+    #[test]
+    fn accepts_imputation_schema() {
+        let spec = CudaProcessSpec::from_protocol(&imputation_spec()).unwrap();
+        assert_eq!(spec.function, 2);
+        assert_eq!(spec.field_index, 0);
+        assert_eq!(spec.field_count, 7);
+        assert_eq!(&spec.field_types[..7], &[3, 2, 2, 4, 4, 5, 4]);
+    }
+
+    #[test]
+    fn rejects_imputation_schema_with_wrong_price_type() {
+        let mut spec = imputation_spec();
+        spec.fields[0] = WireFieldType::Int64;
+        let error = match CudaProcessSpec::from_protocol(&spec) {
+            Ok(_) => panic!("invalid imputation schema was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("IMPUTE requires"));
+    }
 }

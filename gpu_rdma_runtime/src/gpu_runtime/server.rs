@@ -38,13 +38,30 @@ pub fn run(config: ServerConfig<'_>) -> Result<()> {
         (1..RING_BUFFER_ELEMENTS).contains(&config.batch_size),
         "--batch-size must be in 1..{RING_BUFFER_ELEMENTS}"
     );
-    let mut endpoint =
-        GpuRdmaEndpoint::build(config.ib_device, config.ib_port, config.cuda_device, config.cuda_pipeline_depth, config.kernel_path)?;
-    let active_mtu = endpoint.ctx.query_port(config.ib_port)?.active_mtu();
-    let gid = endpoint.ctx.query_gid(config.ib_port, config.gid_index.into())?;
     let listener = TcpListener::bind(("0.0.0.0", config.port))
         .with_context(|| format!("listen on TCP port {}", config.port))?;
     println!("waiting for pre and post clients on port {}", config.port);
+    loop {
+        if let Err(error) = run_cycle(&config, &listener) {
+            eprintln!("cycle failed: {error:#}; waiting for next client pair");
+            // Avoid a tight retry loop when the GPU/driver is temporarily
+            // unavailable. Client/session errors are still retried so the
+            // long-lived server can accept the next pair.
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+}
+
+fn run_cycle(config: &ServerConfig<'_>, listener: &TcpListener) -> Result<()> {
+    let mut endpoint = GpuRdmaEndpoint::build(
+        config.ib_device,
+        config.ib_port,
+        config.cuda_device,
+        config.cuda_pipeline_depth,
+        config.kernel_path,
+    )?;
+    let active_mtu = endpoint.ctx.query_port(config.ib_port)?.active_mtu();
+    let gid = endpoint.ctx.query_gid(config.ib_port, config.gid_index.into())?;
     let (first_stream, first_peer, first_hello) = accept_role(&listener)?;
     println!("received first client role {:?} from {first_peer}", first_hello.role);
     let (second_stream, second_peer, second_hello) = accept_role(&listener)?;
@@ -136,6 +153,7 @@ pub fn run(config: ServerConfig<'_>) -> Result<()> {
         timings.processed as f64 / elapsed.as_secs_f64()
     );
     timings.print();
+    println!("cycle complete; waiting for next pre/post client pair");
     Ok(())
 }
 

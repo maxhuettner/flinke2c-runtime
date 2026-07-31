@@ -66,6 +66,9 @@ version, upgrade CMake before building the PTX.
 CMake writes `cuda/process_function.ptx`. Rebuilding this file is sufficient
 after changing `process_one`; no C++ host executable is involved.
 
+CMake also builds `cuda/build/libflinke2c_imputation_gpu.so`, the JNI library
+used by the direct-call imputation UDF described below.
+
 ## Flink JNI client
 
 The Flink integration uses the optional `jni` feature. It keeps one
@@ -202,3 +205,48 @@ Like the Java UDF, this state is session-local and is not checkpointed.
 Distance and weighting use GPU `double`; an imputed value exactly on a decimal
 halfway boundary can round differently from `BigDecimal.valueOf(...).setScale`
 by one unit in the last (`0.001`) place.
+
+## Direct CUDA price imputation
+
+`org.example.flinke2c.ImputationFunctionGpu` implements the same scalar UDF
+interface but directly invokes the standalone kernel in
+`cuda/direct_imputation_jni.cu`. It does not use the RDMA runtime. Each
+`eval` call sends one compact observation through JNI, launches one CUDA
+kernel, waits for it, and returns the result. It is intentionally synchronous:
+the measured difference therefore includes the per-row JNI, PCIe, kernel
+launch, and synchronization costs that the batched RDMA path avoids.
+
+Build both CUDA artifacts as above, build the Flink UDF JAR from `flinke2c`,
+and make the shared library visible to every TaskManager:
+
+```bash
+cmake -S cuda -B cuda/build -DCMAKE_BUILD_TYPE=Release
+cmake --build cuda/build -j
+cd ../flinke2c
+mvn package
+
+# TaskManager JVM option (the path must be absolute):
+-Dflinke2c.imputation.gpu.library=/path/to/gpu_rdma_runtime/cuda/build/libflinke2c_imputation_gpu.so
+```
+
+The CUDA JNI target requires JDK headers. If CMake cannot find `jni.h`, set
+`JAVA_HOME` to the JDK root before configuring:
+
+```bash
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+test -f "$JAVA_HOME/include/jni.h"
+```
+
+Alternatively, add `cuda/build` to the TaskManager's
+`java.library.path`; the UDF then loads `flinke2c_imputation_gpu` by name.
+The visible CUDA device defaults to zero. Select another device with
+`-Dflinke2c.imputation.gpu.device=N` or by constructing the UDF with a device
+index in Java.
+
+Register `ImputationFunctionGpu` in the same way as
+`ImputationFunction`. Its input and output types are identical. The direct
+UDF keeps a 5,000-observation GPU history per UDF instance; like the CPU and
+RDMA versions, it is not checkpointed. Only real prices enter history. For a
+result and performance comparison, run each implementation with fresh state,
+the same input order and parallelism, and preferably parallelism one because
+the imputer uses global rather than keyed history.

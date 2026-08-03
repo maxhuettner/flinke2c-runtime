@@ -210,11 +210,12 @@ by one unit in the last (`0.001`) place.
 
 `org.example.flinke2c.ImputationFunctionGpu` implements the same scalar UDF
 interface but directly invokes the standalone kernel in
-`cuda/direct_imputation_jni.cu`. It does not use the RDMA runtime. Each
-`eval` call sends one compact observation through JNI, launches one CUDA
-kernel, waits for it, and returns the result. It is intentionally synchronous:
-the measured difference therefore includes the per-row JNI, PCIe, kernel
-launch, and synchronization costs that the batched RDMA path avoids.
+`cuda/direct_imputation_jni.cu`. It does not use the RDMA runtime. It is a
+Flink `AsyncScalarFunction`: calls are held in FIFO order and submitted through
+one JNI call and one host-to-device copy per batch. One CUDA kernel computes
+the batch in parallel, and a second commits observed prices in source order
+after the batch has read the old history, matching the RDMA implementation's
+state boundary.
 
 Build both CUDA artifacts as above, build the Flink UDF JAR from `flinke2c`,
 and make the shared library visible to every TaskManager:
@@ -241,7 +242,41 @@ Alternatively, add `cuda/build` to the TaskManager's
 `java.library.path`; the UDF then loads `flinke2c_imputation_gpu` by name.
 The visible CUDA device defaults to zero. Select another device with
 `-Dflinke2c.imputation.gpu.device=N` or by constructing the UDF with a device
-index in Java.
+index in Java. Direct CUDA batches default to 64 rows with a 1 ms maximum wait
+for a partial batch. Configure them on the TaskManager with:
+
+```text
+-Dflinke2c.imputation.gpu.batch-size=64
+-Dflinke2c.imputation.gpu.batch-delay-micros=1000
+```
+
+Flink must allow at least that many async calls to remain outstanding or the
+batch cannot fill. For a batch size of 64, use at least:
+
+```sql
+SET 'table.exec.async-scalar.max-concurrent-operations' = '128';
+SET 'table.exec.async-scalar.retry-strategy' = 'NO_RETRY';
+```
+
+The function is stateful, so retrying an individual async invocation could
+insert the same observed price twice. Keep retries disabled and let Flink's
+normal job-level recovery restart the non-checkpointed history.
+
+Flink 2.2's async scalar code generator normally completes the result with
+`null` without invoking the UDF when any argument is null. Price imputation
+requires receiving a null `price`, so apply the included planner patch to the
+Flink source tree and rebuild the Flink distribution:
+
+```bash
+cd /path/to/flink
+git apply /path/to/gpu_rdma_runtime/flink-patches/async-scalar-null-arguments.patch
+```
+
+The patch forwards nullable boxed arguments to `AsyncScalarFunction.eval`,
+matching normal scalar-function invocation. The imputation function already
+normalizes null values before placing a row in the CUDA batch. This changes
+null-input handling for every async scalar UDF in that Flink distribution, so
+keep the patch local to the experimental build.
 
 Register `ImputationFunctionGpu` in the same way as
 `ImputationFunction`. Its input and output types are identical. The direct

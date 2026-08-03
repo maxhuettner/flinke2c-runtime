@@ -2,6 +2,7 @@
 #include <jni.h>
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <new>
 #include <string>
@@ -30,6 +31,29 @@ struct Input {
     uint32_t has_price;
 };
 
+static_assert(sizeof(Observation) == 40, "Java/native Observation layout changed");
+static_assert(sizeof(Input) == 48, "Java/native Input layout changed");
+static_assert(
+    offsetof(Input, observation) + offsetof(Observation, price) == 0,
+    "price offset changed");
+static_assert(
+    offsetof(Input, observation) + offsetof(Observation, bidder) == 8,
+    "bidder offset changed");
+static_assert(
+    offsetof(Input, observation) +
+        offsetof(Observation, timestamp_seconds) == 16,
+    "timestamp offset changed");
+static_assert(
+    offsetof(Input, observation) + offsetof(Observation, channel_hash) == 24,
+    "channel hash offset changed");
+static_assert(
+    offsetof(Input, observation) + offsetof(Observation, url_hash) == 28,
+    "URL hash offset changed");
+static_assert(
+    offsetof(Input, observation) + offsetof(Observation, extra_hash) == 32,
+    "extra hash offset changed");
+static_assert(offsetof(Input, has_price) == 40, "has-price offset changed");
+
 struct DeviceState {
     Observation history[HISTORY_SIZE];
     uint32_t start;
@@ -38,6 +62,7 @@ struct DeviceState {
 
 struct Context {
     int device = 0;
+    uint32_t capacity = 0;
     cudaStream_t stream = nullptr;
     DeviceState* state = nullptr;
     Input* device_input = nullptr;
@@ -111,39 +136,59 @@ __device__ double distance(
     return result;
 }
 
+__device__ void consider_neighbor(
+    const Observation& target, const Observation& candidate,
+    double* best_distance, double* best_price, uint32_t& found) {
+    const double candidate_distance = distance(target, candidate);
+    if (found < K) {
+        best_distance[found] = candidate_distance;
+        best_price[found] = candidate.price;
+        ++found;
+        return;
+    }
+
+    uint32_t worst_index = 0;
+    double worst = best_distance[0];
+    for (uint32_t j = 1; j < K; ++j) {
+        if (best_distance[j] > worst) {
+            worst = best_distance[j];
+            worst_index = j;
+        }
+    }
+    if (candidate_distance < worst) {
+        best_distance[worst_index] = candidate_distance;
+        best_price[worst_index] = candidate.price;
+    }
+}
+
 __device__ double impute(
-    const DeviceState& state, const Observation& target) {
+    const DeviceState& state, const Input* batch, uint32_t item) {
+    const Observation& target = batch[item].observation;
     double best_distance[K];
     double best_price[K];
     uint32_t found = 0;
-    const uint32_t search_count =
-        state.size < SEARCH_LIMIT ? state.size : SEARCH_LIMIT;
+    uint32_t remaining = SEARCH_LIMIT;
 
-    // Traverse newest-first, like BoundedRing.snapshotLast in the Java UDF.
-    for (uint32_t i = 0; i < search_count; ++i) {
+    // Earlier observed rows from this batch are logically newer than the
+    // committed history and must be considered newest-first.
+    for (uint32_t prior = item; prior > 0 && remaining > 0; --prior) {
+        const Input& candidate = batch[prior - 1];
+        if (candidate.has_price != 0) {
+            consider_neighbor(
+                target, candidate.observation,
+                best_distance, best_price, found);
+            --remaining;
+        }
+    }
+
+    const uint32_t history_count =
+        state.size < remaining ? state.size : remaining;
+    for (uint32_t i = 0; i < history_count; ++i) {
         const uint32_t index =
             (state.start + state.size - 1 - i) % HISTORY_SIZE;
-        const Observation& candidate = state.history[index];
-        const double candidate_distance = distance(target, candidate);
-        if (found < K) {
-            best_distance[found] = candidate_distance;
-            best_price[found] = candidate.price;
-            ++found;
-            continue;
-        }
-
-        uint32_t worst_index = 0;
-        double worst = best_distance[0];
-        for (uint32_t j = 1; j < K; ++j) {
-            if (best_distance[j] > worst) {
-                worst = best_distance[j];
-                worst_index = j;
-            }
-        }
-        if (candidate_distance < worst) {
-            best_distance[worst_index] = candidate_distance;
-            best_price[worst_index] = candidate.price;
-        }
+        consider_neighbor(
+            target, state.history[index],
+            best_distance, best_price, found);
     }
 
     if (found == 0) {
@@ -173,28 +218,54 @@ __device__ void add_observation(
     state.history[index] = observation;
 }
 
-__global__ void direct_imputation_kernel(
-    DeviceState* state, const Input* input, double* output) {
+// One block per tuple matches the RDMA imputation kernel's batch-level
+// parallelism. KNN work remains on thread zero so neighbor selection and
+// floating-point accumulation retain the Java UDF's deterministic order.
+__global__ void direct_imputation_batch_kernel(
+    const DeviceState* state, const Input* input, double* output,
+    uint32_t count) {
+    const uint32_t item = blockIdx.x;
+    if (item >= count || threadIdx.x != 0) {
+        return;
+    }
+    output[item] = input[item].has_price != 0
+        ? input[item].observation.price
+        : impute(*state, input, item);
+}
+
+// Commit only after every output in the batch has read the old history.
+// Source-order commits form the state boundary used by the RDMA path.
+__global__ void commit_batch_history(
+    DeviceState* state, const Input* input, uint32_t count) {
     if (blockIdx.x != 0 || threadIdx.x != 0) {
         return;
     }
-    if (input->has_price != 0) {
-        add_observation(*state, input->observation);
-        *output = input->observation.price;
-    } else {
-        *output = impute(*state, input->observation);
+    for (uint32_t item = 0; item < count; ++item) {
+        if (input[item].has_price != 0) {
+            add_observation(*state, input[item].observation);
+        }
     }
+}
+
+Context* require_context(JNIEnv* env, jlong handle) {
+    Context* context = reinterpret_cast<Context*>(handle);
+    if (context == nullptr) {
+        throw_java(
+            env, "java/lang/IllegalStateException",
+            "Direct CUDA imputation context is closed");
+    }
+    return context;
 }
 
 }  // namespace
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_org_example_flinke2c_ImputationGpuNative_create(
-    JNIEnv* env, jclass, jint cuda_device) {
-    if (cuda_device < 0) {
+    JNIEnv* env, jclass, jint cuda_device, jint batch_capacity) {
+    if (cuda_device < 0 || batch_capacity <= 0) {
         throw_java(
             env, "java/lang/IllegalArgumentException",
-            "CUDA device index must be non-negative");
+            "CUDA device must be non-negative and batch capacity must be positive");
         return 0;
     }
 
@@ -206,6 +277,9 @@ Java_org_example_flinke2c_ImputationGpuNative_create(
         return 0;
     }
     context->device = cuda_device;
+    context->capacity = static_cast<uint32_t>(batch_capacity);
+    const size_t input_bytes = sizeof(Input) * context->capacity;
+    const size_t output_bytes = sizeof(double) * context->capacity;
 
     if (!cuda_ok(env, cudaSetDevice(context->device), "cudaSetDevice") ||
         !cuda_ok(
@@ -222,26 +296,26 @@ Java_org_example_flinke2c_ImputationGpuNative_create(
             env,
             cudaMalloc(
                 reinterpret_cast<void**>(&context->device_input),
-                sizeof(Input)),
-            "cudaMalloc(Input)") ||
+                input_bytes),
+            "cudaMalloc(batch input)") ||
         !cuda_ok(
             env,
             cudaMalloc(
                 reinterpret_cast<void**>(&context->device_output),
-                sizeof(double)),
-            "cudaMalloc(output)") ||
+                output_bytes),
+            "cudaMalloc(batch output)") ||
         !cuda_ok(
             env,
             cudaHostAlloc(
                 reinterpret_cast<void**>(&context->host_input),
-                sizeof(Input), cudaHostAllocPortable),
-            "cudaHostAlloc(Input)") ||
+                input_bytes, cudaHostAllocPortable),
+            "cudaHostAlloc(batch input)") ||
         !cuda_ok(
             env,
             cudaHostAlloc(
                 reinterpret_cast<void**>(&context->host_output),
-                sizeof(double), cudaHostAllocPortable),
-            "cudaHostAlloc(output)") ||
+                output_bytes, cudaHostAllocPortable),
+            "cudaHostAlloc(batch output)") ||
         !cuda_ok(
             env,
             cudaMemsetAsync(
@@ -257,57 +331,81 @@ Java_org_example_flinke2c_ImputationGpuNative_create(
     return reinterpret_cast<jlong>(context);
 }
 
-extern "C" JNIEXPORT jdouble JNICALL
-Java_org_example_flinke2c_ImputationGpuNative_process(
-    JNIEnv* env, jclass, jlong handle, jboolean has_price, jdouble price,
-    jlong bidder, jdouble timestamp_seconds, jint channel_hash, jint url_hash,
-    jint extra_hash) {
-    Context* context = reinterpret_cast<Context*>(handle);
+extern "C" JNIEXPORT jobject JNICALL
+Java_org_example_flinke2c_ImputationGpuNative_inputBuffer(
+    JNIEnv* env, jclass, jlong handle) {
+    Context* context = require_context(env, handle);
     if (context == nullptr) {
+        return nullptr;
+    }
+    return env->NewDirectByteBuffer(
+        context->host_input,
+        static_cast<jlong>(sizeof(Input) * context->capacity));
+}
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_org_example_flinke2c_ImputationGpuNative_outputBuffer(
+    JNIEnv* env, jclass, jlong handle) {
+    Context* context = require_context(env, handle);
+    if (context == nullptr) {
+        return nullptr;
+    }
+    return env->NewDirectByteBuffer(
+        context->host_output,
+        static_cast<jlong>(sizeof(double) * context->capacity));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_example_flinke2c_ImputationGpuNative_processBatch(
+    JNIEnv* env, jclass, jlong handle, jint count) {
+    Context* context = require_context(env, handle);
+    if (context == nullptr) {
+        return;
+    }
+    if (count <= 0 || static_cast<uint32_t>(count) > context->capacity) {
         throw_java(
-            env, "java/lang/IllegalStateException",
-            "Direct CUDA imputation context is closed");
-        return NAN;
+            env, "java/lang/IllegalArgumentException",
+            "CUDA imputation batch count is outside the configured capacity");
+        return;
     }
-
     if (!cuda_ok(env, cudaSetDevice(context->device), "cudaSetDevice")) {
-        return NAN;
+        return;
     }
 
-    context->host_input->observation.price = price;
-    context->host_input->observation.bidder = bidder;
-    context->host_input->observation.timestamp_seconds = timestamp_seconds;
-    context->host_input->observation.channel_hash =
-        static_cast<uint32_t>(channel_hash);
-    context->host_input->observation.url_hash =
-        static_cast<uint32_t>(url_hash);
-    context->host_input->observation.extra_hash =
-        static_cast<uint32_t>(extra_hash);
-    context->host_input->has_price = has_price == JNI_TRUE ? 1U : 0U;
-
+    const uint32_t batch_count = static_cast<uint32_t>(count);
+    const size_t input_bytes = sizeof(Input) * batch_count;
+    const size_t output_bytes = sizeof(double) * batch_count;
     if (!cuda_ok(
             env,
             cudaMemcpyAsync(
-                context->device_input, context->host_input, sizeof(Input),
+                context->device_input, context->host_input, input_bytes,
                 cudaMemcpyHostToDevice, context->stream),
-            "cudaMemcpyAsync(input)")) {
-        return NAN;
+            "cudaMemcpyAsync(batch input)")) {
+        return;
     }
-    direct_imputation_kernel<<<1, 1, 0, context->stream>>>(
-        context->state, context->device_input, context->device_output);
-    if (!cuda_ok(env, cudaGetLastError(), "direct_imputation_kernel launch") ||
+
+    direct_imputation_batch_kernel<<<batch_count, 1, 0, context->stream>>>(
+        context->state, context->device_input,
+        context->device_output, batch_count);
+    if (!cuda_ok(
+            env, cudaGetLastError(),
+            "direct_imputation_batch_kernel launch")) {
+        return;
+    }
+    commit_batch_history<<<1, 1, 0, context->stream>>>(
+        context->state, context->device_input, batch_count);
+    if (!cuda_ok(env, cudaGetLastError(), "commit_batch_history launch") ||
         !cuda_ok(
             env,
             cudaMemcpyAsync(
-                context->host_output, context->device_output, sizeof(double),
+                context->host_output, context->device_output, output_bytes,
                 cudaMemcpyDeviceToHost, context->stream),
-            "cudaMemcpyAsync(output)") ||
+            "cudaMemcpyAsync(batch output)") ||
         !cuda_ok(
             env, cudaStreamSynchronize(context->stream),
             "cudaStreamSynchronize")) {
-        return NAN;
+        return;
     }
-    return *context->host_output;
 }
 
 extern "C" JNIEXPORT void JNICALL

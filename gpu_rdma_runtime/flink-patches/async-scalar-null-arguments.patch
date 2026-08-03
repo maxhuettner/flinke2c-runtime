@@ -1,0 +1,21 @@
+diff --git a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/planner/codegen/calls/BridgingFunctionGenUtil.scala b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/planner/codegen/calls/BridgingFunctionGenUtil.scala
+--- a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/planner/codegen/calls/BridgingFunctionGenUtil.scala
++++ b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/planner/codegen/calls/BridgingFunctionGenUtil.scala
+@@ -263,14 +263,10 @@ object BridgingFunctionGenUtil {
+     val converterTerm = ctx.addReusableConverter(outputDataType)
+     val functionCallCode =
+       s"""
+          |${externalOperands.map(_.code).mkString("\n")}
+-         |if (${externalOperands.map(_.nullTerm).mkString(" || ")}) {
+-         |  $DEFAULT_DELEGATING_FUTURE_TERM.createAsyncFuture($converterTerm).complete(null);
+-         |} else {
+-         |  $functionTerm.eval(
+-         |    $DEFAULT_DELEGATING_FUTURE_TERM.createAsyncFuture($converterTerm),
+-         |    ${externalOperands.map(_.resultTerm).mkString(", ")});
+-         |}
++         |$functionTerm.eval(
++         |  $DEFAULT_DELEGATING_FUTURE_TERM.createAsyncFuture($converterTerm),
++         |  ${externalOperands.map(_.resultTerm).mkString(", ")});
+          |""".stripMargin
+ 
+     GeneratedExpression(NO_CODE, NEVER_NULL, functionCallCode, outputType)

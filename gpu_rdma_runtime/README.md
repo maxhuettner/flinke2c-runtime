@@ -68,6 +68,8 @@ after changing `process_one`; no C++ host executable is involved.
 
 CMake also builds `cuda/build/libflinke2c_imputation_gpu.so`, the JNI library
 used by the direct-call imputation UDF described below.
+CMake also builds `cuda/build/libflinke2c_currency_conversion_gpu.so`, the JNI
+library used by the batched direct-call currency conversion UDF.
 
 ## Flink JNI client
 
@@ -285,3 +287,37 @@ RDMA versions, it is not checkpointed. Only real prices enter history. For a
 result and performance comparison, run each implementation with fresh state,
 the same input order and parallelism, and preferably parallelism one because
 the imputer uses global rather than keyed history.
+
+## Direct CUDA currency conversion
+
+`org.example.flinke2c.CurrencyConversionFunctionGpu` is a stateless,
+batched `AsyncScalarFunction` equivalent to
+`CurrencyConversionFunction`. It sends one batch of prices through JNI,
+multiplies non-null values by `0.908` in the CUDA kernel, and completes each
+future in input order. Null prices remain null. The GPU result is rounded to
+`DECIMAL(23,3)` in Java, matching the declared SQL result type.
+
+The CUDA build above produces the library. Make it visible to every
+TaskManager and configure the direct UDF with:
+
+```text
+-Dflinke2c.currency.gpu.library=/path/to/gpu_rdma_runtime/cuda/build/libflinke2c_currency_conversion_gpu.so
+-Dflinke2c.currency.gpu.device=0
+-Dflinke2c.currency.gpu.batch-size=64
+-Dflinke2c.currency.gpu.batch-delay-micros=1000
+```
+
+Register `CurrencyConversionFunctionGpu` in place of
+`CurrencyConversionFunction`. The async operator should have enough
+outstanding calls to fill a batch:
+
+```sql
+SET 'table.exec.async-scalar.max-concurrent-operations' = '128';
+SET 'table.exec.async-scalar.retry-strategy' = 'NO_RETRY';
+```
+
+The currency function is stateless, so retries do not duplicate history, but
+disabling retries keeps comparisons with the other GPU paths deterministic.
+The imputation-specific planner patch is not required for null currency
+inputs when normal SQL null propagation is desired; Flink can complete those
+rows as null without invoking the function.

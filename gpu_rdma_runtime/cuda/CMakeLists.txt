@@ -74,3 +74,18 @@ set_target_properties(
         CUDA_STANDARD_REQUIRED ON
         POSITION_INDEPENDENT_CODE ON
 )
+
+add_library(flinke2c_currency_conversion_gpu SHARED direct_currency_conversion_jni.cu)
+target_include_directories(
+        flinke2c_currency_conversion_gpu
+        PRIVATE
+        "${FLINKE2C_JNI_INCLUDE_DIR}"
+        "${FLINKE2C_JNI_PLATFORM_INCLUDE_DIR}")
+set_target_properties(
+        flinke2c_currency_conversion_gpu
+        PROPERTIES
+        CUDA_ARCHITECTURES "${FLINKE2C_DIRECT_CUDA_ARCHITECTURE}"
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON
+        POSITION_INDEPENDENT_CODE ON
+)

@@ -23,7 +23,7 @@ public final class RdmaPostSmokeTest {
         int rows = args.length > 5 ? Integer.parseInt(args[5]) : 128;
 
         long handle = RustRdmaNative.open(host, port, device, ibPort, gidIndex, "post",
-                "{\"function\":\"INCREMENT\",\"field_index\":2,\"fields\":[\"INT64\",\"INT64\",\"DECIMAL_BYTES\",\"TIMESTAMP_MILLIS\",\"BYTES\",\"INT64\"]}");
+                "{\"function\":\"CURRENCY_CONVERSION\",\"field_index\":2,\"fields\":[\"INT64\",\"INT64\",\"DECIMAL_BYTES\",\"TIMESTAMP_MILLIS\",\"BYTES\",\"INT64\"]}");
         if (handle == 0) {
             throw new IOException("POST JNI open returned a null handle");
         }
@@ -60,7 +60,8 @@ public final class RdmaPostSmokeTest {
                     buffer.get(extra);
                     long latencyTs = buffer.getLong();
 
-                    long expectedUnscaled = (received == 0 ? 0 : 12_345L + received) + 1;
+                    long inputUnscaled = received == 0 ? 0 : 12_345L + received;
+                    long expectedUnscaled = (inputUnscaled * 908L + 500L) / 1_000L;
                     if (op != 0
                             || rowId != received
                             || nullBitmap != 0

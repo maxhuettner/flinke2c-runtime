@@ -329,16 +329,6 @@ fn process_slots(
 
         let mut first_ready = true;
         loop {
-            // In open-ended mode, retain the last ready batch until PRE either
-            // publishes another batch or announces completion. This ensures
-            // the final RDMA write can be posted with a completion request;
-            // the TCP done notification may arrive concurrently with the
-            // final RDMA input notification.
-            let input_complete = input_done
-                && expected_input_slots.map_or(true, |expected| submitted >= expected);
-            if iterations.is_none() && pending.len() == 1 && !input_complete {
-                break;
-            }
             let batch = pending.front().context("CUDA pipeline made no progress")?;
             if !first_ready
                 && !timed(profile_stages, &mut timings.cuda_wait, || {
@@ -347,9 +337,11 @@ fn process_slots(
             {
                 break;
             }
-            let input_complete = input_done
-                && expected_input_slots.map_or(true, |expected| submitted >= expected);
-            let phase_end = iterations.map_or(input_complete && pending.len() == 1, |limit| {
+            // An open-ended session cannot know which batch is final before
+            // PRE closes. Signal every such output batch so it can be
+            // published immediately without retaining it and deadlocking a
+            // blocking POST operator.
+            let phase_end = iterations.map_or(true, |limit| {
                 completed + u64::from(batch.count) == limit
             });
             while state.output_in_flight + batch.count as usize >= RING_BUFFER_ELEMENTS {

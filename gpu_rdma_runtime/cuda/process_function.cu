@@ -12,6 +12,13 @@ struct ProcessSpec {
 
 constexpr uint32_t FUNCTION_INCREMENT = 1;
 constexpr uint32_t FUNCTION_IMPUTE = 2;
+constexpr uint32_t FUNCTION_CURRENCY_CONVERSION = 3;
+
+constexpr uint32_t CURRENCY_NUMERATOR = 908;
+constexpr uint32_t CURRENCY_DENOMINATOR = 1000;
+// DECIMAL(23,3) needs at most ten bytes. Leave ample room while keeping the
+// per-thread local arrays bounded.
+constexpr uint32_t MAX_CURRENCY_DECIMAL_BYTES = 40;
 
 constexpr uint32_t IMPUTATION_HISTORY_SIZE = 5000;
 constexpr uint32_t IMPUTATION_SEARCH_LIMIT = 512;
@@ -113,6 +120,144 @@ __device__ void increment_decimal(uint8_t* row, uint32_t& row_len,
         ++row_len;
         put_be32(row + length_pos, n);
     }
+}
+
+// Multiplies a minimal big-endian two's-complement unscaled decimal integer
+// by 0.908 and rounds to the same scale with BigDecimal HALF_UP semantics.
+// Arithmetic is performed on the integer bytes so DECIMAL(23,3) does not lose
+// precision through a double conversion.
+__device__ uint32_t convert_currency_decimal(
+    const uint8_t* value, uint32_t length, uint8_t* output) {
+    if (length == 0 || length > MAX_CURRENCY_DECIMAL_BYTES) return 0;
+
+    const bool negative = (value[0] & 0x80u) != 0;
+    uint8_t magnitude[MAX_CURRENCY_DECIMAL_BYTES + 2];
+    uint32_t digits = length;
+    for (uint32_t i = 0; i < length; ++i) {
+        magnitude[i] = value[length - 1 - i];
+    }
+
+    if (negative) {
+        uint32_t carry = 1;
+        for (uint32_t i = 0; i < digits; ++i) {
+            const uint32_t converted =
+                uint32_t(uint8_t(~magnitude[i])) + carry;
+            magnitude[i] = uint8_t(converted);
+            carry = converted >> 8;
+        }
+    }
+    while (digits > 0 && magnitude[digits - 1] == 0) --digits;
+    if (digits == 0) {
+        output[0] = 0;
+        return 1;
+    }
+
+    uint32_t carry = 0;
+    for (uint32_t i = 0; i < digits; ++i) {
+        const uint32_t product =
+            uint32_t(magnitude[i]) * CURRENCY_NUMERATOR + carry;
+        magnitude[i] = uint8_t(product);
+        carry = product >> 8;
+    }
+    while (carry != 0) {
+        magnitude[digits++] = uint8_t(carry);
+        carry >>= 8;
+    }
+
+    uint32_t remainder = 0;
+    for (uint32_t i = digits; i > 0; --i) {
+        const uint32_t dividend =
+            remainder * 256u + uint32_t(magnitude[i - 1]);
+        magnitude[i - 1] = uint8_t(dividend / CURRENCY_DENOMINATOR);
+        remainder = dividend % CURRENCY_DENOMINATOR;
+    }
+    while (digits > 0 && magnitude[digits - 1] == 0) --digits;
+
+    // HALF_UP increments the magnitude on a tie, which rounds negative
+    // values away from zero just like BigDecimal.
+    if (remainder * 2u >= CURRENCY_DENOMINATOR) {
+        uint32_t index = 0;
+        uint32_t round_carry = 1;
+        while (round_carry != 0 && index < digits) {
+            const uint32_t rounded =
+                uint32_t(magnitude[index]) + round_carry;
+            magnitude[index] = uint8_t(rounded);
+            round_carry = rounded >> 8;
+            ++index;
+        }
+        if (round_carry != 0 || digits == 0) {
+            magnitude[digits++] = uint8_t(round_carry == 0 ? 1 : round_carry);
+        }
+    }
+    if (digits == 0) {
+        output[0] = 0;
+        return 1;
+    }
+
+    uint32_t width = digits;
+    if (!negative) {
+        if ((magnitude[digits - 1] & 0x80u) != 0) {
+            output[0] = 0;
+            ++width;
+        }
+        for (uint32_t i = 0; i < digits; ++i) {
+            output[width - 1 - i] = magnitude[i];
+        }
+        return width;
+    }
+
+    bool lower_nonzero = false;
+    for (uint32_t i = 0; i + 1 < digits; ++i) {
+        lower_nonzero |= magnitude[i] != 0;
+    }
+    const uint8_t top = magnitude[digits - 1];
+    if (top > 0x80u || (top == 0x80u && lower_nonzero)) ++width;
+    for (uint32_t i = 0; i < width; ++i) {
+        const uint8_t magnitude_byte =
+            i < digits ? magnitude[i] : uint8_t(0);
+        output[width - 1 - i] = uint8_t(~magnitude_byte);
+    }
+    for (uint32_t i = width; i > 0; --i) {
+        output[i - 1]++;
+        if (output[i - 1] != 0) break;
+    }
+    return width;
+}
+
+__device__ void convert_currency_decimal_field(
+    uint8_t* row, uint32_t& row_len,
+    uint32_t length_pos, uint32_t bytes_pos) {
+    if (length_pos > row_len || row_len - length_pos < 4 ||
+        bytes_pos > row_len) {
+        return;
+    }
+    const uint32_t old_length = be32(row + length_pos);
+    if (old_length == 0 || old_length > row_len - bytes_pos) return;
+
+    uint8_t converted[MAX_CURRENCY_DECIMAL_BYTES + 1];
+    const uint32_t new_length =
+        convert_currency_decimal(row + bytes_pos, old_length, converted);
+    if (new_length == 0) return;
+
+    const uint32_t old_end = bytes_pos + old_length;
+    if (new_length > old_length) {
+        const uint32_t growth = new_length - old_length;
+        if (growth > MAX_ITEM_SIZE - row_len) return;
+        for (uint32_t i = row_len; i > old_end; --i) {
+            row[i + growth - 1] = row[i - 1];
+        }
+        row_len += growth;
+    } else if (new_length < old_length) {
+        const uint32_t shrink = old_length - new_length;
+        for (uint32_t i = old_end; i < row_len; ++i) {
+            row[i - shrink] = row[i];
+        }
+        row_len -= shrink;
+    }
+    for (uint32_t i = 0; i < new_length; ++i) {
+        row[bytes_pos + i] = converted[i];
+    }
+    put_be32(row + length_pos, new_length);
 }
 
 __device__ __forceinline__ bool null_field(const uint8_t* bitmap, uint32_t field) {
@@ -498,7 +643,10 @@ __device__ void process_increment(Slot& destination, const ProcessSpec& spec) {
         const bool is_null =
             (destination.value[base + 12 + field / 8] >> (field % 8)) & 1;
         const uint32_t type = spec.field_types[field];
-        if (is_null) continue;
+        if (is_null) {
+            if (field == spec.field_index) return;
+            continue;
+        }
         if (field == spec.field_index) {
             if (type == 1 && position + 4 <= destination.len) {
                 increment_int32(destination.value + position);
@@ -509,6 +657,8 @@ __device__ void process_increment(Slot& destination, const ProcessSpec& spec) {
                     destination.value, destination.len,
                     position, position + 4);
             }
+            if (framed) put_be32(destination.value, destination.len - 4);
+            return;
         }
         if (type == 1) {
             position += 4;
@@ -520,7 +670,44 @@ __device__ void process_increment(Slot& destination, const ProcessSpec& spec) {
         }
         if (position > destination.len) return;
     }
-    if (framed) put_be32(destination.value, destination.len - 4);
+}
+
+__device__ void process_currency_conversion(
+    Slot& destination, const ProcessSpec& spec) {
+    const bool framed =
+        destination.len >= 4 &&
+        be32(destination.value) == destination.len - 4;
+    const uint32_t base = framed ? 4 : 0;
+    const uint32_t null_bytes = (spec.field_count + 7) / 8;
+    uint32_t position = base + 12 + null_bytes;
+    if (spec.field_count == 0 || position > destination.len) return;
+    for (uint32_t field = 0; field < spec.field_count; ++field) {
+        const bool is_null =
+            (destination.value[base + 12 + field / 8] >> (field % 8)) & 1;
+        const uint32_t type = spec.field_types[field];
+        if (is_null) {
+            if (field == spec.field_index) return;
+            continue;
+        }
+        if (field == spec.field_index) {
+            if (type == 3) {
+                convert_currency_decimal_field(
+                    destination.value, destination.len,
+                    position, position + 4);
+            }
+            if (framed) put_be32(destination.value, destination.len - 4);
+            return;
+        }
+        if (type == 1) {
+            position += 4;
+        } else if (type == 2 || type == 5) {
+            position += 8;
+        } else if (type == 3 || type == 4) {
+            if (position + 4 > destination.len) return;
+            position += 4 + be32(destination.value + position);
+        }
+        if (position > destination.len) return;
+    }
 }
 
 extern "C" __global__ void process_slots(
@@ -547,6 +734,10 @@ extern "C" __global__ void process_slots(
     destination.timestamp_ns = source.timestamp_ns;
     if (spec.function == FUNCTION_INCREMENT) {
         process_increment(destination, spec);
+        return;
+    }
+    if (spec.function == FUNCTION_CURRENCY_CONVERSION) {
+        process_currency_conversion(destination, spec);
         return;
     }
     if (spec.function != FUNCTION_IMPUTE) return;

@@ -41,6 +41,7 @@ pub struct ProcessingSpec {
 pub enum ProcessingFunction {
     Increment,
     Impute,
+    CurrencyConversion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

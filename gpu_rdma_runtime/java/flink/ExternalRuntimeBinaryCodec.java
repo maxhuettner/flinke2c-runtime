@@ -296,7 +296,11 @@ final class ExternalRuntimeBinaryCodec {
         }
         final int frameLen = readIntBE(frame, 0);
         if (frameLen < 0 || frameLen > DEFAULT_MAX_FRAME_SIZE || frameLen + 4 > frame.length) {
-            throw new IOException("Invalid frame length: " + frameLen);
+            throw new IOException(
+                    "Invalid frame length: "
+                            + frameLen
+                            + " for RDMA slot payload length "
+                            + frame.length);
         }
         return decodeFrame(frame, Integer.BYTES, frameLen, fallbackKind, reuseRow);
     }

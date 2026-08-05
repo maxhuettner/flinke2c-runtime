@@ -16,6 +16,9 @@ constexpr double EPS = 1e-6;
 constexpr double W_BIDDER = 0.25;
 constexpr double W_TIME = 1.0;
 constexpr double W_STRING = 0.25;
+// Imputation uses substantially more registers per tuple than currency
+// conversion, so use a smaller block while still filling every warp.
+constexpr uint32_t THREADS_PER_BLOCK = 128;
 
 struct Observation {
     double price;
@@ -218,14 +221,13 @@ __device__ void add_observation(
     state.history[index] = observation;
 }
 
-// One block per tuple matches the RDMA imputation kernel's batch-level
-// parallelism. KNN work remains on thread zero so neighbor selection and
-// floating-point accumulation retain the Java UDF's deterministic order.
+// One thread processes one tuple. Each thread retains the deterministic
+// newest-first neighbor scan and floating-point accumulation order.
 __global__ void direct_imputation_batch_kernel(
     const DeviceState* state, const Input* input, double* output,
     uint32_t count) {
-    const uint32_t item = blockIdx.x;
-    if (item >= count || threadIdx.x != 0) {
+    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+    if (item >= count) {
         return;
     }
     output[item] = input[item].has_price != 0
@@ -384,7 +386,10 @@ Java_org_example_flinke2c_ImputationGpuNative_processBatch(
         return;
     }
 
-    direct_imputation_batch_kernel<<<batch_count, 1, 0, context->stream>>>(
+    const uint32_t block_count =
+        (batch_count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    direct_imputation_batch_kernel
+        <<<block_count, THREADS_PER_BLOCK, 0, context->stream>>>(
         context->state, context->device_input,
         context->device_output, batch_count);
     if (!cuda_ok(

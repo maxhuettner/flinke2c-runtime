@@ -23,7 +23,7 @@ public final class RdmaPreSmokeTest {
         int rows = args.length > 5 ? Integer.parseInt(args[5]) : 128;
 
         long handle = RustRdmaNative.open(host, port, device, ibPort, gidIndex, "pre",
-                "{\"function\":\"INCREMENT\",\"field_index\":2,\"fields\":[\"INT64\",\"INT64\",\"DECIMAL_BYTES\",\"TIMESTAMP_MILLIS\",\"BYTES\",\"INT64\"]}");
+                "{\"function\":\"CURRENCY_CONVERSION\",\"field_index\":2,\"fields\":[\"INT64\",\"INT64\",\"DECIMAL_BYTES\",\"TIMESTAMP_MILLIS\",\"BYTES\",\"INT64\"]}");
         if (handle == 0) {
             throw new IOException("PRE JNI open returned a null handle");
         }

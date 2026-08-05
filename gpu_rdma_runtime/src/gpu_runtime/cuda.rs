@@ -67,6 +67,13 @@ impl CudaProcessSpec {
                 );
                 2
             }
+            ProcessingFunction::CurrencyConversion => {
+                ensure!(
+                    spec.fields[spec.field_index as usize] == WireFieldType::DecimalBytes,
+                    "CURRENCY_CONVERSION requires a DECIMAL_BYTES target field"
+                );
+                3
+            }
         };
         let mut field_types = [0u32; MAX_PROCESS_FIELDS];
         for (index, field) in spec.fields.iter().enumerate() {
@@ -640,6 +647,21 @@ mod tests {
         }
     }
 
+    fn currency_conversion_spec() -> ProcessingSpec {
+        ProcessingSpec {
+            function: ProcessingFunction::CurrencyConversion,
+            field_index: 2,
+            fields: vec![
+                WireFieldType::Int64,
+                WireFieldType::Int64,
+                WireFieldType::DecimalBytes,
+                WireFieldType::TimestampMillis,
+                WireFieldType::Bytes,
+                WireFieldType::Int64,
+            ],
+        }
+    }
+
     #[test]
     fn accepts_imputation_schema() {
         let spec = CudaProcessSpec::from_protocol(&imputation_spec()).unwrap();
@@ -658,5 +680,27 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("IMPUTE requires"));
+    }
+
+    #[test]
+    fn accepts_currency_conversion_decimal_target() {
+        let spec = CudaProcessSpec::from_protocol(&currency_conversion_spec()).unwrap();
+        assert_eq!(spec.function, 3);
+        assert_eq!(spec.field_index, 2);
+        assert_eq!(spec.field_count, 6);
+        assert_eq!(&spec.field_types[..6], &[2, 2, 3, 5, 4, 2]);
+    }
+
+    #[test]
+    fn rejects_currency_conversion_non_decimal_target() {
+        let mut spec = currency_conversion_spec();
+        spec.field_index = 1;
+        let error = match CudaProcessSpec::from_protocol(&spec) {
+            Ok(_) => panic!("non-decimal currency target was accepted"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("CURRENCY_CONVERSION requires a DECIMAL_BYTES target field"));
     }
 }

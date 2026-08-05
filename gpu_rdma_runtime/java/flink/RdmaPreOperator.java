@@ -20,6 +20,8 @@ package org.apache.flink.table.runtime.functions.table.externalruntime;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
+import org.apache.flink.streaming.api.watermark.Watermark;
+import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.logical.LogicalType;
@@ -27,6 +29,7 @@ import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.types.RowKind;
 
 import java.io.IOException;
+import java.util.ArrayDeque;
 
 /** PRE: encodes rows into RDMA ring slots, publishes batches, and emits placeholders. */
 @Internal
@@ -35,6 +38,7 @@ public final class RdmaPreOperator extends RdmaOperator implements BoundedOneInp
     private static final long serialVersionUID = 1L;
 
     private transient int pendingSlotCount;
+    private transient ArrayDeque<StreamRecord<RowData>> pendingElements;
     private transient long nextRowId;
 
     public RdmaPreOperator(String conf, RowType rowType) {
@@ -68,6 +72,7 @@ public final class RdmaPreOperator extends RdmaOperator implements BoundedOneInp
                         null,
                         false);
         this.pendingSlotCount = 0;
+        this.pendingElements = new ArrayDeque<>(rdmaConfig.batchSize);
         this.nextRowId = 0L;
         LOG.info(
                 "RdmaPreOperator opened {}:{} (batchSize={}, ringElements={}, maxItemSize={})",
@@ -90,10 +95,31 @@ public final class RdmaPreOperator extends RdmaOperator implements BoundedOneInp
         }
         writeInputSlot(slot);
         pendingSlotCount++;
+        return placeholder(inRow.getRowKind());
+    }
+
+    @Override
+    protected void processElementInternal(StreamRecord<RowData> element) throws Exception {
+        final RowData placeholder = processRow(element.getValue());
+        // Do not expose a placeholder to POST until its complete RDMA batch
+        // has been published. Otherwise POST can block waiting for output and
+        // backpressure PRE before PRE accumulates enough rows to publish.
+        pendingElements.addLast(element.copy(placeholder));
         if (pendingSlotCount == rdmaConfig.batchSize) {
             flushBatch();
         }
-        return placeholder(inRow.getRowKind());
+    }
+
+    @Override
+    public void processWatermark(Watermark mark) throws Exception {
+        flushBatch();
+        super.processWatermark(mark);
+    }
+
+    @Override
+    public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
+        flushBatch();
+        super.prepareSnapshotPreBarrier(checkpointId);
     }
 
     @Override
@@ -105,8 +131,22 @@ public final class RdmaPreOperator extends RdmaOperator implements BoundedOneInp
         if (pendingSlotCount == 0) {
             return;
         }
-        publishInputBatch(pendingSlotCount);
+        final int count = pendingSlotCount;
+        if (pendingElements.size() != count) {
+            throw new IOException(
+                    "RDMA PRE batch bookkeeping mismatch: "
+                            + count
+                            + " slots but "
+                            + pendingElements.size()
+                            + " placeholders");
+        }
+        // Publish first. output.collect() may synchronously enter a chained
+        // POST operator, which waits for this batch's RDMA response.
+        publishInputBatch(count);
         pendingSlotCount = 0;
+        while (!pendingElements.isEmpty()) {
+            output.collect(pendingElements.removeFirst());
+        }
     }
 
     private RowData placeholder(RowKind kind) {
@@ -156,6 +196,7 @@ public final class RdmaPreOperator extends RdmaOperator implements BoundedOneInp
             error = suppress(error, e);
         }
         pendingSlotCount = 0;
+        pendingElements = null;
         codec = null;
         if (error != null) {
             throw error;

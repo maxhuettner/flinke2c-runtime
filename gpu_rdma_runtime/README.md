@@ -182,6 +182,27 @@ rebuild the PTX. The stable kernel distributes tuple bytes across the block.
 Use `--profile-stages` only for diagnosis; its per-stage clocks add overhead and
 the reported stages overlap, so their averages are not additive.
 
+## GPU RDMA currency conversion
+
+The RDMA processing kernel supports the stateless currency conversion used by
+`org.example.flinke2c.CurrencyConversionFunction`. Select it in both RDMA Flink
+operators with:
+
+```text
+rdmaProcessingSpec={"function":"CURRENCY_CONVERSION","field_index":2,"fields":["INT64","INT64","DECIMAL_BYTES","TIMESTAMP_MILLIS","BYTES","INT64"]}
+```
+
+`field_index` may select any `DECIMAL_BYTES` field in the declared wire schema.
+The kernel multiplies the unscaled decimal integer by `908 / 1000` and rounds
+HALF_UP at the existing scale. The calculation uses integer byte arithmetic,
+so `DECIMAL(23,3)` values do not lose precision through a `double` conversion.
+Null target fields remain null.
+
+PRE publishes every complete or flushed partial RDMA batch before emitting its
+corresponding placeholders downstream. This ordering allows large batches even
+when PRE and POST are chained or the Flink network has less buffering than one
+batch. Watermarks and checkpoint barriers flush partial batches first.
+
 ## GPU price imputation
 
 The processing kernel also supports the stateful KNN price imputer used by

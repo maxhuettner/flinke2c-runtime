@@ -9,6 +9,7 @@
 namespace {
 
 constexpr double CONVERSION_FACTOR = 0.908;
+constexpr uint32_t THREADS_PER_BLOCK = 256;
 
 // Keep these layouts in sync with CurrencyConversionFunctionGpu.java.
 struct Input {
@@ -90,8 +91,8 @@ void release_context(Context* context) {
 
 __global__ void direct_currency_conversion_batch_kernel(
         const Input* input, Output* output, uint32_t count) {
-    const uint32_t item = blockIdx.x;
-    if (item >= count || threadIdx.x != 0) {
+    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+    if (item >= count) {
         return;
     }
     if (input[item].valid == 0) {
@@ -233,7 +234,10 @@ Java_org_example_flinke2c_CurrencyConversionGpuNative_processBatch(
         return;
     }
 
-    direct_currency_conversion_batch_kernel<<<batch_count, 1, 0, context->stream>>>(
+    const uint32_t block_count =
+            (batch_count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    direct_currency_conversion_batch_kernel
+            <<<block_count, THREADS_PER_BLOCK, 0, context->stream>>>(
             context->device_input,
             context->device_output,
             batch_count);

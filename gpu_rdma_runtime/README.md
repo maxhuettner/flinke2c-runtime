@@ -13,10 +13,14 @@ both roles to complete bootstrap before connecting either QP.
    Write-with-Immediate. Ring wrap requires one preceding plain write.
 4. The server drains available CQ notifications, establishes GPUDirect memory
    ordering once for the group, and launches batches onto independent CUDA streams.
-5. One CUDA block maps each slot, with its threads cooperating across the payload.
+5. Stateless increment/currency kernels modify input slots in place with one
+   packed CUDA thread per row. Imputation uses one warp per row and eight rows
+   per block to copy payloads coalescently into the separate output ring.
 6. CUDA events retire batches in input order while later batches execute concurrently.
-7. The server publishes each ordered output batch directly from the GPU ring with
-   RDMA Write-with-Immediate, again using one preceding write only at ring wrap.
+7. The server publishes each ordered output batch directly from its GPU ring
+   with RDMA Write-with-Immediate. Stateless output is sent from the input ring,
+   and its input credit is returned only after the RNIC finishes reading those
+   slots. Ring wrap may split a batch into multiple writes.
 8. The post client receive CQE publishes the batch to its local consumer in order.
 
 The GPU-node CPU only orchestrates complete batches; tuple data never stages in
@@ -33,8 +37,7 @@ returns output credits after it consumes a batch. The default ring capacity is
 
 ## Structure
 
-- `cuda/process_function.cu`: stable cooperative per-slot processing kernel.
-- `cuda/process_map.cuh`: replaceable per-element `process_one` implementation.
+- `cuda/process_function.cu`: in-place stateless and warp-per-row imputation kernels.
 - `cuda/slot.h`: CUDA data layout matching Rust.
 - `src/gpu_runtime/cuda.rs`: CUDA Driver API, PTX, and DMA-BUF ownership.
 - `src/gpu_runtime/endpoint.rs`: QP setup and ordered GPU-to-peer writes.
@@ -177,8 +180,6 @@ window must contain at least two batches to expose useful pipeline parallelism;
 `in-flight >= batch-size * 4` is a good starting point. The scheduler never waits
 for all pipeline lanes to fill, so smaller client windows remain valid.
 
-For the built-in byte map, edit only `process_one` in `cuda/process_map.cuh` and
-rebuild the PTX. The stable kernel distributes tuple bytes across the block.
 Use `--profile-stages` only for diagnosis; its per-stage clocks add overhead and
 the reported stages overlap, so their averages are not additive.
 
@@ -197,6 +198,17 @@ The kernel multiplies the unscaled decimal integer by `908 / 1000` and rounds
 HALF_UP at the existing scale. The calculation uses integer byte arithmetic,
 so `DECIMAL(23,3)` values do not lose precision through a `double` conversion.
 Null target fields remain null.
+
+Currency conversion and increment use one packed CUDA thread per row and modify
+their input slots in place. The output RDMA write reads the result directly from
+the input GPU ring, removing the full input-to-output GPU row copy. The server
+waits for that RDMA write's completion before returning the corresponding input
+credit, so PRE cannot overwrite a slot while the RNIC is still reading it.
+The RDMA transport still sends one fixed-size slot per row, so throughput can
+plateau once batching has amortized launch and notification overhead. Increasing
+the batch beyond that point does not reduce the bytes transferred; select the
+smallest batch at the measured throughput plateau, commonly 1024 for this
+workload.
 
 PRE publishes every complete or flushed partial RDMA batch before emitting its
 corresponding placeholders downstream. This ordering allows large batches even

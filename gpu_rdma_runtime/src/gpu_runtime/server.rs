@@ -172,6 +172,7 @@ struct ProcessingState {
 }
 
 struct PendingBatch {
+    input_tail: u64,
     output_head: u64,
     count: u32,
     cuda: CudaBatch,
@@ -295,12 +296,14 @@ fn process_slots(
             timed(profile_stages, &mut timings.submit, || {
                 for count in arrivals {
                     validate_batch(count, batch_size, iterations.map(|limit| limit - submitted))?;
+                    let input_tail = state.input_tail;
                     let output_head = state.output_head;
-                    let cuda = endpoint.submit_process(state.input_tail, output_head, count, processing)?;
+                    let cuda = endpoint.submit_process(input_tail, output_head, count, processing)?;
                     state.input_tail += u64::from(count);
                     state.output_head += u64::from(count);
                     submitted += u64::from(count);
                     pending.push_back(PendingBatch {
+                        input_tail,
                         output_head,
                         count,
                         cuda,
@@ -351,7 +354,14 @@ fn process_slots(
                 state.output_in_flight -= credit;
             }
             timed(profile_stages, &mut timings.output, || {
-                endpoint.write_output_batch(&remote.writable, batch.output_head, batch.count, phase_end)
+                endpoint.write_output_batch(
+                    &remote.writable,
+                    batch.input_tail,
+                    batch.output_head,
+                    batch.count,
+                    batch.cuda.output_location(),
+                    phase_end,
+                )
             })?;
             completed += u64::from(batch.count);
             state.output_in_flight += batch.count as usize;

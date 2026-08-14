@@ -710,11 +710,35 @@ __device__ void process_currency_conversion(
     }
 }
 
+// Stateless functions modify their input slots directly. With no row copy to
+// cooperate on, tightly pack one row per CUDA thread.
+extern "C" __global__ void process_slots_in_place(
+    RingBuffer* input, uint64_t input_tail, uint32_t count,
+    ProcessSpec spec) {
+    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+    if (item >= count) return;
+    const uint32_t input_index =
+        (input_tail + item) & (RING_BUFFER_ELEMENTS - 1);
+    Slot& row = input->slots[input_index];
+    row.len = row.len < MAX_ITEM_SIZE ? row.len : MAX_ITEM_SIZE;
+    if (spec.function == FUNCTION_INCREMENT) {
+        process_increment(row, spec);
+    } else if (spec.function == FUNCTION_CURRENCY_CONVERSION) {
+        process_currency_conversion(row, spec);
+    }
+}
+
+// Functions that materialize a separate output use one warp per row. Each warp
+// copies adjacent bytes with coalesced accesses, and a block handles eight rows.
 extern "C" __global__ void process_slots(
     const RingBuffer* input, RingBuffer* output,
     uint64_t input_tail, uint64_t output_head, uint32_t count,
     ProcessSpec spec) {
-    const uint32_t item = blockIdx.x;
+    constexpr uint32_t WARP_SIZE = 32;
+    const uint32_t lane = threadIdx.x & (WARP_SIZE - 1);
+    const uint32_t warp = threadIdx.x / WARP_SIZE;
+    const uint32_t warps_per_block = blockDim.x / WARP_SIZE;
+    const uint32_t item = blockIdx.x * warps_per_block + warp;
     if (item >= count) return;
     const uint32_t input_index =
         (input_tail + item) & (RING_BUFFER_ELEMENTS - 1);
@@ -724,22 +748,14 @@ extern "C" __global__ void process_slots(
     Slot& destination = output->slots[output_index];
     const uint32_t copy_length =
         source.len < MAX_ITEM_SIZE ? source.len : MAX_ITEM_SIZE;
-    for (uint32_t i = threadIdx.x; i < copy_length; i += blockDim.x) {
+    for (uint32_t i = lane; i < copy_length; i += WARP_SIZE) {
         destination.value[i] = source.value[i];
     }
-    __syncthreads();
-    if (threadIdx.x != 0) return;
+    __syncwarp();
+    if (lane != 0) return;
 
     destination.len = copy_length;
     destination.timestamp_ns = source.timestamp_ns;
-    if (spec.function == FUNCTION_INCREMENT) {
-        process_increment(destination, spec);
-        return;
-    }
-    if (spec.function == FUNCTION_CURRENCY_CONVERSION) {
-        process_currency_conversion(destination, spec);
-        return;
-    }
     if (spec.function != FUNCTION_IMPUTE) return;
 
     BidView bid;
@@ -781,16 +797,5 @@ extern "C" __global__ void commit_imputation_history(
                 (imputation_history_start + 1) % IMPUTATION_HISTORY_SIZE;
         }
         imputation_history[history_index] = observation_from(bid);
-    }
-}
-
-// Runs after process_slots on the same CUDA stream. The producer pointer is
-// therefore visible only after every block of the batch has completed.
-extern "C" __global__ void publish_output_head(
-    RingBuffer* output, uint64_t* completed_head, uint64_t value) {
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        __threadfence_system();
-        output->producer_head = value;
-        *completed_head = value;
     }
 }

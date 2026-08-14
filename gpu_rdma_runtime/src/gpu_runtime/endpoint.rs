@@ -21,7 +21,7 @@ use crate::constants::{RECEIVE_WR_DEPTH, RING_BUFFER_ELEMENTS};
 use crate::control_protocol::{MemoryRegionInfo, RdmaDestination};
 use crate::ring_buffer::{slot::Slot, RingBuffer};
 
-use super::cuda::{CudaBatch, CudaProcessSpec, CudaRuntime};
+use super::cuda::{CudaBatch, CudaOutputLocation, CudaProcessSpec, CudaRuntime};
 use super::memory_region::DmaBufMemoryRegion;
 
 type RuntimeRing = RingBuffer<RING_BUFFER_ELEMENTS>;
@@ -249,8 +249,10 @@ impl GpuRdmaEndpoint {
     pub fn write_output_batch(
         &mut self,
         remote: &MemoryRegionInfo,
+        local_head: u64,
         output_head: u64,
         count: u32,
+        output_location: CudaOutputLocation,
         phase_end: bool,
     ) -> Result<()> {
         ensure!(count > 0, "output batch must not be empty");
@@ -263,7 +265,11 @@ impl GpuRdmaEndpoint {
             "remote output region is smaller than the ring buffer"
         );
 
-        let signaled = phase_end || self.output_batches_since_signal + 1 >= OUTPUT_SIGNAL_INTERVAL;
+        // Input-ring slots cannot be credited back to PRE until the RNIC has
+        // finished reading them for the output write.
+        let signaled = output_location == CudaOutputLocation::Input
+            || phase_end
+            || self.output_batches_since_signal + 1 >= OUTPUT_SIGNAL_INTERVAL;
         let wr_id = if signaled {
             let id = self.next_write_id;
             self.next_write_id = self.next_write_id.wrapping_add(1);
@@ -271,36 +277,29 @@ impl GpuRdmaEndpoint {
         } else {
             None
         };
-        let local_base = self.cuda.output().pointer();
-        let mask = RING_BUFFER_ELEMENTS as u64 - 1;
-        let lkey = self.output_mr.lkey();
+        let (local_base, lkey) = match output_location {
+            CudaOutputLocation::Input => (self.cuda.input().pointer(), self.input_mr.lkey()),
+            CudaOutputLocation::Output => (self.cuda.output().pointer(), self.output_mr.lkey()),
+        };
         let mut guard = self.output_qp.start_post_send();
 
-        let first_index = (output_head & mask) as usize;
-        let first_count = (count as usize).min(RING_BUFFER_ELEMENTS - first_index);
-        let second_count = count as usize - first_count;
-        if second_count > 0 {
-            post_output_segment(&mut guard, lkey, local_base, remote, first_index, first_count, None);
-            post_output_segment(
-                &mut guard,
-                lkey,
-                local_base,
-                remote,
-                0,
-                second_count,
-                Some((wr_id.unwrap_or(0), signaled, count)),
-            );
-        } else {
-            post_output_segment(
-                &mut guard,
-                lkey,
-                local_base,
-                remote,
-                first_index,
-                first_count,
-                Some((wr_id.unwrap_or(0), signaled, count)),
-            );
-        }
+        for_each_output_segment(
+            local_head,
+            output_head,
+            count as usize,
+            |local_index, remote_index, segment_count, final_segment| {
+                post_output_segment(
+                    &mut guard,
+                    lkey,
+                    local_base,
+                    remote,
+                    local_index,
+                    remote_index,
+                    segment_count,
+                    final_segment.then_some((wr_id.unwrap_or(0), signaled, count)),
+                );
+            },
+        );
         guard.post().context("post GPU output RDMA writes")?;
 
         if let Some(wr_id) = wr_id {
@@ -309,7 +308,18 @@ impl GpuRdmaEndpoint {
         } else {
             self.output_batches_since_signal += 1;
         }
-        self.reap_output_completions().map(|_| ())
+        self.reap_output_completions()?;
+        if output_location == CudaOutputLocation::Input {
+            // The caller returns the corresponding input credit immediately
+            // after this method. Wait until the local input slots are no
+            // longer an RNIC DMA source before allowing PRE to reuse them.
+            while !self.pending_output_completions.is_empty() {
+                if self.reap_output_completions()? == 0 {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn finish_output(&mut self) -> Result<()> {
@@ -394,16 +404,39 @@ fn post_receive_notifications(qp: &mut ExtendedQueuePair, count: usize) -> Resul
     guard.post().context("post RDMA input notification receives")
 }
 
+fn for_each_output_segment(
+    local_head: u64,
+    remote_head: u64,
+    count: usize,
+    mut visit: impl FnMut(usize, usize, usize, bool),
+) {
+    let mask = RING_BUFFER_ELEMENTS as u64 - 1;
+    let mut local_index = (local_head & mask) as usize;
+    let mut remote_index = (remote_head & mask) as usize;
+    let mut remaining = count;
+    while remaining > 0 {
+        let segment_count = remaining
+            .min(RING_BUFFER_ELEMENTS - local_index)
+            .min(RING_BUFFER_ELEMENTS - remote_index);
+        remaining -= segment_count;
+        visit(local_index, remote_index, segment_count, remaining == 0);
+        local_index = (local_index + segment_count) & (RING_BUFFER_ELEMENTS - 1);
+        remote_index = (remote_index + segment_count) & (RING_BUFFER_ELEMENTS - 1);
+    }
+}
+
 fn post_output_segment<G: PostSendGuard>(
     guard: &mut G,
     lkey: u32,
     local_base: u64,
     remote: &MemoryRegionInfo,
-    index: usize,
+    local_index: usize,
+    remote_index: usize,
     count: usize,
     notification: Option<(u64, bool, u32)>,
 ) {
-    let offset = RuntimeRing::slot_offset(index) as u64;
+    let local_offset = RuntimeRing::slot_offset(local_index) as u64;
+    let remote_offset = RuntimeRing::slot_offset(remote_index) as u64;
     let byte_count = count * size_of::<Slot>();
     if let Some((wr_id, signaled, immediate)) = notification {
         let flags = if signaled {
@@ -414,16 +447,56 @@ fn post_output_segment<G: PostSendGuard>(
         let write =
             guard
                 .construct_wr(wr_id, flags)
-                .setup_write_imm(remote.rkey, remote.addr + offset, immediate.to_be());
+                .setup_write_imm(remote.rkey, remote.addr + remote_offset, immediate.to_be());
         unsafe {
-            write.setup_sge(lkey, local_base + offset, byte_count as u32);
+            write.setup_sge(lkey, local_base + local_offset, byte_count as u32);
         }
     } else {
         let write = guard
             .construct_wr(0, WorkRequestFlags::none())
-            .setup_write(remote.rkey, remote.addr + offset);
+            .setup_write(remote.rkey, remote.addr + remote_offset);
         unsafe {
-            write.setup_sge(lkey, local_base + offset, byte_count as u32);
+            write.setup_sge(lkey, local_base + local_offset, byte_count as u32);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn segments(
+        local_head: u64,
+        remote_head: u64,
+        count: usize,
+    ) -> Vec<(usize, usize, usize, bool)> {
+        let mut result = Vec::new();
+        for_each_output_segment(
+            local_head,
+            remote_head,
+            count,
+            |local, remote, size, final_segment| {
+                result.push((local, remote, size, final_segment));
+            },
+        );
+        result
+    }
+
+    #[test]
+    fn output_segments_without_wrap() {
+        assert_eq!(segments(10, 20, 3), vec![(10, 20, 3, true)]);
+    }
+
+    #[test]
+    fn output_segments_independent_local_and_remote_wraps() {
+        let n = RING_BUFFER_ELEMENTS;
+        assert_eq!(
+            segments((n - 2) as u64, (n - 4) as u64, 6),
+            vec![
+                (n - 2, n - 4, 2, false),
+                (0, n - 2, 2, false),
+                (2, 0, 2, true),
+            ]
+        );
     }
 }

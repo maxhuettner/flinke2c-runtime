@@ -4,6 +4,8 @@ mod endpoint;
 mod memory_region;
 mod server;
 
-// Typical framed rows are tens of bytes. 64 threads keeps enough parallelism
-// for larger rows while avoiding 192 idle threads for normal Nexmark rows.
-const THREADS_PER_BLOCK: u32 = 64;
+// Stateless in-place kernels map one thread to one row. Kernels that materialize
+// a separate output map one 32-thread warp to each row, so a block handles eight
+// rows while preserving coalesced row copies.
+const THREADS_PER_BLOCK: u32 = 256;
+const ROWS_PER_COPY_BLOCK: u32 = THREADS_PER_BLOCK / 32;

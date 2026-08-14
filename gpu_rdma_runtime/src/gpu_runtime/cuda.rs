@@ -12,7 +12,7 @@ use crate::constants::RING_BUFFER_ELEMENTS;
 use crate::control_protocol::{ProcessingFunction, ProcessingSpec, WireFieldType};
 use crate::ring_buffer::RingBuffer;
 
-use super::THREADS_PER_BLOCK;
+use super::{ROWS_PER_COPY_BLOCK, THREADS_PER_BLOCK};
 
 type CuResult = i32;
 type CuDevice = i32;
@@ -339,9 +339,9 @@ impl Drop for CudaBuffer {
 struct CudaKernel {
     api: Arc<CudaApi>,
     module: CuModule,
+    process_slots_in_place: CuFunction,
     process_slots: CuFunction,
     commit_imputation_history: CuFunction,
-    publish_output_head: CuFunction,
 }
 
 impl CudaKernel {
@@ -356,17 +356,21 @@ impl CudaKernel {
         )?;
 
         let result = (|| {
+            let mut process_slots_in_place = ptr::null_mut();
+            context.api.check(
+                unsafe {
+                    (context.api.module_get_function)(
+                        &mut process_slots_in_place,
+                        module,
+                        c"process_slots_in_place".as_ptr(),
+                    )
+                },
+                "resolve process_slots_in_place kernel",
+            )?;
             let mut process_slots = ptr::null_mut();
             context.api.check(
                 unsafe { (context.api.module_get_function)(&mut process_slots, module, c"process_slots".as_ptr()) },
                 "resolve process_slots kernel",
-            )?;
-            let mut publish_output_head = ptr::null_mut();
-            context.api.check(
-                unsafe {
-                    (context.api.module_get_function)(&mut publish_output_head, module, c"publish_output_head".as_ptr())
-                },
-                "resolve publish_output_head kernel",
             )?;
             let mut commit_imputation_history = ptr::null_mut();
             context.api.check(
@@ -379,17 +383,23 @@ impl CudaKernel {
                 },
                 "resolve commit_imputation_history kernel",
             )?;
-            Ok((process_slots, commit_imputation_history, publish_output_head))
+            Ok((
+                process_slots_in_place,
+                process_slots,
+                commit_imputation_history,
+            ))
         })();
 
         match result {
-            Ok((process_slots, commit_imputation_history, publish_output_head)) => Ok(Self {
-                api: Arc::clone(&context.api),
-                module,
-                process_slots,
-                commit_imputation_history,
-                publish_output_head,
-            }),
+            Ok((process_slots_in_place, process_slots, commit_imputation_history)) => {
+                Ok(Self {
+                    api: Arc::clone(&context.api),
+                    module,
+                    process_slots_in_place,
+                    process_slots,
+                    commit_imputation_history,
+                })
+            }
             Err(error) => {
                 unsafe { (context.api.module_unload)(module) };
                 Err(error)
@@ -442,6 +452,19 @@ impl Drop for CudaLane {
 #[derive(Debug, Clone, Copy)]
 pub struct CudaBatch {
     lane: usize,
+    output_location: CudaOutputLocation,
+}
+
+impl CudaBatch {
+    pub fn output_location(self) -> CudaOutputLocation {
+        self.output_location
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CudaOutputLocation {
+    Input,
+    Output,
 }
 
 impl Drop for CudaKernel {
@@ -470,8 +493,9 @@ impl CudaRuntime {
         let input = CudaBuffer::allocate(&context)?;
         let output = CudaBuffer::allocate(&context)?;
         let kernel = CudaKernel::load(&context, kernel_path)?;
-        // A single ordered stream guarantees that the GPU-published producer
-        // head can never skip an unfinished batch.
+        // Independent streams allow stateless batches to overlap. The server
+        // retires their events in input order, while stateful imputation adds
+        // explicit cross-stream event dependencies below.
         let lanes = (0..pipeline_depth)
             .map(|_| CudaLane::create(&context))
             .collect::<Result<Vec<_>>>()?;
@@ -540,37 +564,68 @@ impl CudaRuntime {
         }
 
         let mut input = self.input.pointer;
-        let mut output = self.output.pointer;
         let mut input_tail_arg = input_tail;
-        let mut output_head_arg = output_head;
         let mut count_arg = count;
         let mut spec_arg = spec;
-        let mut arguments = [
-            (&mut input as *mut u64).cast(),
-            (&mut output as *mut u64).cast(),
-            (&mut input_tail_arg as *mut u64).cast(),
-            (&mut output_head_arg as *mut u64).cast(),
-            (&mut count_arg as *mut u32).cast(),
-            (&mut spec_arg as *mut CudaProcessSpec).cast(),
-        ];
-        self.context.api.check(
-            unsafe {
-                (self.context.api.launch_kernel)(
-                    self.kernel.process_slots,
-                    count,
-                    1,
-                    1,
-                    THREADS_PER_BLOCK,
-                    1,
-                    1,
-                    0,
-                    lane.stream,
-                    arguments.as_mut_ptr(),
-                    ptr::null_mut(),
-                )
-            },
-            "launch process_slots",
-        )?;
+        let output_location = if spec.function == 2 {
+            let mut output = self.output.pointer;
+            let mut output_head_arg = output_head;
+            let mut arguments = [
+                (&mut input as *mut u64).cast(),
+                (&mut output as *mut u64).cast(),
+                (&mut input_tail_arg as *mut u64).cast(),
+                (&mut output_head_arg as *mut u64).cast(),
+                (&mut count_arg as *mut u32).cast(),
+                (&mut spec_arg as *mut CudaProcessSpec).cast(),
+            ];
+            let block_count = count.div_ceil(ROWS_PER_COPY_BLOCK);
+            self.context.api.check(
+                unsafe {
+                    (self.context.api.launch_kernel)(
+                        self.kernel.process_slots,
+                        block_count,
+                        1,
+                        1,
+                        THREADS_PER_BLOCK,
+                        1,
+                        1,
+                        0,
+                        lane.stream,
+                        arguments.as_mut_ptr(),
+                        ptr::null_mut(),
+                    )
+                },
+                "launch process_slots",
+            )?;
+            CudaOutputLocation::Output
+        } else {
+            let mut arguments = [
+                (&mut input as *mut u64).cast(),
+                (&mut input_tail_arg as *mut u64).cast(),
+                (&mut count_arg as *mut u32).cast(),
+                (&mut spec_arg as *mut CudaProcessSpec).cast(),
+            ];
+            let block_count = count.div_ceil(THREADS_PER_BLOCK);
+            self.context.api.check(
+                unsafe {
+                    (self.context.api.launch_kernel)(
+                        self.kernel.process_slots_in_place,
+                        block_count,
+                        1,
+                        1,
+                        THREADS_PER_BLOCK,
+                        1,
+                        1,
+                        0,
+                        lane.stream,
+                        arguments.as_mut_ptr(),
+                        ptr::null_mut(),
+                    )
+                },
+                "launch process_slots_in_place",
+            )?;
+            CudaOutputLocation::Input
+        };
         if spec.function == 2 {
             let mut history_arguments = [
                 (&mut input as *mut u64).cast(),
@@ -601,7 +656,10 @@ impl CudaRuntime {
             unsafe { (self.context.api.event_record)(lane.event, lane.stream) },
             "record CUDA batch completion",
         )?;
-        Ok(CudaBatch { lane: lane_index })
+        Ok(CudaBatch {
+            lane: lane_index,
+            output_location,
+        })
     }
 
     pub fn is_complete(&self, batch: CudaBatch) -> Result<bool> {

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <new>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -16,9 +17,6 @@ constexpr double EPS = 1e-6;
 constexpr double W_BIDDER = 0.25;
 constexpr double W_TIME = 1.0;
 constexpr double W_STRING = 0.25;
-// Imputation uses substantially more registers per tuple than currency
-// conversion, so use a smaller block while still filling every warp.
-constexpr uint32_t THREADS_PER_BLOCK = 128;
 
 struct Observation {
     double price;
@@ -63,15 +61,47 @@ struct DeviceState {
     uint32_t size;
 };
 
-struct Context {
-    int device = 0;
-    uint32_t capacity = 0;
+// Each lane owns an independent stream, event, and pinned/device input+output
+// buffer pair, exactly like the currency conversion lanes. Unlike currency
+// conversion, imputation reads and mutates one DeviceState shared by every
+// lane (the KNN history), so lanes cannot simply run free: a later batch's
+// impute kernel must observe an earlier batch's committed history, and two
+// commits must not interleave. Ordering that on the CPU (block until the
+// previous batch fully finishes before submitting the next) would collapse
+// back to the fully-serial design this replaces. Instead, ordering is
+// enforced on the GPU: submitBatch makes the lane's own stream wait on the
+// previous imputation lane's completion event before launching its kernels,
+// via cudaStreamWaitEvent. That wait is asynchronous from the CPU's
+// perspective (it just enqueues a dependency), so the CPU can still fill and
+// submit the next lane without blocking, while the GPU itself serializes only
+// the state-touching kernels. Independent lanes' H2D/D2H copies are
+// unaffected and can overlap freely. This mirrors the cross-stream
+// last_imputation_lane dependency gpu_runtime/cuda.rs uses for the RDMA path.
+struct Lane {
     cudaStream_t stream = nullptr;
-    DeviceState* state = nullptr;
+    cudaEvent_t event = nullptr;
+    bool event_pending = false;
     Input* device_input = nullptr;
     double* device_output = nullptr;
     Input* host_input = nullptr;
     double* host_output = nullptr;
+};
+
+struct Context {
+    int device = 0;
+    uint32_t capacity = 0;
+    // CUDA block size for the batch kernel. A compile-time constant would
+    // require rebuilding the PTX/shared library to sweep; this is instead
+    // set once at create() time from Java, alongside batch capacity and
+    // pipeline depth. Imputation uses substantially more registers per tuple
+    // than currency conversion, so its Java-side default is smaller (128
+    // rather than 256) while still filling every warp.
+    uint32_t threads_per_block = 0;
+    DeviceState* state = nullptr;
+    std::vector<Lane> lanes;
+    // Index into lanes of the most recently submitted imputation batch, or
+    // -1 if none has been submitted yet on this context.
+    int last_lane = -1;
 };
 
 void throw_java(JNIEnv* env, const char* class_name, const std::string& message) {
@@ -94,31 +124,41 @@ bool cuda_ok(
     return false;
 }
 
+void release_lane(Context* context, Lane& lane) {
+    cudaSetDevice(context->device);
+    if (lane.stream != nullptr) {
+        cudaStreamSynchronize(lane.stream);
+    }
+    if (lane.device_output != nullptr) {
+        cudaFree(lane.device_output);
+    }
+    if (lane.device_input != nullptr) {
+        cudaFree(lane.device_input);
+    }
+    if (lane.host_output != nullptr) {
+        cudaFreeHost(lane.host_output);
+    }
+    if (lane.host_input != nullptr) {
+        cudaFreeHost(lane.host_input);
+    }
+    if (lane.event != nullptr) {
+        cudaEventDestroy(lane.event);
+    }
+    if (lane.stream != nullptr) {
+        cudaStreamDestroy(lane.stream);
+    }
+}
+
 void release_context(Context* context) {
     if (context == nullptr) {
         return;
     }
+    for (Lane& lane : context->lanes) {
+        release_lane(context, lane);
+    }
     cudaSetDevice(context->device);
-    if (context->stream != nullptr) {
-        cudaStreamSynchronize(context->stream);
-    }
-    if (context->device_output != nullptr) {
-        cudaFree(context->device_output);
-    }
-    if (context->device_input != nullptr) {
-        cudaFree(context->device_input);
-    }
     if (context->state != nullptr) {
         cudaFree(context->state);
-    }
-    if (context->host_output != nullptr) {
-        cudaFreeHost(context->host_output);
-    }
-    if (context->host_input != nullptr) {
-        cudaFreeHost(context->host_input);
-    }
-    if (context->stream != nullptr) {
-        cudaStreamDestroy(context->stream);
     }
     delete context;
 }
@@ -236,7 +276,10 @@ __global__ void direct_imputation_batch_kernel(
 }
 
 // Commit only after every output in the batch has read the old history.
-// Source-order commits form the state boundary used by the RDMA path.
+// Source-order commits form the state boundary used by the RDMA path. The
+// caller (submitBatch) is responsible for ordering this against other lanes'
+// commits via cudaStreamWaitEvent; this kernel itself assumes it is the only
+// one touching *state at a time.
 __global__ void commit_batch_history(
     DeviceState* state, const Input* input, uint32_t count) {
     if (blockIdx.x != 0 || threadIdx.x != 0) {
@@ -259,15 +302,37 @@ Context* require_context(JNIEnv* env, jlong handle) {
     return context;
 }
 
+bool require_lane(JNIEnv* env, Context* context, jint lane, uint32_t& out) {
+    if (lane < 0 || static_cast<uint32_t>(lane) >= context->lanes.size()) {
+        throw_java(
+            env, "java/lang/IllegalArgumentException",
+            "Direct CUDA imputation lane index is out of range");
+        return false;
+    }
+    out = static_cast<uint32_t>(lane);
+    return true;
+}
+
 }  // namespace
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_org_example_flinke2c_ImputationGpuNative_create(
-    JNIEnv* env, jclass, jint cuda_device, jint batch_capacity) {
-    if (cuda_device < 0 || batch_capacity <= 0) {
+    JNIEnv* env, jclass, jint cuda_device, jint batch_capacity, jint pipeline_depth,
+    jint threads_per_block) {
+    if (cuda_device < 0 || batch_capacity <= 0 || pipeline_depth <= 0) {
         throw_java(
             env, "java/lang/IllegalArgumentException",
-            "CUDA device must be non-negative and batch capacity must be positive");
+            "CUDA device must be non-negative, and batch capacity and pipeline "
+            "depth must be positive");
+        return 0;
+    }
+    // 1024 is the max threads per block on every CUDA compute capability this
+    // library targets (compute_80+); Java validates this too, but check here
+    // as well since this is a JNI entry point Java isn't the only caller of.
+    if (threads_per_block <= 0 || threads_per_block > 1024) {
+        throw_java(
+            env, "java/lang/IllegalArgumentException",
+            "threadsPerBlock must be in 1..1024");
         return 0;
     }
 
@@ -280,54 +345,55 @@ Java_org_example_flinke2c_ImputationGpuNative_create(
     }
     context->device = cuda_device;
     context->capacity = static_cast<uint32_t>(batch_capacity);
-    const size_t input_bytes = sizeof(Input) * context->capacity;
-    const size_t output_bytes = sizeof(double) * context->capacity;
+    context->threads_per_block = static_cast<uint32_t>(threads_per_block);
+    context->lanes.resize(static_cast<uint32_t>(pipeline_depth));
 
     if (!cuda_ok(env, cudaSetDevice(context->device), "cudaSetDevice") ||
         !cuda_ok(
             env,
-            cudaStreamCreateWithFlags(&context->stream, cudaStreamNonBlocking),
-            "cudaStreamCreateWithFlags") ||
-        !cuda_ok(
-            env,
-            cudaMalloc(
-                reinterpret_cast<void**>(&context->state),
-                sizeof(DeviceState)),
+            cudaMalloc(reinterpret_cast<void**>(&context->state), sizeof(DeviceState)),
             "cudaMalloc(DeviceState)") ||
         !cuda_ok(
-            env,
-            cudaMalloc(
-                reinterpret_cast<void**>(&context->device_input),
-                input_bytes),
-            "cudaMalloc(batch input)") ||
-        !cuda_ok(
-            env,
-            cudaMalloc(
-                reinterpret_cast<void**>(&context->device_output),
-                output_bytes),
-            "cudaMalloc(batch output)") ||
-        !cuda_ok(
-            env,
-            cudaHostAlloc(
-                reinterpret_cast<void**>(&context->host_input),
-                input_bytes, cudaHostAllocPortable),
-            "cudaHostAlloc(batch input)") ||
-        !cuda_ok(
-            env,
-            cudaHostAlloc(
-                reinterpret_cast<void**>(&context->host_output),
-                output_bytes, cudaHostAllocPortable),
-            "cudaHostAlloc(batch output)") ||
-        !cuda_ok(
-            env,
-            cudaMemsetAsync(
-                context->state, 0, sizeof(DeviceState), context->stream),
-            "cudaMemsetAsync(DeviceState)") ||
-        !cuda_ok(
-            env, cudaStreamSynchronize(context->stream),
-            "cudaStreamSynchronize")) {
+            env, cudaMemset(context->state, 0, sizeof(DeviceState)),
+            "cudaMemset(DeviceState)")) {
         release_context(context);
         return 0;
+    }
+
+    const size_t input_bytes = sizeof(Input) * context->capacity;
+    const size_t output_bytes = sizeof(double) * context->capacity;
+    for (Lane& lane : context->lanes) {
+        if (!cuda_ok(
+                env,
+                cudaStreamCreateWithFlags(&lane.stream, cudaStreamNonBlocking),
+                "cudaStreamCreateWithFlags") ||
+            !cuda_ok(
+                env,
+                cudaEventCreateWithFlags(&lane.event, cudaEventDisableTiming),
+                "cudaEventCreateWithFlags") ||
+            !cuda_ok(
+                env,
+                cudaMalloc(reinterpret_cast<void**>(&lane.device_input), input_bytes),
+                "cudaMalloc(batch input)") ||
+            !cuda_ok(
+                env,
+                cudaMalloc(reinterpret_cast<void**>(&lane.device_output), output_bytes),
+                "cudaMalloc(batch output)") ||
+            !cuda_ok(
+                env,
+                cudaHostAlloc(
+                    reinterpret_cast<void**>(&lane.host_input), input_bytes,
+                    cudaHostAllocPortable),
+                "cudaHostAlloc(batch input)") ||
+            !cuda_ok(
+                env,
+                cudaHostAlloc(
+                    reinterpret_cast<void**>(&lane.host_output), output_bytes,
+                    cudaHostAllocPortable),
+                "cudaHostAlloc(batch output)")) {
+            release_context(context);
+            return 0;
+        }
     }
 
     return reinterpret_cast<jlong>(context);
@@ -335,33 +401,41 @@ Java_org_example_flinke2c_ImputationGpuNative_create(
 
 extern "C" JNIEXPORT jobject JNICALL
 Java_org_example_flinke2c_ImputationGpuNative_inputBuffer(
-    JNIEnv* env, jclass, jlong handle) {
+    JNIEnv* env, jclass, jlong handle, jint lane) {
     Context* context = require_context(env, handle);
-    if (context == nullptr) {
+    uint32_t lane_index;
+    if (context == nullptr || !require_lane(env, context, lane, lane_index)) {
         return nullptr;
     }
     return env->NewDirectByteBuffer(
-        context->host_input,
+        context->lanes[lane_index].host_input,
         static_cast<jlong>(sizeof(Input) * context->capacity));
 }
 
 extern "C" JNIEXPORT jobject JNICALL
 Java_org_example_flinke2c_ImputationGpuNative_outputBuffer(
-    JNIEnv* env, jclass, jlong handle) {
+    JNIEnv* env, jclass, jlong handle, jint lane) {
     Context* context = require_context(env, handle);
-    if (context == nullptr) {
+    uint32_t lane_index;
+    if (context == nullptr || !require_lane(env, context, lane, lane_index)) {
         return nullptr;
     }
     return env->NewDirectByteBuffer(
-        context->host_output,
+        context->lanes[lane_index].host_output,
         static_cast<jlong>(sizeof(double) * context->capacity));
 }
 
+// Launches one lane's H2D copy, impute kernel, history commit, and D2H copy
+// asynchronously on that lane's own stream and returns immediately; call
+// waitBatch to block for the result. The impute/commit kernels wait on the
+// previous imputation batch's completion event (on any lane) before running,
+// so history updates apply in submission order even though lanes overlap.
 extern "C" JNIEXPORT void JNICALL
-Java_org_example_flinke2c_ImputationGpuNative_processBatch(
-    JNIEnv* env, jclass, jlong handle, jint count) {
+Java_org_example_flinke2c_ImputationGpuNative_submitBatch(
+    JNIEnv* env, jclass, jlong handle, jint lane, jint count) {
     Context* context = require_context(env, handle);
-    if (context == nullptr) {
+    uint32_t lane_index;
+    if (context == nullptr || !require_lane(env, context, lane, lane_index)) {
         return;
     }
     if (count <= 0 || static_cast<uint32_t>(count) > context->capacity) {
@@ -374,42 +448,78 @@ Java_org_example_flinke2c_ImputationGpuNative_processBatch(
         return;
     }
 
+    Lane& active = context->lanes[lane_index];
     const uint32_t batch_count = static_cast<uint32_t>(count);
     const size_t input_bytes = sizeof(Input) * batch_count;
     const size_t output_bytes = sizeof(double) * batch_count;
+
+    // Independent of history ordering: this lane's own buffers are not
+    // touched by any other lane, so the copy can start immediately.
     if (!cuda_ok(
             env,
             cudaMemcpyAsync(
-                context->device_input, context->host_input, input_bytes,
-                cudaMemcpyHostToDevice, context->stream),
+                active.device_input, active.host_input, input_bytes,
+                cudaMemcpyHostToDevice, active.stream),
             "cudaMemcpyAsync(batch input)")) {
         return;
     }
 
+    if (context->last_lane >= 0) {
+        // Delay only the state-touching kernels below until the previous
+        // imputation batch (possibly on a different lane) has committed.
+        if (!cuda_ok(
+                env,
+                cudaStreamWaitEvent(
+                    active.stream, context->lanes[context->last_lane].event, 0),
+                "cudaStreamWaitEvent")) {
+            return;
+        }
+    }
+    context->last_lane = static_cast<int>(lane_index);
+
+    const uint32_t threads_per_block = context->threads_per_block;
     const uint32_t block_count =
-        (batch_count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-    direct_imputation_batch_kernel
-        <<<block_count, THREADS_PER_BLOCK, 0, context->stream>>>(
-        context->state, context->device_input,
-        context->device_output, batch_count);
-    if (!cuda_ok(
-            env, cudaGetLastError(),
-            "direct_imputation_batch_kernel launch")) {
+        (batch_count + threads_per_block - 1) / threads_per_block;
+    direct_imputation_batch_kernel<<<block_count, threads_per_block, 0, active.stream>>>(
+        context->state, active.device_input, active.device_output, batch_count);
+    if (!cuda_ok(env, cudaGetLastError(), "direct_imputation_batch_kernel launch")) {
         return;
     }
-    commit_batch_history<<<1, 1, 0, context->stream>>>(
-        context->state, context->device_input, batch_count);
-    if (!cuda_ok(env, cudaGetLastError(), "commit_batch_history launch") ||
-        !cuda_ok(
+    commit_batch_history<<<1, 1, 0, active.stream>>>(
+        context->state, active.device_input, batch_count);
+    if (!cuda_ok(env, cudaGetLastError(), "commit_batch_history launch")) {
+        return;
+    }
+    if (!cuda_ok(
             env,
             cudaMemcpyAsync(
-                context->host_output, context->device_output, output_bytes,
-                cudaMemcpyDeviceToHost, context->stream),
-            "cudaMemcpyAsync(batch output)") ||
-        !cuda_ok(
-            env, cudaStreamSynchronize(context->stream),
-            "cudaStreamSynchronize")) {
+                active.host_output, active.device_output, output_bytes,
+                cudaMemcpyDeviceToHost, active.stream),
+            "cudaMemcpyAsync(batch output)")) {
         return;
+    }
+    if (!cuda_ok(env, cudaEventRecord(active.event, active.stream), "cudaEventRecord")) {
+        return;
+    }
+    active.event_pending = true;
+}
+
+// Blocks until the lane's most recent submitBatch has finished; a no-op if
+// nothing is outstanding on the lane.
+extern "C" JNIEXPORT void JNICALL
+Java_org_example_flinke2c_ImputationGpuNative_waitBatch(
+    JNIEnv* env, jclass, jlong handle, jint lane) {
+    Context* context = require_context(env, handle);
+    uint32_t lane_index;
+    if (context == nullptr || !require_lane(env, context, lane, lane_index)) {
+        return;
+    }
+    Lane& active = context->lanes[lane_index];
+    if (!active.event_pending) {
+        return;
+    }
+    if (cuda_ok(env, cudaEventSynchronize(active.event), "cudaEventSynchronize")) {
+        active.event_pending = false;
     }
 }
 

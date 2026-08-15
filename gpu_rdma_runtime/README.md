@@ -246,11 +246,24 @@ by one unit in the last (`0.001`) place.
 `org.example.flinke2c.ImputationFunctionGpu` implements the same scalar UDF
 interface but directly invokes the standalone kernel in
 `cuda/direct_imputation_jni.cu`. It does not use the RDMA runtime. It is a
-Flink `AsyncScalarFunction`: calls are held in FIFO order and submitted through
-one JNI call and one host-to-device copy per batch. One CUDA kernel computes
-the batch in parallel, and a second commits observed prices in source order
-after the batch has read the old history, matching the RDMA implementation's
-state boundary.
+Flink `AsyncScalarFunction`: calls are held in FIFO order and submitted
+through one JNI call and one host-to-device copy per batch. One CUDA kernel
+computes the batch in parallel, and a second commits observed prices in
+source order after the batch has read the old history, matching the RDMA
+implementation's state boundary.
+
+Like the currency conversion UDF, batches are round-robined across
+`pipelineDepth` CUDA streams so consecutive batches' copy/kernel/copy phases
+can overlap instead of fully serializing behind one synchronize per batch.
+The KNN history is one piece of state shared by every lane, so it cannot be
+pipelined as freely as the stateless currency conversion path: the native
+side makes each batch's compute and history-commit kernels wait on a GPU
+event for the previous batch's commit (`cudaStreamWaitEvent`) before running,
+regardless of which lane submits it, so history updates still apply in strict
+submission order. That wait is enqueued on the GPU, not blocked on the CPU,
+so the calling thread can still fill and submit the next lane without
+stalling — only the state-touching kernels are serialized, not the batches'
+H2D/D2H copies or the CPU-side dispatch.
 
 Build both CUDA artifacts as above, build the Flink UDF JAR from `flinke2c`,
 and make the shared library visible to every TaskManager:
@@ -275,21 +288,45 @@ test -f "$JAVA_HOME/include/jni.h"
 
 Alternatively, add `cuda/build` to the TaskManager's
 `java.library.path`; the UDF then loads `flinke2c_imputation_gpu` by name.
-The visible CUDA device defaults to zero. Select another device with
-`-Dflinke2c.imputation.gpu.device=N` or by constructing the UDF with a device
-index in Java. Direct CUDA batches default to 64 rows with a 1 ms maximum wait
-for a partial batch. Configure them on the TaskManager with:
+Direct CUDA batches default to 64 rows with a 1 ms maximum wait for a partial
+batch. The library path and CUDA device are TaskManager-wide JVM options,
+since the native library itself has to be loaded before any job runs:
 
 ```text
--Dflinke2c.imputation.gpu.batch-size=64
--Dflinke2c.imputation.gpu.batch-delay-micros=1000
+-Dflinke2c.imputation.gpu.library=/path/to/gpu_rdma_runtime/cuda/build/libflinke2c_imputation_gpu.so
+-Dflinke2c.imputation.gpu.device=0
 ```
 
-Flink must allow at least that many async calls to remain outstanding or the
-batch cannot fill. For a batch size of 64, use at least:
+Everything else — batch size, batch delay, pipeline depth, threads per block —
+is per-job configuration, not a JVM flag. It resolves in this order: an
+explicit constructor argument on `ImputationFunctionGpu`, then the
+`flinke2c.imputation.gpu.conf` job parameter (set per job/session from SQL,
+below), then the matching `-D` system property as a cluster-wide fallback,
+then the built-in default. To set it from SQL the same way `RdmaOperator`
+takes its `conf` string via `table.exec.external-runtime.conf.<class>`: Flink
+only exposes `pipeline.global-job-parameters` to UDF code
+(`FunctionContext.getJobParameter`) — arbitrary `SET 'x'='y'` keys are not
+visible to a UDF's `open()`, only that one. So the whole conf string goes in
+as the value of a single job parameter:
 
 ```sql
-SET 'table.exec.async-scalar.max-concurrent-operations' = '128';
+SET 'pipeline.global-job-parameters' =
+    'flinke2c.imputation.gpu.conf:batchsize=1024;pipelinedepth=8;threadsperblock=128';
+```
+
+The inner string is parsed exactly like `RdmaOperator.RdmaConfig`'s `conf`
+string: semicolon-separated `key=value` pairs, keys lower-cased and trimmed,
+malformed entries silently ignored. Recognized keys: `batchsize`,
+`batchdelaymicros`, `pipelinedepth`, `threadsperblock`, `device`.
+
+Flink must allow enough async calls to remain outstanding to fill
+`pipelineDepth` batches concurrently, not just one, or batches will stay
+partial and hit the delay timeout instead of filling by count. As a rule of
+thumb, set `max-concurrent-operations` to at least
+`batch-size * pipeline-depth * 2`:
+
+```sql
+SET 'table.exec.async-scalar.max-concurrent-operations' = '512';
 SET 'table.exec.async-scalar.retry-strategy' = 'NO_RETRY';
 ```
 
@@ -325,32 +362,301 @@ the imputer uses global rather than keyed history.
 
 `org.example.flinke2c.CurrencyConversionFunctionGpu` is a stateless,
 batched `AsyncScalarFunction` equivalent to
-`CurrencyConversionFunction`. It sends one batch of prices through JNI,
+`CurrencyConversionFunction`. It sends batches of prices through JNI,
 multiplies non-null values by `0.908` in the CUDA kernel, and completes each
-future in input order. Null prices remain null. The GPU result is rounded to
-`DECIMAL(23,3)` in Java, matching the declared SQL result type.
+call's future once its batch's device-to-host copy lands. Null prices remain
+null. The GPU result is rounded to `DECIMAL(23,3)` in Java, matching the
+declared SQL result type. The function is deterministic, so futures may
+complete out of input order across batches without affecting correctness;
+Flink's async operator restores stream order downstream.
+
+The native context keeps `pipelineDepth` independent CUDA streams ("lanes"),
+each with its own pinned host and device buffers. Batches are submitted to
+lanes round robin; a submission launches the host-to-device copy, kernel, and
+device-to-host copy on that lane's stream and returns immediately instead of
+blocking, so the next batch can be filled and launched on another lane while
+this one is still running on the GPU. A lane is only waited on when it is
+about to be reused (or when the call queue drains to empty), so several
+batches' copy/kernel/copy phases overlap instead of fully serializing behind
+one synchronize per batch. Without this, throughput is bounded by
+`batchSize / (H2D + kernel + D2H + JNI overhead)` per round trip; with it,
+`pipelineDepth` round trips can be in flight at once.
 
 The CUDA build above produces the library. Make it visible to every
-TaskManager and configure the direct UDF with:
+TaskManager. Only the library path and CUDA device are TaskManager-wide JVM
+options, since the native library has to be loaded before any job runs:
 
 ```text
 -Dflinke2c.currency.gpu.library=/path/to/gpu_rdma_runtime/cuda/build/libflinke2c_currency_conversion_gpu.so
 -Dflinke2c.currency.gpu.device=0
--Dflinke2c.currency.gpu.batch-size=64
--Dflinke2c.currency.gpu.batch-delay-micros=1000
 ```
 
-Register `CurrencyConversionFunctionGpu` in place of
-`CurrencyConversionFunction`. The async operator should have enough
-outstanding calls to fill a batch:
+Batch size, batch delay, pipeline depth, and threads per block are per-job
+configuration instead, resolved in this order: an explicit constructor
+argument on `CurrencyConversionFunctionGpu`, then the
+`flinke2c.currency.gpu.conf` job parameter (set per job/session from SQL,
+below), then the matching `-D` system property as a cluster-wide fallback,
+then the built-in default. To set it from SQL the same way `RdmaOperator`
+takes its `conf` string via `table.exec.external-runtime.conf.<class>`: Flink
+only exposes `pipeline.global-job-parameters` to UDF code
+(`FunctionContext.getJobParameter`) — arbitrary `SET 'x'='y'` keys are not
+visible to a UDF's `open()`, only that one. So the whole conf string goes in
+as the value of a single job parameter:
 
 ```sql
-SET 'table.exec.async-scalar.max-concurrent-operations' = '128';
+SET 'pipeline.global-job-parameters' =
+    'flinke2c.currency.gpu.conf:batchsize=1024;pipelinedepth=8;threadsperblock=256';
+```
+
+The inner string is parsed exactly like `RdmaOperator.RdmaConfig`'s `conf`
+string: semicolon-separated `key=value` pairs, keys lower-cased and trimmed,
+malformed entries silently ignored. Recognized keys: `batchsize`,
+`batchdelaymicros`, `pipelinedepth`, `threadsperblock`, `device`.
+
+Register `CurrencyConversionFunctionGpu` in place of
+`CurrencyConversionFunction`. The async operator needs enough outstanding
+calls to fill `pipelineDepth` batches concurrently, not just one:
+
+```sql
+SET 'table.exec.async-scalar.max-concurrent-operations' = '256';
 SET 'table.exec.async-scalar.retry-strategy' = 'NO_RETRY';
 ```
+
+As a rule of thumb, set `max-concurrent-operations` to at least
+`batch-size * pipeline-depth * 2` so the queue can keep every lane fed while
+the previous round trip is still draining. Too few outstanding calls and
+batches stay partial, hitting `batch-delay-micros` on every flush instead of
+filling.
 
 The currency function is stateless, so retries do not duplicate history, but
 disabling retries keeps comparisons with the other GPU paths deterministic.
 The imputation-specific planner patch is not required for null currency
 inputs when normal SQL null propagation is desired; Flink can complete those
 rows as null without invoking the function.
+
+### Batch-size / pipeline-depth sweeps
+
+Currency conversion is one cheap multiply per row and imputation's per-row
+compute is still small relative to a round trip, so a single round trip (JNI
+call, host-device copy, kernel launch, RDMA hop, or whatever the path adds)
+costs far more than the arithmetic itself; at `batchSize=1` any GPU path will
+lose badly to staying on the CPU in the same Flink thread. The question worth
+measuring is whether *aggregate* throughput under load can still win by
+amortizing that fixed cost over more parallel work. These knobs control how
+much parallel work is in flight; all of them are runtime parameters read at
+`open()` — none require rebuilding the PTX/shared library to sweep, and on
+the direct paths none require a TaskManager restart either: set them per job
+via the `flinke2c.*.gpu.conf` job parameter (see above) and just resubmit the
+job between sweep points.
+
+- **Batch size** — how many rows one kernel launch (and, on the direct path,
+  one JNI call; on the RDMA path, one RDMA notification) processes. Larger
+  batches mean fewer round trips, more threads launched per kernel, and this
+  is also what total thread count tracks (see below).
+- **Pipeline depth** — how many batches can be on the GPU at once
+  (`flinke2c.currency.gpu.pipeline-depth` / `flinke2c.imputation.gpu.pipeline-depth`
+  on the direct paths, `--cuda-pipeline-depth` on the RDMA server). Depth
+  beyond 1 is what lets a new batch's copy/launch overlap a previous batch's
+  still-running copy or kernel, instead of the GPU sitting idle between round
+  trips. On the imputation path, raising this does not change result
+  ordering: the native side still applies history commits in strict
+  submission order via a GPU-side event wait between lanes, regardless of how
+  many lanes are configured.
+- **Threads per block** — on the direct paths,
+  `flinke2c.currency.gpu.threads-per-block` /
+  `flinke2c.imputation.gpu.threads-per-block` (defaults 256 / 128, max 1024);
+  not exposed on the RDMA path, which uses a fixed 256. Every kernel here maps
+  one CUDA thread to one row, so *total* threads launched per batch is always
+  batch size regardless of this setting — this only changes how those threads
+  are grouped into blocks (occupancy/scheduling), it does not add or remove
+  parallelism on its own. Sweep it after batch size and pipeline depth are
+  already at a good point, not before; it's a second-order effect by
+  comparison.
+
+Sweep batch size and pipeline depth together and compare against the plain
+CPU baseline (`CurrencyConversionFunction` / `ImputationFunction`) at matching
+Flink parallelism (for imputation, parallelism one, since its history is
+global rather than keyed):
+
+- Direct paths: vary `batchsize` (e.g. 16, 64, 256, 1024) times
+  `pipelinedepth` (e.g. 1, 2, 4, 8) via the `flinke2c.*.gpu.conf` job
+  parameter, keeping `table.exec.async-scalar.max-concurrent-operations` well
+  above `batchsize * pipelinedepth` at every point (also set per job, via
+  `SET`) so batches actually fill by count instead of timing out on the batch
+  delay. Once that combination plateaus, optionally sweep `threadsperblock`
+  (e.g. 64, 128, 256, 512) at the winning batch size/depth to check for a
+  further, smaller gain.
+- RDMA path: vary `--batch-size` on both `rdma_gpu_server` and
+  `rdma_test_client` together (the README's transport section already
+  recommends `1, 4, 16, 64, 256`) times `--cuda-pipeline-depth` on the server.
+  Remember the RDMA transport sends one fixed `MAX_ITEM_SIZE` slot per row
+  regardless of batch size, so its throughput plateaus once the link is
+  saturated; past that point more pipeline depth or batch size will not help,
+  and the smallest batch at the plateau is the right operating point.
+
+Expect diminishing returns once either knob is large enough to keep the GPU
+continuously fed — at that point the bottleneck has moved to one of: raw
+kernel throughput (unlikely for currency conversion; more plausible for
+imputation's `O(SEARCH_LIMIT)` neighbor scan per row), the single-threaded
+batch-fill/dispatch loop on the direct paths (see below), the single-thread
+`commit_batch_history` kernel on the imputation path (its cost scales with
+batch size and cannot itself be pipelined across batches), or, on the RDMA
+path, link bandwidth for the fixed-size slot format.
+
+Both direct-path UDFs dispatch batches from one dedicated executor thread
+(filling pinned buffers and issuing the JNI call). Once GPU-side round trips
+overlap via pipelining, that single CPU thread doing the fill-loop and native
+dispatch sequentially across lanes can become the new bottleneck at high
+depth — if throughput plateaus well before the GPU should plausibly be
+saturated, check this before assuming it is a GPU limit. In practice the
+biggest single contributor found on that thread was `BigDecimal.valueOf(double)`
+on the output side: it's `new BigDecimal(Double.toString(val))` internally, a
+full decimal string format-and-reparse per row, run once per output row on
+that one thread. Both UDFs now compute the scale-3 unscaled value directly
+and use the non-parsing `BigDecimal.valueOf(long, int)` overload instead
+(falling back to the exact string-based path only for values whose unscaled
+magnitude could overflow a `long`, which no realistic price approaches).
+This alone can be the difference between "GPU-bound" and "one Java thread
+doing decimal string parsing 2048 times per batch bound."
+
+A second, related fix a CPU flame graph (async-profiler / JFR, attached to
+the TaskManager during a real run) surfaced: both UDFs originally ran their
+per-batch dispatch (`eval()`'s immediate `execute()` calls) *and* the
+delayed partial-batch timer on the same `ScheduledThreadPoolExecutor`. That
+class backs *everything* — even zero-delay `execute()` calls — with the same
+priority-heap queue (`DelayedWorkQueue`) it uses for the timer, so every
+single dispatch paid an O(log n) heap insert/remove
+(`ScheduledFutureTask.compareTo`, `DelayedWorkQueue.siftDown`) instead of the
+O(1) a plain FIFO queue would cost. Measured on a real profile, that was
+~5.8% of total CPU self time before any of the framework overhead below.
+Both UDFs now split this into two executors: a plain
+`Executors.newSingleThreadExecutor` for dispatch, and a separate
+`ScheduledThreadPoolExecutor` used only for the timer — which, holding at
+most one pending task, pays negligible heap cost regardless.
+
+Reading a flame graph of either UDF, expect roughly these buckets (order and
+exact split will vary by run and hardware):
+- **The actual GPU work** — `submitBatch`/`waitBatch` and everything under
+  `CurrencyConversionGpuNative`/`ImputationGpuNative` — should be a small
+  slice (single-digit percent) if pipelining is doing its job. If this is
+  large instead, that points back at the round trip itself, not the JVM side.
+- **Flink's async-operator framework** — `AsyncWaitOperator`,
+  `OrderedStreamElementQueue`, `DelegatingAsyncResultFuture`, plus JDK
+  `CompletableFuture` completion machinery — this is inherent per-row
+  `AsyncScalarFunction` cost, not something tunable from inside this UDF; see
+  below.
+- **Flink row serialization** (`RowDataSerializer`, `GenericRowData`,
+  `DecimalData`) converting the returned value back into Flink's internal
+  row format — also framework cost, largely unavoidable.
+- **JIT compiler activity** (`CompileBroker`, `C2Compiler`, `PhaseChaitin`,
+  and similar HotSpot-internal frames) — if this is a large fraction, the
+  profiled window likely overlapped JVM warm-up rather than steady state;
+  re-profile after several minutes of sustained load before trusting the
+  numbers.
+- **Our own UDF code** (batching, `ByteBuffer` marshalling, `toScale3`) —
+  should also be a small slice; if this grows large, that's the concrete,
+  fixable kind of cost the two fixes above were.
+
+If the dispatch thread is still the ceiling after both fixes (check: is the
+`flinke2c-*-gpu-*` thread pinned near 100% CPU while GPU utilization is low?
+that confirms it), the next-larger lever is architectural, not a tuning knob:
+`AsyncScalarFunction.eval()` costs more per row than the plain CPU UDF
+inherently pays, independent of anything in this codebase — a `BigDecimal`
+argument boxed by Flink's codegen, a `CompletableFuture` allocated by Flink
+per call, and the async operator's own in-flight/ordering bookkeeping, all on
+top of whatever our own queueing adds. A real profile measured this Flink
+async-framework tax (`AsyncWaitOperator`/`OrderedStreamElementQueue`/
+`DelegatingAsyncResultFuture` plus `CompletableFuture`) at roughly 14% of
+total CPU self time on its own — a real cost, though on its own not close to
+explaining a multi-times throughput gap against a synchronous CPU baseline;
+expect it to be one contributor among several rather than the single
+explanation. The RDMA path doesn't pay any of this:
+`RdmaPreOperator`/`RdmaPostOperator` are custom operators that encode whole
+batches to bytes once (`ExternalRuntimeBinaryCodec`) and move them as
+`byte[]`, with no per-row future and no per-row scalar-function call at all.
+Closing the *entire* gap to a CPU baseline that also doesn't pay per-row
+async overhead may not be possible from inside the `AsyncScalarFunction`
+model — the more faithful fix, if the gap remains large after the above,
+would be reshaping the direct-CUDA path into an operator pair structured like
+`RdmaPreOperator`/`RdmaPostOperator` (batches of raw bytes in and out, no
+per-row `CompletableFuture`) instead of a scalar UDF. That's a substantially
+larger change than anything above and worth doing only if the cheaper fixes
+don't close enough of the gap.
+
+## Direct CUDA currency conversion operator (batch-native, no AsyncScalarFunction)
+
+`CudaCurrencyConversionOperator` (`java/flink/CudaCurrencyConversionOperator.java`)
+is that larger change: a real operator replacement for
+`CurrencyConversionFunctionGpu`, built the way the "more faithful fix"
+paragraph above describes, once profiling on a real workload confirmed the
+`AsyncScalarFunction` per-row completion machinery (one `CompletableFuture`
+per row, `AsyncWaitOperator`'s ordered result queue, one mailbox repost per
+row) was the remaining ceiling after the batching/pipelining/executor fixes
+above — none of which touch that machinery, since it's per-row regardless of
+how batched the GPU dispatch is.
+
+**Design.** Unlike `RdmaPreOperator`/`RdmaPostOperator`, this needs only one
+operator: the native call is an in-process JNI call to a local GPU, not a
+cross-machine RDMA round trip, so there's no reason to split "publish input"
+and "consume output" across two operators/TaskManagers. It reuses the exact
+lane/pipelining design `CurrencyConversionFunctionGpu` uses (buffer a batch,
+submit non-blockingly to one of `pipelineDepth` CUDA streams, collect a
+lane's previous batch right before reusing it), but emits results with a
+plain `output.collect()` loop instead of completing futures — no
+`CompletableFuture`, no ordered async queue, no per-row mailbox repost.
+Because `processElement` is guaranteed non-concurrent with itself by Flink's
+runtime, none of the batching state needs the locking the async UDF requires.
+Row order is preserved by construction (lanes are always collected in
+submission order, always before being reused), so unlike `RdmaPostOperator`
+there's no explicit sequence-number check needed — that one exists because
+RDMA crosses a network boundary, and this doesn't.
+
+**Two important things to know before using this:**
+
+1. **It is written by close analogy to `RdmaOperator`/`RdmaPreOperator`/
+   `RdmaPostOperator`, not verified against `ExternalRuntimeOperator`'s
+   actual source** (not present in this repository). The constructor shape,
+   the inherited `conf`/`output` fields, and the
+   `openInternal`/`closeInternal`/`processElementInternal`/`processRow`
+   template methods are inferred from how the RDMA operators use them. The
+   batching/pipelining/row-conversion logic doesn't depend on getting those
+   exactly right, but the class won't compile until they match the real base
+   class — check this first.
+2. **Wiring it into a query the way `RdmaOperator` is wired in — as a
+   transparent swap-in for a plain `SELECT CurrencyConversionFunction(price)`
+   call via `table.exec.external-runtime.conf.<class>` — depends on planner
+   code that also isn't in this repository.** `usesDirectCudaTransport(conf)`
+   is provided (mirroring `RdmaOperator.usesRdmaTransport`) in case the
+   dispatch convention expects a predicate like that per candidate operator
+   class, but whether the planner's dispatch is a generic lookup (in which
+   case this "just works" once wired) or a hardcoded reference to
+   `RdmaPreOperator`/`RdmaPostOperator` specifically (in which case adding
+   this operator as a candidate needs an edit on the Flink planner side too)
+   isn't something this repository can answer.
+
+**Native bridge is intentionally separate from `CurrencyConversionGpuNative`.**
+This operator's package (`org.apache.flink.table.runtime.functions.table
+.externalruntime`, matching `RdmaPreOperator`/`RdmaPostOperator`) implies it
+gets compiled into the Flink distribution itself, the same way
+`RustRdmaNative` is for the RDMA path — while `CurrencyConversionGpuNative`
+(used by the `AsyncScalarFunction` path) ships in the separate `flinke2c`
+user JAR. Flink's own classloader generally can't see classes from a
+separately deployed user JAR, so reusing that bridge class directly across
+the package boundary isn't reliable. `DirectCudaCurrencyNative`
+(`java/flink/DirectCudaCurrencyNative.java`) is a second, self-contained JNI
+bridge with its own exported symbol names, calling into the *same*
+`direct_currency_conversion_jni.cu` logic — see that file's "Bridge 1"/
+"Bridge 2" comments. No CUDA logic is duplicated, only the thin JNI wrapper
+functions. One consequence worth testing before relying on both paths in the
+same cluster: loading the same `.so` from two different classloaders in one
+JVM process can fail with `UnsatisfiedLinkError: Native Library ... already
+loaded in another classloader` if a single TaskManager process ever runs both
+`CurrencyConversionFunctionGpu` and `CudaCurrencyConversionOperator` over its
+lifetime.
+
+**Conf keys** (same semicolon-delimited `key=value` style as
+`RdmaOperator.RdmaConfig`, e.g. via whatever conf string your planner rule
+passes through): `batchsize` (default 64), `pipelinedepth` (default 4, max
+64), `threadsperblock` (default 256, max 1024), `device` (default 0),
+`fieldindex` (default 0 — the row position of the `DECIMAL` price column to
+convert; must name a `DECIMAL` column or construction fails).

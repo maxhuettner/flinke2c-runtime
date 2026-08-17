@@ -27,9 +27,9 @@ import java.math.RoundingMode;
  * [int32_be frameLen][payload]
  * payload := int32 __op, [int64 __rowId if enabled], nullBitmap, values...
  */
-final class ExternalRuntimeBinaryCodec {
+public final class ExternalRuntimeBinaryCodec {
 
-    enum WireType {
+    public enum WireType {
         INT32,
         INT64,
         FLOAT32,
@@ -67,7 +67,7 @@ final class ExternalRuntimeBinaryCodec {
 
     private static final long[] POW10 = initPow10();
 
-    ExternalRuntimeBinaryCodec(
+    public ExternalRuntimeBinaryCodec(
             boolean includeRowId,
             @Nullable WireType[] writeWireTypes,
             @Nullable LogicalType[] writeTargetTypes,
@@ -150,7 +150,7 @@ final class ExternalRuntimeBinaryCodec {
     }
 
     /** Encodes one frame without constructing a temporary ByteArrayOutputStream. */
-    byte[] encodeFramedRow(RowData row, int[] payloadFieldIndices, long rowId) throws IOException {
+    public byte[] encodeFramedRow(RowData row, int[] payloadFieldIndices, long rowId) throws IOException {
         if (writeWireTypes == null) {
             throw new IOException("ExternalRuntimeBinaryCodec not configured for writing");
         }
@@ -182,6 +182,54 @@ final class ExternalRuntimeBinaryCodec {
         frame[3] = (byte) payloadLen;
         System.arraycopy(outBuf.buf(), 0, frame, Integer.BYTES, payloadLen);
         return frame;
+    }
+
+    /**
+     * Encodes directly into a caller-owned buffer. This is used by the local packed CUDA
+     * operator so the hot path does not allocate one temporary byte array per input row.
+     *
+     * @return complete frame length, including the four-byte big-endian length prefix
+     */
+    public int encodeFramedRow(
+            RowData row, int[] payloadFieldIndices, long rowId,
+            java.nio.ByteBuffer destination, int offset) throws IOException {
+        return encodeFramedRow(row, payloadFieldIndices, rowId, destination, offset,
+                Integer.MAX_VALUE);
+    }
+
+    /** Encodes directly into a buffer while enforcing a per-record capacity. */
+    public int encodeFramedRow(
+            RowData row, int[] payloadFieldIndices, long rowId,
+            java.nio.ByteBuffer destination, int offset, int maxFrameLength) throws IOException {
+        if (writeWireTypes == null) {
+            throw new IOException("ExternalRuntimeBinaryCodec not configured for writing");
+        }
+        final int nFields = writeWireTypes.length;
+        final int nullBytes = (nFields + 7) >>> 3;
+        outBuf.reset();
+        outBuf.putIntBE(rowKindToOp(row.getRowKind()));
+        if (includeRowId) outBuf.putLongBE(rowId);
+        final int nullBitmapPos = outBuf.position();
+        outBuf.ensureCapacity(nullBytes);
+        for (int i = 0; i < nullBytes; i++) outBuf.putByte((byte) 0);
+        for (int i = 0; i < nFields; i++) {
+            final int sourceIndex = payloadFieldIndices[i];
+            if (row.isNullAt(sourceIndex)) setNullBit(outBuf.buf(), nullBitmapPos, i);
+            else writeValue(i, row, sourceIndex);
+        }
+        final int payloadLen = outBuf.position();
+        final int frameLen = payloadLen + Integer.BYTES;
+        if (frameLen > maxFrameLength || offset < 0 || offset > destination.limit() - frameLen) {
+            throw new IOException("destination buffer is too small for encoded row");
+        }
+        destination.put(offset, (byte) (payloadLen >>> 24));
+        destination.put(offset + 1, (byte) (payloadLen >>> 16));
+        destination.put(offset + 2, (byte) (payloadLen >>> 8));
+        destination.put(offset + 3, (byte) payloadLen);
+        for (int i = 0; i < payloadLen; i++) {
+            destination.put(offset + Integer.BYTES + i, outBuf.buf()[i]);
+        }
+        return frameLen;
     }
 
     private void writeValue(int fieldPos, RowData row, int sourceIndex) throws IOException {
@@ -289,7 +337,7 @@ final class ExternalRuntimeBinaryCodec {
     }
 
     /** Decodes a complete RDMA slot directly, avoiding a ByteArrayInputStream allocation. */
-    RowWithId readFramedRow(byte[] frame, RowKind fallbackKind, @Nullable GenericRowData reuseRow)
+    public RowWithId readFramedRow(byte[] frame, RowKind fallbackKind, @Nullable GenericRowData reuseRow)
             throws IOException {
         if (frame.length < Integer.BYTES) {
             throw new IOException("Truncated frame header");
@@ -303,6 +351,24 @@ final class ExternalRuntimeBinaryCodec {
                             + frame.length);
         }
         return decodeFrame(frame, Integer.BYTES, frameLen, fallbackKind, reuseRow);
+    }
+
+    /**
+     * Decodes a frame in a native direct buffer without copying the slot into a
+     * temporary byte array. The offset points at the four-byte frame length.
+     */
+    public RowWithId readFramedRow(
+            java.nio.ByteBuffer frame, int offset, RowKind fallbackKind,
+            @Nullable GenericRowData reuseRow) throws IOException {
+        if (offset < 0 || offset > frame.limit() - Integer.BYTES) {
+            throw new IOException("Truncated frame header");
+        }
+        final int frameLen = readIntBE(frame, offset);
+        if (frameLen < 0 || frameLen > DEFAULT_MAX_FRAME_SIZE
+                || frameLen > frame.limit() - offset - Integer.BYTES) {
+            throw new IOException("Invalid frame length: " + frameLen);
+        }
+        return decodeFrame(frame, offset + Integer.BYTES, frameLen, fallbackKind, reuseRow);
     }
 
     private RowWithId decodeFrame(
@@ -345,6 +411,40 @@ final class ExternalRuntimeBinaryCodec {
 
         final RowKind kind = opToRowKind(op, fallbackKind);
         outRow.setRowKind(kind);
+        return new RowWithId(rowId, outRow);
+    }
+
+    private RowWithId decodeFrame(
+            java.nio.ByteBuffer frame, int frameOffset, int frameLen, RowKind fallbackKind,
+            @Nullable GenericRowData reuseRow) throws IOException {
+        int p = frameOffset;
+        final int limit = frameOffset + frameLen;
+        if (p + 4 > limit) throw new IOException("Truncated payload: missing operation");
+        final int op = readIntBE(frame, p);
+        p += 4;
+        final long rowId;
+        if (includeRowId) {
+            if (p + 8 > limit) throw new IOException("Truncated payload: missing row id");
+            rowId = readLongBE(frame, p);
+            p += 8;
+        } else {
+            rowId = -1L;
+        }
+        final int nFields = readWireTypes.length;
+        final int nullBytes = (nFields + 7) >>> 3;
+        if (p + nullBytes > limit) throw new IOException("Truncated payload: missing nullBitmap");
+        final int nullBitmapPos = p;
+        p += nullBytes;
+        final GenericRowData outRow = reuseRow != null && reuseRow.getArity() == nFields
+                ? reuseRow : new GenericRowData(nFields);
+        for (int i = 0; i < nFields; i++) {
+            if (isNullBitSet(frame, nullBitmapPos, i)) {
+                outRow.setField(i, null);
+            } else {
+                p = readValueIntoRow(i, frame, p, limit, outRow);
+            }
+        }
+        outRow.setRowKind(opToRowKind(op, fallbackKind));
         return new RowWithId(rowId, outRow);
     }
 
@@ -444,6 +544,67 @@ final class ExternalRuntimeBinaryCodec {
         }
     }
 
+    private int readValueIntoRow(
+            int i, java.nio.ByteBuffer buf, int p, int limit, GenericRowData outRow)
+            throws IOException {
+        final WireType wt = readWireTypes[i];
+        switch (wt) {
+            case BOOL:
+                if (p + 1 > limit) throw new IOException("Truncated BOOL");
+                outRow.setField(i, castIfNeeded(buf.get(p) != 0, readSourceTypes[i], readTargetTypes[i]));
+                return p + 1;
+            case INT32:
+                if (p + 4 > limit) throw new IOException("Truncated INT32");
+                outRow.setField(i, castIfNeeded(readIntBE(buf, p), readSourceTypes[i], readTargetTypes[i]));
+                return p + 4;
+            case INT64:
+            case TIMESTAMP_MILLIS:
+                if (p + 8 > limit) throw new IOException("Truncated INT64");
+                outRow.setField(i, castIfNeeded(readLongBE(buf, p), readSourceTypes[i], readTargetTypes[i]));
+                return p + 8;
+            case FLOAT32:
+                if (p + 4 > limit) throw new IOException("Truncated FLOAT32");
+                outRow.setField(i, castIfNeeded(Float.intBitsToFloat(readIntBE(buf, p)), readSourceTypes[i], readTargetTypes[i]));
+                return p + 4;
+            case FLOAT64:
+                if (p + 8 > limit) throw new IOException("Truncated FLOAT64");
+                outRow.setField(i, castIfNeeded(Double.longBitsToDouble(readLongBE(buf, p)), readSourceTypes[i], readTargetTypes[i]));
+                return p + 8;
+            case STRING: {
+                if (p + 4 > limit) throw new IOException("Truncated STRING len");
+                final int len = readIntBE(buf, p);
+                p += 4;
+                if (len < 0 || p + len > limit) throw new IOException("Invalid STRING len: " + len);
+                final byte[] bytes = copyBytes(i, buf, p, len);
+                final StringData sd = StringData.fromBytes(bytes, 0, len);
+                outRow.setField(i, castIfNeeded(sd, readSourceTypes[i], readTargetTypes[i]));
+                return p + len;
+            }
+            case BYTES: {
+                if (p + 4 > limit) throw new IOException("Truncated BYTES len");
+                final int len = readIntBE(buf, p);
+                p += 4;
+                if (len < 0 || p + len > limit) throw new IOException("Invalid BYTES len: " + len);
+                outRow.setField(i, castIfNeeded(copyBytes(i, buf, p, len), readSourceTypes[i], readTargetTypes[i]));
+                return p + len;
+            }
+            case DECIMAL_UNSCALED_I64:
+                if (p + 8 > limit) throw new IOException("Truncated DECIMAL_UNSCALED_I64");
+                outRow.setField(i, castIfNeeded(readLongBE(buf, p), readSourceTypes[i], readTargetTypes[i]));
+                return p + 8;
+            case DECIMAL_UNSCALED_BYTES: {
+                if (p + 4 > limit) throw new IOException("Truncated DECIMAL_UNSCALED_BYTES len");
+                final int len = readIntBE(buf, p);
+                p += 4;
+                if (len < 0 || p + len > limit) throw new IOException("Invalid DECIMAL bytes len: " + len);
+                outRow.setField(i, castIfNeeded(copyBytes(i, buf, p, len), readSourceTypes[i], readTargetTypes[i]));
+                return p + len;
+            }
+            default:
+                throw new IOException("Unsupported read wire type: " + wt);
+        }
+    }
+
     private static Object castIfNeeded(Object value, LogicalType sourceType, LogicalType targetType) {
         if (value == null || targetType == null) {
             return value;
@@ -463,7 +624,10 @@ final class ExternalRuntimeBinaryCodec {
 
             if (tr == LogicalTypeRoot.DECIMAL) {
                 final DecimalType dt = (DecimalType) targetType;
-                final DecimalData d = (DecimalData) materializeFromWire(value, targetType);
+                // The wire bytes have the scale of the source schema (for the packed imputer,
+                // DECIMAL(23,3)); materializing with targetType would silently interpret those
+                // bytes at the result scale before the cast.
+                final DecimalData d = (DecimalData) materializeFromWire(value, sourceType);
                 return DecimalDataUtils.castFrom(d, dt.getPrecision(), dt.getScale());
             }
             return materializeFromWire(value, targetType);
@@ -622,11 +786,11 @@ final class ExternalRuntimeBinaryCodec {
         }
     }
 
-    static boolean isStringRoot(LogicalTypeRoot root) {
+    public static boolean isStringRoot(LogicalTypeRoot root) {
         return root == LogicalTypeRoot.CHAR || root == LogicalTypeRoot.VARCHAR;
     }
 
-    static boolean isTimestampRoot(LogicalTypeRoot root) {
+    public static boolean isTimestampRoot(LogicalTypeRoot root) {
         return root == LogicalTypeRoot.TIMESTAMP_WITHOUT_TIME_ZONE
                 || root == LogicalTypeRoot.TIMESTAMP_WITH_LOCAL_TIME_ZONE;
     }
@@ -747,9 +911,9 @@ final class ExternalRuntimeBinaryCodec {
         }
     }
 
-    static final class RowWithId {
-        final long rowId;
-        final RowData row;
+    public static final class RowWithId {
+        public final long rowId;
+        public final RowData row;
 
         RowWithId(long rowId, RowData row) {
             this.rowId = rowId;
@@ -773,6 +937,22 @@ final class ExternalRuntimeBinaryCodec {
         return out;
     }
 
+    private byte[] copyBytes(int fieldIndex, java.nio.ByteBuffer buf, int p, int len) {
+        final byte[] out;
+        if (reuseObjects) {
+            byte[] existing = reuseBytes[fieldIndex];
+            if (existing == null || existing.length != len) {
+                existing = new byte[len];
+                reuseBytes[fieldIndex] = existing;
+            }
+            out = existing;
+        } else {
+            out = new byte[len];
+        }
+        for (int i = 0; i < len; i++) out[i] = buf.get(p + i);
+        return out;
+    }
+
     private void ensureReadBuf(int len) {
         if (frameReadBuf.length >= len)
             return;
@@ -793,6 +973,12 @@ final class ExternalRuntimeBinaryCodec {
         final int bit = fieldIndex & 7;
         final int b = payload[byteIndex] & 0xFF;
         return (b & (1 << bit)) != 0;
+    }
+
+    private static boolean isNullBitSet(java.nio.ByteBuffer payload, int bitmapPos, int fieldIndex) {
+        final int byteIndex = bitmapPos + (fieldIndex >>> 3);
+        final int bit = fieldIndex & 7;
+        return (payload.get(byteIndex) & (1 << bit)) != 0;
     }
 
     private static void readFully(InputStream in, byte[] b, int off, int len) throws IOException {
@@ -824,6 +1010,13 @@ final class ExternalRuntimeBinaryCodec {
                 | (buf[p + 3] & 0xff);
     }
 
+    private static int readIntBE(java.nio.ByteBuffer buf, int p) {
+        return ((buf.get(p) & 0xff) << 24)
+                | ((buf.get(p + 1) & 0xff) << 16)
+                | ((buf.get(p + 2) & 0xff) << 8)
+                | (buf.get(p + 3) & 0xff);
+    }
+
     private static long readLongBE(byte[] buf, int p) {
         return ((long) (buf[p] & 0xff) << 56)
                 | ((long) (buf[p + 1] & 0xff) << 48)
@@ -833,6 +1026,17 @@ final class ExternalRuntimeBinaryCodec {
                 | ((long) (buf[p + 5] & 0xff) << 16)
                 | ((long) (buf[p + 6] & 0xff) << 8)
                 | (buf[p + 7] & 0xff);
+    }
+
+    private static long readLongBE(java.nio.ByteBuffer buf, int p) {
+        return ((long) (buf.get(p) & 0xff) << 56)
+                | ((long) (buf.get(p + 1) & 0xff) << 48)
+                | ((long) (buf.get(p + 2) & 0xff) << 40)
+                | ((long) (buf.get(p + 3) & 0xff) << 32)
+                | ((long) (buf.get(p + 4) & 0xff) << 24)
+                | ((long) (buf.get(p + 5) & 0xff) << 16)
+                | ((long) (buf.get(p + 6) & 0xff) << 8)
+                | (buf.get(p + 7) & 0xff);
     }
 
     private static void writeIntBE(OutputStream out, int v) throws IOException {

@@ -12,7 +12,7 @@ namespace {
 constexpr double CONVERSION_FACTOR = 0.908;
 
 // Keep these layouts in sync with CurrencyConversionFunctionGpu.java and
-// DirectCudaCurrencyNative.java (both native bridges below share this ABI).
+// DirectCudaCurrencyNative.java and CurrencyConversionGpuNative share this ABI.
 struct Input {
     double price;
     uint32_t valid;
@@ -159,15 +159,8 @@ bool require_lane(JNIEnv* env, Context* context, jint lane, uint32_t& out) {
 // Shared implementation. Exposed to Java through two independent sets of
 // JNI wrappers below: CurrencyConversionGpuNative (used by the
 // AsyncScalarFunction path, org.example.flinke2c) and
-// DirectCudaCurrencyNative (used by CudaCurrencyConversionOperator,
-// org.apache.flink.table.runtime.functions.table.externalruntime). Both
-// bridge classes call into the exact same context/lane logic; only the
-// JNI-mangled entry-point names differ, one per calling class. This exists
-// because the operator is expected to be compiled into the Flink
-// distribution itself (matching how RdmaPreOperator/RdmaPostOperator and
-// their RustRdmaNative bridge are structured) while the async UDF ships in
-// a separate user JAR — two different classloaders in general, so a single
-// shared Java bridge class isn't reliably visible to both callers.
+// DirectCudaCurrencyNative (used by the dynamically loaded packed function).
+// Both user-jar bridge classes call the same context/lane logic.
 // ---------------------------------------------------------------------
 
 jlong create_impl(
@@ -449,53 +442,6 @@ Java_org_example_flinke2c_DirectCudaCurrencyNative_waitBatch(
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_example_flinke2c_DirectCudaCurrencyNative_destroy(
-        JNIEnv*, jclass, jlong handle) {
-    destroy_impl(handle);
-}
-
-// ---------------------------------------------------------------------
-// Bridge 2: org.apache.flink.table.runtime.functions.table.externalruntime
-//           .DirectCudaCurrencyNative
-// Used by CudaCurrencyConversionOperator, expected to be compiled into the
-// Flink distribution itself (see that class's Javadoc). Identical ABI and
-// behavior to Bridge 1 above; only the exported symbol names differ, since
-// JNI resolves native methods by the calling Java class's fully-qualified
-// name.
-// ---------------------------------------------------------------------
-
-extern "C" JNIEXPORT jlong JNICALL
-Java_org_apache_flink_table_runtime_functions_table_externalruntime_DirectCudaCurrencyNative_create(
-        JNIEnv* env, jclass, jint cuda_device, jint batch_capacity, jint pipeline_depth,
-        jint threads_per_block) {
-    return create_impl(env, cuda_device, batch_capacity, pipeline_depth, threads_per_block);
-}
-
-extern "C" JNIEXPORT jobject JNICALL
-Java_org_apache_flink_table_runtime_functions_table_externalruntime_DirectCudaCurrencyNative_inputBuffer(
-        JNIEnv* env, jclass, jlong handle, jint lane) {
-    return input_buffer_impl(env, handle, lane);
-}
-
-extern "C" JNIEXPORT jobject JNICALL
-Java_org_apache_flink_table_runtime_functions_table_externalruntime_DirectCudaCurrencyNative_outputBuffer(
-        JNIEnv* env, jclass, jlong handle, jint lane) {
-    return output_buffer_impl(env, handle, lane);
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_org_apache_flink_table_runtime_functions_table_externalruntime_DirectCudaCurrencyNative_submitBatch(
-        JNIEnv* env, jclass, jlong handle, jint lane, jint count) {
-    submit_batch_impl(env, handle, lane, count);
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_org_apache_flink_table_runtime_functions_table_externalruntime_DirectCudaCurrencyNative_waitBatch(
-        JNIEnv* env, jclass, jlong handle, jint lane) {
-    wait_batch_impl(env, handle, lane);
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_org_apache_flink_table_runtime_functions_table_externalruntime_DirectCudaCurrencyNative_destroy(
         JNIEnv*, jclass, jlong handle) {
     destroy_impl(handle);
 }

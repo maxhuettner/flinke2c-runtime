@@ -583,11 +583,10 @@ per-row `CompletableFuture`) instead of a scalar UDF. That's a substantially
 larger change than anything above and worth doing only if the cheaper fixes
 don't close enough of the gap.
 
-## Direct CUDA currency conversion operator (batch-native, no AsyncScalarFunction)
+## Direct CUDA currency conversion function (packed, dynamically loaded)
 
-`CudaCurrencyConversionOperator` (`java/flink/CudaCurrencyConversionOperator.java`)
-is that larger change: a real operator replacement for
-`CurrencyConversionFunctionGpu`, built the way the "more faithful fix"
+`CurrencyConversionGpuFunction` is that packed implementation: a dynamic
+replacement for `CurrencyConversionFunctionGpu`, built the way the "more faithful fix"
 paragraph above describes, once profiling on a real workload confirmed the
 `AsyncScalarFunction` per-row completion machinery (one `CompletableFuture`
 per row, `AsyncWaitOperator`'s ordered result queue, one mailbox repost per
@@ -651,7 +650,7 @@ functions. One consequence worth testing before relying on both paths in the
 same cluster: loading the same `.so` from two different classloaders in one
 JVM process can fail with `UnsatisfiedLinkError: Native Library ... already
 loaded in another classloader` if a single TaskManager process ever runs both
-`CurrencyConversionFunctionGpu` and `CudaCurrencyConversionOperator` over its
+`CurrencyConversionFunctionGpu` and `CurrencyConversionGpuFunction` over its
 lifetime.
 
 **Conf keys** (same semicolon-delimited `key=value` style as
@@ -660,3 +659,25 @@ passes through): `batchsize` (default 64), `pipelinedepth` (default 4, max
 64), `threadsperblock` (default 256, max 1024), `device` (default 0),
 `fieldindex` (default 0 — the row position of the `DECIMAL` price column to
 convert; must name a `DECIMAL` column or construction fails).
+
+## Packed direct CUDA imputation
+
+`ImputationGpuFunction` and the existing `flinke2c_imputation_gpu` library provide the
+corresponding local path for imputation. The dynamically loaded function uses
+the same framed seven-field ABI as `RdmaPreOperator`/`RdmaPostOperator`, writes
+directly into pinned slot memory, and runs parsing, string hashing, KNN search,
+history commit, and decimal encoding on the GPU. Use the normal dynamic
+`impl=org.example.flinke2c.ImputationGpuFunction` configuration (with the optional `batchsize`,
+`pipelinedepth`, `threadsperblock`, and `device` keys). The default schema is
+`DECIMAL/BIGINT price, BIGINT auction, BIGINT bidder, STRING channel, STRING
+url, TIMESTAMP, STRING extra`; `pricefield=...` and the corresponding other
+`*field` keys can select positions. The planner must register
+the dynamic `GpuRuntimeOperator` with the packed function interface described
+below.
+
+The same optimization is available through the normal dynamic GPU-function
+configuration. `GpuRuntimeOperator` now accepts any class implementing
+the packed `GpuRuntimeFunction` contract; it still loads the class from `impl=...`, but
+forwards live rows directly and lets the function own native batching. The
+updated user functions are `org.example.flinke2c.ImputationGpuFunction` and
+`org.example.flinke2c.CurrencyConversionGpuFunction`.

@@ -42,6 +42,15 @@ struct ImputationObservation {
     uint32_t extra_hash;
 };
 
+// Per-session history used by the packed local-JNI path. The RDMA path keeps
+// its historical module-global state for compatibility; the JNI path passes
+// this object explicitly so separate Flink subtasks do not share history.
+struct ImputationState {
+    ImputationObservation history[IMPUTATION_HISTORY_SIZE];
+    uint32_t start;
+    uint32_t size;
+};
+
 // Module globals are zero-initialized when a server session loads the PTX.
 // Stateful batches are ordered by CUDA events on the host before these values
 // are read or updated.
@@ -505,6 +514,94 @@ __device__ double impute_price(
     return denominator != 0.0 ? numerator / denominator : 0.0;
 }
 
+__device__ double impute_price_state(
+    const ImputationState& state,
+    const RingBuffer* input, uint64_t input_tail, uint32_t item,
+    const BidView& target_bid) {
+    const ImputationObservation target = observation_from(target_bid);
+    double best_distance[IMPUTATION_K];
+    double best_price[IMPUTATION_K];
+    uint32_t found = 0;
+    uint32_t remaining = IMPUTATION_SEARCH_LIMIT;
+
+    for (uint32_t prior = item; prior > 0 && remaining > 0; --prior) {
+        const uint32_t index =
+            (input_tail + prior - 1) & (RING_BUFFER_ELEMENTS - 1);
+        BidView candidate_bid;
+        if (parse_bid(input->slots[index], candidate_bid) &&
+            !candidate_bid.price_missing) {
+            consider_neighbor(
+                target, observation_from(candidate_bid),
+                best_distance, best_price, found);
+            --remaining;
+        }
+    }
+
+    const uint32_t search_count =
+        state.size < remaining ? state.size : remaining;
+    for (uint32_t i = 0; i < search_count; ++i) {
+        const uint32_t index =
+            (state.start + state.size - 1 - i) % IMPUTATION_HISTORY_SIZE;
+        consider_neighbor(
+            target, state.history[index],
+            best_distance, best_price, found);
+    }
+
+    if (found == 0) return 0.0;
+
+    double numerator = 0.0;
+    double denominator = 0.0;
+    for (uint32_t i = 0; i < found; ++i) {
+        const double weight = 1.0 / (best_distance[i] + IMPUTATION_EPS);
+        numerator += best_price[i] * weight;
+        denominator += weight;
+    }
+    return denominator != 0.0 ? numerator / denominator : 0.0;
+}
+
+// Packed rows are variable-length. Parse each row once per batch and let the
+// KNN search use these compact observations instead of reparsing and hashing
+// up to 512 candidate rows for every missing value.
+__device__ double impute_price_state_observations(
+    const ImputationState& state,
+    const ImputationObservation* observations,
+    const uint8_t* has_price,
+    uint32_t item,
+    const ImputationObservation& target) {
+    double best_distance[IMPUTATION_K];
+    double best_price[IMPUTATION_K];
+    uint32_t found = 0;
+    uint32_t remaining = IMPUTATION_SEARCH_LIMIT;
+
+    for (uint32_t prior = item; prior > 0 && remaining > 0; --prior) {
+        const uint32_t index = prior - 1;
+        if (has_price[index] != 0) {
+            consider_neighbor(target, observations[index], best_distance,
+                              best_price, found);
+            --remaining;
+        }
+    }
+
+    const uint32_t search_count =
+        state.size < remaining ? state.size : remaining;
+    for (uint32_t i = 0; i < search_count; ++i) {
+        const uint32_t index =
+            (state.start + state.size - 1 - i) % IMPUTATION_HISTORY_SIZE;
+        consider_neighbor(target, state.history[index], best_distance,
+                          best_price, found);
+    }
+
+    if (found == 0) return 0.0;
+    double numerator = 0.0;
+    double denominator = 0.0;
+    for (uint32_t i = 0; i < found; ++i) {
+        const double weight = 1.0 / (best_distance[i] + IMPUTATION_EPS);
+        numerator += best_price[i] * weight;
+        denominator += weight;
+    }
+    return denominator != 0.0 ? numerator / denominator : 0.0;
+}
+
 // Encodes round-HALF_UP(price * 1000) as a minimal big-endian two's-complement
 // integer. The base-256 path also covers imputed values outside int64 range.
 __device__ uint32_t encode_decimal(double price, uint8_t* output) {
@@ -760,9 +857,10 @@ extern "C" __global__ void process_slots(
 
     BidView bid;
     if (!parse_bid(source, bid)) return;
-    double price = bid.price_missing
-        ? impute_price(input, input_tail, item, bid)
-        : decimal_to_double(bid.price, bid.price_length);
+    // The source bytes are already the exact result for observed prices.
+    // Avoid converting DECIMAL through double and preserve their precision.
+    if (!bid.price_missing) return;
+    double price = impute_price(input, input_tail, item, bid);
     // A missing/invalid neighborhood maps to the Java UDF's 0.000 default.
     if (!isfinite(price)) price = 0.0;
     write_imputed_bid(source, destination, bid, price);
@@ -797,5 +895,94 @@ extern "C" __global__ void commit_imputation_history(
                 (imputation_history_start + 1) % IMPUTATION_HISTORY_SIZE;
         }
         imputation_history[history_index] = observation_from(bid);
+    }
+}
+
+// Per-context variants used by the packed local JNI operator. These consume
+// exactly the same framed slot format as the RDMA path, but receive an
+// explicit history pointer so separate JVM subtasks remain isolated.
+extern "C" __global__ void prepare_imputation_observations(
+    const RingBuffer* input, ImputationObservation* observations,
+    uint8_t* has_price, uint32_t count) {
+    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+    if (item >= count) return;
+    BidView bid;
+    if (!parse_bid(input->slots[item], bid)) {
+        observations[item].price = 0.0;
+        observations[item].bidder = 0;
+        observations[item].timestamp_seconds = 0.0;
+        observations[item].channel_hash = 0;
+        observations[item].url_hash = 0;
+        observations[item].extra_hash = 0;
+        has_price[item] = 0;
+        return;
+    }
+    observations[item] = observation_from(bid);
+    has_price[item] = bid.price_missing ? 0 : 1;
+}
+
+extern "C" __global__ void process_slots_state(
+    const RingBuffer* input, RingBuffer* output, ImputationState* state,
+    const ImputationObservation* observations, const uint8_t* has_price,
+    uint64_t input_tail, uint64_t output_head, uint32_t count,
+    ProcessSpec spec) {
+    constexpr uint32_t WARP_SIZE = 32;
+    const uint32_t lane = threadIdx.x & (WARP_SIZE - 1);
+    const uint32_t warp = threadIdx.x / WARP_SIZE;
+    const uint32_t warps_per_block = blockDim.x / WARP_SIZE;
+    const uint32_t item = blockIdx.x * warps_per_block + warp;
+    if (item >= count) return;
+
+    const uint32_t input_index =
+        (input_tail + item) & (RING_BUFFER_ELEMENTS - 1);
+    const uint32_t output_index =
+        (output_head + item) & (RING_BUFFER_ELEMENTS - 1);
+    const Slot& source = input->slots[input_index];
+    Slot& destination = output->slots[output_index];
+    const uint32_t copy_length =
+        source.len < MAX_ITEM_SIZE ? source.len : MAX_ITEM_SIZE;
+    for (uint32_t i = lane; i < copy_length; i += WARP_SIZE) {
+        destination.value[i] = source.value[i];
+    }
+    __syncwarp();
+    if (lane != 0) return;
+
+    destination.len = copy_length;
+    destination.timestamp_ns = source.timestamp_ns;
+    if (spec.function != FUNCTION_IMPUTE) return;
+
+    BidView bid;
+    if (!parse_bid(source, bid)) return;
+    // Preserve observed DECIMAL bytes exactly; only missing prices need a
+    // newly encoded value from the imputation result.
+    if (!bid.price_missing) return;
+    const ImputationObservation target = observations[item];
+    double price = impute_price_state_observations(
+        *state, observations, has_price, item, target);
+    if (!isfinite(price)) price = 0.0;
+    write_imputed_bid(source, destination, bid, price);
+}
+
+extern "C" __global__ void commit_imputation_history_state(
+    const ImputationObservation* observations, const uint8_t* has_price,
+    ImputationState* state,
+    uint64_t input_tail, uint32_t count, ProcessSpec spec) {
+    if (blockIdx.x != 0 || threadIdx.x != 0 ||
+        spec.function != FUNCTION_IMPUTE) {
+        return;
+    }
+    for (uint32_t item = 0; item < count; ++item) {
+        if (has_price[item] == 0) continue;
+        uint32_t history_index;
+        if (state->size < IMPUTATION_HISTORY_SIZE) {
+            history_index =
+                (state->start + state->size) % IMPUTATION_HISTORY_SIZE;
+            ++state->size;
+        } else {
+            history_index = state->start;
+            state->start =
+                (state->start + 1) % IMPUTATION_HISTORY_SIZE;
+        }
+        state->history[history_index] = observations[item];
     }
 }

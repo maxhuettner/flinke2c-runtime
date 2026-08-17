@@ -130,6 +130,9 @@ public final class GpuRuntimeOperator extends TableStreamOperator<RowData>
         function.processElement(
                 element.getValue(), element.hasTimestamp(),
                 element.hasTimestamp() ? element.getTimestamp() : 0L);
+        // Implementations may complete GPU work on a private worker, but all
+        // output collection remains on this Flink operator thread.
+        function.poll();
     }
 
     @Override

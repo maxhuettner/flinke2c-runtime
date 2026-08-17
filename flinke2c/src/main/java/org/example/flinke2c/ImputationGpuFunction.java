@@ -15,9 +15,10 @@ import org.apache.flink.types.RowKind;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.Map;
 
 /** Dynamically loadable packed GPU implementation of bid-price imputation. */
@@ -32,11 +33,18 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
 
     private transient GpuRuntimeFunction.Emitter emitter;
     private transient ExternalRuntimeBinaryCodec codec;
+    private transient ExternalRuntimeBinaryCodec decodeCodec;
     private transient long handle;
     private transient ByteBuffer[] inputs, outputs;
-    private transient List<Pending>[] pending;
-    private transient ArrayDeque<Integer> laneOrder;
     private transient List<Pending> filling;
+    private transient ArrayBlockingQueue<Work> workQueue;
+    private transient ArrayBlockingQueue<CompletedBatch> completedQueue;
+    private transient Object laneMonitor;
+    private transient boolean[] laneBusy;
+    private transient Thread worker;
+    private transient volatile Throwable workerFailure;
+    private transient volatile boolean workerRunning;
+    private transient volatile boolean workerBusy;
     private transient int[] fields;
     private transient int[] resultFieldWireIndexes;
     private transient int resultPriceField;
@@ -55,6 +63,36 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
         Pending(long id, boolean hasTimestamp, long timestamp, RowKind rowKind, Object passthrough) {
             this.id = id; this.hasTimestamp = hasTimestamp; this.timestamp = timestamp;
             this.rowKind = rowKind; this.passthrough = passthrough;
+        }
+    }
+
+    private static final class Work {
+        final int lane;
+        final int count;
+        final List<Pending> rows;
+
+        Work(int lane, int count, List<Pending> rows) {
+            this.lane = lane;
+            this.count = count;
+            this.rows = rows;
+        }
+    }
+
+    private static final class CompletedBatch {
+        final List<CompletedRow> rows;
+
+        CompletedBatch(List<CompletedRow> rows) {
+            this.rows = rows;
+        }
+    }
+
+    private static final class CompletedRow {
+        final Pending metadata;
+        final GenericRowData result;
+
+        CompletedRow(Pending metadata, GenericRowData result) {
+            this.metadata = metadata;
+            this.result = result;
         }
     }
 
@@ -136,23 +174,35 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
             if (types[i] instanceof TimestampType) timestampPrecision[i] = ((TimestampType) types[i]).getPrecision();
         }
         codec = new ExternalRuntimeBinaryCodec(true, WIRES, writeTargets, roots, precision, scale,
-                timestampPrecision, WIRES, readSources, readTargets, false);
+                timestampPrecision, null, null, null, false);
+        decodeCodec = new ExternalRuntimeBinaryCodec(true, null, null, null, null, null, null,
+                WIRES, readSources, readTargets, false);
         emitter = output;
         handle = DirectCudaImputationNative.create(device, batchSize, depth, threads);
         if (handle == 0L) throw new IllegalStateException("packed CUDA imputation context creation failed");
         inputs = new ByteBuffer[depth]; outputs = new ByteBuffer[depth];
-        @SuppressWarnings("unchecked") List<Pending>[] lanes = new List[depth];
-        pending = lanes; laneOrder = new ArrayDeque<>(depth);
+        workQueue = new ArrayBlockingQueue<>(depth);
+        completedQueue = new ArrayBlockingQueue<>(depth);
+        laneMonitor = new Object();
+        laneBusy = new boolean[depth];
         for (int i = 0; i < depth; i++) {
             inputs[i] = DirectCudaImputationNative.inputBuffer(handle, i).order(ByteOrder.nativeOrder());
             outputs[i] = DirectCudaImputationNative.outputBuffer(handle, i).order(ByteOrder.nativeOrder());
         }
         filling = new ArrayList<>(batchSize); nextLane = 0; fillCount = 0; nextRowId = 0;
+        workerFailure = null;
+        workerRunning = true;
+        workerBusy = false;
+        worker = new Thread(this::runWorker, "gpu-imputation-completion");
+        worker.setDaemon(true);
+        worker.start();
     }
 
     @Override
     public void processElement(RowData row, boolean hasTimestamp, long timestamp) throws Exception {
-        if (fillCount == 0) completeLane(nextLane);
+        drainCompleted();
+        checkWorkerFailure();
+        if (fillCount == 0) awaitLaneFree(nextLane);
         long id = nextRowId++;
         ByteBuffer input = inputs[nextLane];
         int base = fillCount * DirectCudaImputationNative.SLOT_STRIDE;
@@ -167,36 +217,106 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
 
     @Override
     public void flush() throws Exception {
-        if (laneOrder == null) return;
+        if (workQueue == null) return;
         submitFilling();
-        while (!laneOrder.isEmpty()) completeLane(laneOrder.peekFirst());
+        for (;;) {
+            checkWorkerFailure();
+            drainCompleted();
+            synchronized (laneMonitor) {
+                boolean busy = false;
+                for (boolean value : laneBusy) busy |= value;
+                if (!busy && !workerBusy && workQueue.isEmpty()) break;
+                laneMonitor.wait(1L);
+            }
+        }
+        drainCompleted();
+        checkWorkerFailure();
     }
 
     private void submitFilling() throws Exception {
         if (fillCount == 0) return;
         int lane = nextLane; nextLane = (nextLane + 1) % depth;
-        completeLane(lane);
-        DirectCudaImputationNative.submitBatch(handle, lane, fillCount);
-        pending[lane] = filling; laneOrder.addLast(lane);
+        List<Pending> rows = filling;
+        int count = fillCount;
+        synchronized (laneMonitor) {
+            laneBusy[lane] = true;
+        }
+        Work work = new Work(lane, count, rows);
+        while (!workQueue.offer(work, 100L, TimeUnit.MILLISECONDS)) {
+            checkWorkerFailure();
+        }
         filling = new ArrayList<>(batchSize); fillCount = 0;
     }
 
-    private void completeLane(int lane) throws Exception {
-        List<Pending> rows = pending[lane];
-        if (rows == null) return;
-        if (laneOrder.isEmpty() || laneOrder.peekFirst() != lane) throw new IOException("packed lane order violation");
-        laneOrder.removeFirst(); pending[lane] = null;
-        DirectCudaImputationNative.waitBatch(handle, lane);
-        ByteBuffer output = outputs[lane];
-        for (int i = 0; i < rows.size(); i++) {
+    @Override
+    public void poll() throws Exception {
+        drainCompleted();
+        checkWorkerFailure();
+    }
+
+    private void awaitLaneFree(int lane) throws Exception {
+        synchronized (laneMonitor) {
+            while (laneBusy[lane]) {
+                checkWorkerFailure();
+                laneMonitor.wait(1L);
+            }
+        }
+    }
+
+    private void runWorker() {
+        try {
+            while (workerRunning || !workQueue.isEmpty()) {
+                Work work = workQueue.poll(100L, TimeUnit.MILLISECONDS);
+                if (work == null) continue;
+                workerBusy = true;
+                try {
+                    DirectCudaImputationNative.submitBatch(handle, work.lane, work.count);
+                    DirectCudaImputationNative.waitBatch(handle, work.lane);
+                    CompletedBatch completed = decode(work);
+                    // decode() has copied all results out of the native output
+                    // buffer, so the lane can be reused while the completed
+                    // rows wait for collection on the Flink thread.
+                    synchronized (laneMonitor) {
+                        laneBusy[work.lane] = false;
+                        laneMonitor.notifyAll();
+                    }
+                    completedQueue.put(completed);
+                } finally {
+                    workerBusy = false;
+                    synchronized (laneMonitor) {
+                        // Also release the lane on submit/wait/decode failure.
+                        laneBusy[work.lane] = false;
+                        laneMonitor.notifyAll();
+                    }
+                }
+            }
+        } catch (Throwable failure) {
+            workerFailure = failure;
+            workerRunning = false;
+            workerBusy = false;
+            synchronized (laneMonitor) {
+                for (int i = 0; i < laneBusy.length; i++) laneBusy[i] = false;
+                laneMonitor.notifyAll();
+            }
+        }
+    }
+
+    private CompletedBatch decode(Work work) throws Exception {
+        ByteBuffer output = outputs[work.lane];
+        List<CompletedRow> results = new ArrayList<>(work.count);
+        for (int i = 0; i < work.count; i++) {
             int base = i * DirectCudaImputationNative.SLOT_STRIDE;
             int length = output.getInt(base);
-            if (length < 4 || length > DirectCudaImputationNative.MAX_ITEM_SIZE) throw new IOException("invalid output slot");
-            Pending meta = rows.get(i);
-            ExternalRuntimeBinaryCodec.RowWithId decoded = codec.readFramedRow(
+            if (length < 4 || length > DirectCudaImputationNative.MAX_ITEM_SIZE) {
+                throw new IOException("invalid output slot");
+            }
+            Pending meta = work.rows.get(i);
+            ExternalRuntimeBinaryCodec.RowWithId decoded = decodeCodec.readFramedRow(
                     output, base + DirectCudaImputationNative.SLOT_VALUE_OFFSET,
                     RowKind.INSERT, null);
-            if (decoded.rowId != meta.id) throw new IOException("packed imputation row order violation");
+            if (decoded.rowId != meta.id) {
+                throw new IOException("packed imputation row order violation");
+            }
             GenericRowData result = new GenericRowData(resultType.getFieldCount());
             result.setRowKind(meta.rowKind);
             GenericRowData wireRow = (GenericRowData) decoded.row;
@@ -204,16 +324,45 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
                 int wireIndex = resultFieldWireIndexes[f];
                 result.setField(f, wireIndex >= 0 ? wireRow.getField(wireIndex) : meta.passthrough);
             }
-            emitter.collect(result, meta.hasTimestamp, meta.timestamp);
+            results.add(new CompletedRow(meta, result));
         }
+        return new CompletedBatch(results);
+    }
+
+    private void drainCompleted() throws Exception {
+        CompletedBatch batch;
+        while ((batch = completedQueue.poll()) != null) {
+            for (CompletedRow row : batch.rows) {
+                Pending meta = row.metadata;
+                emitter.collect(row.result, meta.hasTimestamp, meta.timestamp);
+            }
+        }
+    }
+
+    private void checkWorkerFailure() throws Exception {
+        Throwable failure = workerFailure;
+        if (failure == null) return;
+        if (failure instanceof Exception) throw (Exception) failure;
+        if (failure instanceof Error) throw (Error) failure;
+        throw new IOException("asynchronous GPU imputation worker failed", failure);
     }
 
     @Override
     public void close() throws Exception {
-        try { if (handle != 0L) flush(); }
+        try {
+            if (handle != 0L) flush();
+        }
         finally {
+            workerRunning = false;
+            if (worker != null) {
+                worker.interrupt();
+                worker.join(5000L);
+            }
             if (handle != 0L) DirectCudaImputationNative.destroy(handle);
-            handle = 0L; inputs = null; outputs = null; pending = null; laneOrder = null; codec = null; emitter = null;
+            handle = 0L; inputs = null; outputs = null; workQueue = null;
+            completedQueue = null; laneMonitor = null; laneBusy = null;
+            worker = null; filling = null; codec = null; decodeCodec = null; emitter = null;
+            workerBusy = false;
         }
     }
 

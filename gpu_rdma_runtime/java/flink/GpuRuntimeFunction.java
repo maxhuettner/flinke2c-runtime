@@ -19,6 +19,13 @@ public interface GpuRuntimeFunction extends Serializable {
     /** Accepts one live input row; implementations buffer and submit it as appropriate. */
     void processElement(RowData row, boolean hasTimestamp, long timestamp) throws Exception;
 
+    /**
+     * Gives an implementation a chance to publish completed asynchronous work
+     * on the Flink operator thread. The default is a no-op for synchronous
+     * implementations.
+     */
+    default void poll() throws Exception {}
+
     /** Flushes all partial and in-flight batches in input order. */
     void flush() throws Exception;
 

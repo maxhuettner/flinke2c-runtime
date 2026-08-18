@@ -38,13 +38,16 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
     private transient ByteBuffer[] inputs, outputs;
     private transient List<Pending> filling;
     private transient ArrayBlockingQueue<Work> workQueue;
+    private transient ArrayBlockingQueue<Work> submittedQueue;
     private transient ArrayBlockingQueue<CompletedBatch> completedQueue;
     private transient Object laneMonitor;
     private transient boolean[] laneBusy;
-    private transient Thread worker;
+    private transient Thread submitter;
+    private transient Thread completer;
     private transient volatile Throwable workerFailure;
     private transient volatile boolean workerRunning;
-    private transient volatile boolean workerBusy;
+    private transient volatile boolean submitterBusy;
+    private transient volatile boolean completerBusy;
     private transient int[] fields;
     private transient int[] resultFieldWireIndexes;
     private transient int resultPriceField;
@@ -54,6 +57,13 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
     private transient RowType resultType;
     private transient int batchSize, depth, nextLane, fillCount;
     private transient long nextRowId;
+    // decode() runs on the single completer thread, one row at a time, and
+    // copies every field it needs out of this row into the row it hands off
+    // before touching the next slot - so reusing one container here (instead
+    // of allocating a fresh 7-field GenericRowData per row) is safe even
+    // though the *result* rows it feeds must stay independently valid until
+    // drainCompleted() later collects them.
+    private transient GenericRowData wireScratch;
 
     private static final class Pending {
         final long id, timestamp;
@@ -177,11 +187,13 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
                 timestampPrecision, null, null, null, false);
         decodeCodec = new ExternalRuntimeBinaryCodec(true, null, null, null, null, null, null,
                 WIRES, readSources, readTargets, false);
+        wireScratch = new GenericRowData(FIELDS);
         emitter = output;
         handle = DirectCudaImputationNative.create(device, batchSize, depth, threads);
         if (handle == 0L) throw new IllegalStateException("packed CUDA imputation context creation failed");
         inputs = new ByteBuffer[depth]; outputs = new ByteBuffer[depth];
         workQueue = new ArrayBlockingQueue<>(depth);
+        submittedQueue = new ArrayBlockingQueue<>(depth);
         completedQueue = new ArrayBlockingQueue<>(depth);
         laneMonitor = new Object();
         laneBusy = new boolean[depth];
@@ -192,10 +204,14 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
         filling = new ArrayList<>(batchSize); nextLane = 0; fillCount = 0; nextRowId = 0;
         workerFailure = null;
         workerRunning = true;
-        workerBusy = false;
-        worker = new Thread(this::runWorker, "gpu-imputation-completion");
-        worker.setDaemon(true);
-        worker.start();
+        submitterBusy = false;
+        completerBusy = false;
+        submitter = new Thread(this::runSubmitter, "gpu-imputation-submit");
+        completer = new Thread(this::runCompleter, "gpu-imputation-completion");
+        submitter.setDaemon(true);
+        completer.setDaemon(true);
+        submitter.start();
+        completer.start();
     }
 
     @Override
@@ -225,7 +241,8 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
             synchronized (laneMonitor) {
                 boolean busy = false;
                 for (boolean value : laneBusy) busy |= value;
-                if (!busy && !workerBusy && workQueue.isEmpty()) break;
+                if (!busy && !submitterBusy && !completerBusy
+                        && workQueue.isEmpty() && submittedQueue.isEmpty()) break;
                 laneMonitor.wait(1L);
             }
         }
@@ -263,41 +280,67 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
         }
     }
 
-    private void runWorker() {
+    private void runSubmitter() {
         try {
             while (workerRunning || !workQueue.isEmpty()) {
                 Work work = workQueue.poll(100L, TimeUnit.MILLISECONDS);
                 if (work == null) continue;
-                workerBusy = true;
+                submitterBusy = true;
                 try {
                     DirectCudaImputationNative.submitBatch(handle, work.lane, work.count);
+                    while (!submittedQueue.offer(work, 100L, TimeUnit.MILLISECONDS)) {
+                        checkWorkerFailure();
+                    }
+                } finally {
+                    submitterBusy = false;
+                }
+            }
+        } catch (Throwable failure) {
+            failWorker(failure);
+        }
+    }
+
+    private void runCompleter() {
+        try {
+            while (workerRunning || !submittedQueue.isEmpty()) {
+                Work work = submittedQueue.poll(100L, TimeUnit.MILLISECONDS);
+                if (work == null) continue;
+                completerBusy = true;
+                try {
                     DirectCudaImputationNative.waitBatch(handle, work.lane);
                     CompletedBatch completed = decode(work);
                     // decode() has copied all results out of the native output
-                    // buffer, so the lane can be reused while the completed
-                    // rows wait for collection on the Flink thread.
+                    // buffer, so the lane can be reused while completed rows
+                    // wait for collection on the Flink thread.
                     synchronized (laneMonitor) {
                         laneBusy[work.lane] = false;
                         laneMonitor.notifyAll();
                     }
-                    completedQueue.put(completed);
+                    while (!completedQueue.offer(completed, 100L, TimeUnit.MILLISECONDS)) {
+                        checkWorkerFailure();
+                    }
                 } finally {
-                    workerBusy = false;
+                    completerBusy = false;
                     synchronized (laneMonitor) {
-                        // Also release the lane on submit/wait/decode failure.
+                        // Also release the lane on wait/decode failure.
                         laneBusy[work.lane] = false;
                         laneMonitor.notifyAll();
                     }
                 }
             }
         } catch (Throwable failure) {
-            workerFailure = failure;
-            workerRunning = false;
-            workerBusy = false;
-            synchronized (laneMonitor) {
-                for (int i = 0; i < laneBusy.length; i++) laneBusy[i] = false;
-                laneMonitor.notifyAll();
-            }
+            failWorker(failure);
+        }
+    }
+
+    private void failWorker(Throwable failure) {
+        if (workerFailure == null) workerFailure = failure;
+        workerRunning = false;
+        submitterBusy = false;
+        completerBusy = false;
+        synchronized (laneMonitor) {
+            for (int i = 0; i < laneBusy.length; i++) laneBusy[i] = false;
+            laneMonitor.notifyAll();
         }
     }
 
@@ -313,9 +356,14 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
             Pending meta = work.rows.get(i);
             ExternalRuntimeBinaryCodec.RowWithId decoded = decodeCodec.readFramedRow(
                     output, base + DirectCudaImputationNative.SLOT_VALUE_OFFSET,
-                    RowKind.INSERT, null);
+                    RowKind.INSERT, wireScratch);
             if (decoded.rowId != meta.id) {
-                throw new IOException("packed imputation row order violation");
+                throw new IOException(
+                        "packed imputation row order violation: lane=" + work.lane
+                                + ", slot=" + i
+                                + ", expectedRowId=" + meta.id
+                                + ", actualRowId=" + decoded.rowId
+                                + ", frameLength=" + length);
             }
             GenericRowData result = new GenericRowData(resultType.getFieldCount());
             result.setRowKind(meta.rowKind);
@@ -354,15 +402,16 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
         }
         finally {
             workerRunning = false;
-            if (worker != null) {
-                worker.interrupt();
-                worker.join(5000L);
-            }
+            if (submitter != null) submitter.interrupt();
+            if (completer != null) completer.interrupt();
+            if (submitter != null) submitter.join(5000L);
+            if (completer != null) completer.join(5000L);
             if (handle != 0L) DirectCudaImputationNative.destroy(handle);
             handle = 0L; inputs = null; outputs = null; workQueue = null;
-            completedQueue = null; laneMonitor = null; laneBusy = null;
-            worker = null; filling = null; codec = null; decodeCodec = null; emitter = null;
-            workerBusy = false;
+            submittedQueue = null; completedQueue = null; laneMonitor = null; laneBusy = null;
+            submitter = null; completer = null; filling = null;
+            codec = null; decodeCodec = null; wireScratch = null; emitter = null;
+            submitterBusy = false; completerBusy = false;
         }
     }
 

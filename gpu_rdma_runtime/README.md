@@ -681,3 +681,74 @@ the packed `GpuRuntimeFunction` contract; it still loads the class from `impl=..
 forwards live rows directly and lets the function own native batching. The
 updated user functions are `org.example.flinke2c.ImputationGpuFunction` and
 `org.example.flinke2c.CurrencyConversionGpuFunction`.
+
+**Submit/complete must run on separate threads.** `submitBatch`
+([`direct_imputation_jni.cu`](cuda/direct_imputation_jni.cu)) only enqueues a
+lane's H2D copy, kernels, and D2H copy on that lane's stream and returns —
+`waitBatch` is the only call that blocks (`cudaEventSynchronize`). The
+original implementation nonetheless ran `submitBatch` immediately followed by
+`waitBatch` and `decode()` on one background thread. That serialized GPU
+dispatch behind GPU completion: the thread could not enqueue lane N+1's work
+until it had finished blocking on lane N, so the GPU's command queue only ever
+held one lane's work regardless of `pipelinedepth`, and every batch paid a
+full host round-trip stall between the previous batch finishing and the next
+one being launched. Measured effect: capped around 800k tps against the same
+kernels' >1M tps over the RDMA path, whose server dispatches batches without
+blocking a single thread on each one's completion. `ImputationGpuFunction` now
+splits this into a submitter thread (calls `submitBatch` only, loops
+immediately) and a completer thread (drains a `submittedQueue` in the same
+FIFO order and does `waitBatch`/`decode`), so the GPU stays fed the same way
+the RDMA server's loop does. Submission order is still strictly
+single-threaded and FIFO, which the native side depends on: lanes are chained
+with `cudaStreamWaitEvent` off `context->last_lane` to keep KNN history
+commits ordered, and that ordering is only correct if `submitBatch` calls
+happen in submission order.
+`CurrencyConversionGpuFunction` never had this bug — it waits on a lane lazily,
+inline on the Flink thread, only right before reusing it, which works because
+its lanes are independent (no shared history to serialize).
+
+**The submit/complete split alone did not close the gap to RDMA.** Both paths
+run the *same* CUDA kernels (`direct_imputation_jni.cu` includes
+`process_function.cu`, the file the RDMA server also uses), so once dispatch
+no longer stalls the GPU, a remaining gap points at the JVM/JNI side, not the
+kernels. Comparing `decode()` against `RdmaPostOperator` found it doing
+avoidable per-row work on the completer thread, which is now the thread that
+actually gates throughput:
+- `ExternalRuntimeBinaryCodec.copyBytes(ByteBuffer, ...)`, used for every
+  `STRING`/`BYTES`/`DECIMAL_UNSCALED_BYTES` field (three strings plus the
+  price per bid), copied one byte at a time in a Java loop instead of a bulk
+  `ByteBuffer.get(byte[], off, len)`, which the JIT intrinsifies for a direct
+  buffer and the loop does not. This cost scales with row count, not batch
+  count, which fits `ImputationFunctionGpu`'s RDMA config using
+  `rdmabatchsize=64` against the direct path's `4096` and still coming out
+  ahead — a bigger batch doesn't amortize a per-row cost.
+- `decode()` allocated a fresh 7-field `GenericRowData` for the wire row on
+  every row, on top of the fresh result-row allocation it also needs. The
+  wire row is only ever read immediately and discarded, so it's now a single
+  reused scratch container instead (`wireScratch`, one per function instance,
+  passed as `decodeCodec`'s `reuseRow`) — safe because `decode()` processes
+  one row at a time on the one completer thread and copies every value it
+  needs out of it before touching the next slot.
+
+**Full buffer-level `pipeline.object-reuse` (matching `RdmaPostOperator`'s
+`reuseRow`) is deliberately not enabled here — it would be a correctness bug
+given this class's architecture, not just an optimization.**
+`RdmaPostOperator` decodes and immediately collects one row at a time, so
+reusing a row's backing buffers before the next decode is always safe. This
+class decodes an entire batch ahead of time onto a queue that the Flink
+thread drains later (`completedQueue`), so a decoded row must stay
+independently valid — with its own backing bytes — until it is actually
+collected, which can be several batches later. `StringData.fromBytes` wraps
+its byte array rather than copying it, so sharing one scratch array across
+rows the way `ExternalRuntimeBinaryCodec.reuseBytes` does for
+`RdmaPostOperator` would let a later row's decode silently overwrite an
+earlier row's still-queued string field. Closing that gap safely needs a
+bounded pool of per-slot buffers (sized to `pipelinedepth * batchsize`),
+reused only once a given slot's row has actually been collected — a real
+change, not attempted here.
+
+If the gap still doesn't close after these two, profile the completer thread
+specifically (it now does 100% of decode plus the `waitBatch` block) with
+async-profiler/JFR attached to the TaskManager under real load, the same way
+the async-UDF profiling above was done, rather than assuming which of the two
+fixes above mattered more.

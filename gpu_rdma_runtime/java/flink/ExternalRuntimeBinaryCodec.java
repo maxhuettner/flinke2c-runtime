@@ -949,7 +949,14 @@ public final class ExternalRuntimeBinaryCodec {
         } else {
             out = new byte[len];
         }
-        for (int i = 0; i < len; i++) out[i] = buf.get(p + i);
+        // Bulk relative get is JIT-intrinsified (backed by Unsafe.copyMemory for a
+        // direct buffer); a byte-at-a-time loop is not and dominated STRING/BYTES
+        // decode cost on wide payloads. duplicate() gives an independent
+        // position/limit so this doesn't disturb the caller's absolute indexing
+        // into the same buffer.
+        final java.nio.ByteBuffer view = buf.duplicate();
+        view.position(p);
+        view.get(out, 0, len);
         return out;
     }
 

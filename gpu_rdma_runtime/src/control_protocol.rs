@@ -42,6 +42,7 @@ pub enum ProcessingFunction {
     Increment,
     Impute,
     CurrencyConversion,
+    BlackScholes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

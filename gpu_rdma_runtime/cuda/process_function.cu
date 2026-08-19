@@ -13,12 +13,20 @@ struct ProcessSpec {
 constexpr uint32_t FUNCTION_INCREMENT = 1;
 constexpr uint32_t FUNCTION_IMPUTE = 2;
 constexpr uint32_t FUNCTION_CURRENCY_CONVERSION = 3;
+constexpr uint32_t FUNCTION_BLACK_SCHOLES = 4;
 
 constexpr uint32_t CURRENCY_NUMERATOR = 908;
 constexpr uint32_t CURRENCY_DENOMINATOR = 1000;
 // DECIMAL(23,3) needs at most ten bytes. Leave ample room while keeping the
 // per-thread local arrays bounded.
 constexpr uint32_t MAX_CURRENCY_DECIMAL_BYTES = 40;
+
+// Same fixed contract as BlackScholesFunction.java / direct_black_scholes_jni.cu:
+// a 30-day, 10%-out-of-the-money European call, treating the bid price as spot.
+constexpr double BLACK_SCHOLES_STRIKE_RATIO = 1.10;
+constexpr double BLACK_SCHOLES_TIME_TO_MATURITY_YEARS = 30.0 / 365.0;
+constexpr double BLACK_SCHOLES_RISK_FREE_RATE = 0.03;
+constexpr double BLACK_SCHOLES_VOLATILITY = 0.25;
 
 constexpr uint32_t IMPUTATION_HISTORY_SIZE = 5000;
 constexpr uint32_t IMPUTATION_SEARCH_LIMIT = 512;
@@ -662,6 +670,86 @@ __device__ uint32_t encode_decimal(double price, uint8_t* output) {
     return width;
 }
 
+// Abramowitz & Stegun approximation 7.1.26 (max absolute error 1.5e-7),
+// matching BlackScholesFunction.erf / direct_black_scholes_jni.cu's
+// erf_approx exactly, so all three paths agree to floating-point precision.
+__device__ double black_scholes_erf(double x) {
+    const double sign = x < 0.0 ? -1.0 : 1.0;
+    x = fabs(x);
+    const double a1 = 0.254829592;
+    const double a2 = -0.284496736;
+    const double a3 = 1.421413741;
+    const double a4 = -1.453152027;
+    const double a5 = 1.061405429;
+    const double p = 0.3275911;
+    const double t = 1.0 / (1.0 + p * x);
+    const double y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * exp(-x * x);
+    return sign * y;
+}
+
+__device__ double black_scholes_normal_cdf(double x) {
+    return 0.5 * (1.0 + black_scholes_erf(x / sqrt(2.0)));
+}
+
+// Mirrors BlackScholesFunction.eval: a non-positive spot maps to 0.0
+// (BigDecimal.ZERO on the Java path); callers handle the null case
+// themselves the same way process_currency_conversion does.
+__device__ double black_scholes_call_price(double spot) {
+    if (spot <= 0.0) return 0.0;
+    const double strike = spot * BLACK_SCHOLES_STRIKE_RATIO;
+    const double t = BLACK_SCHOLES_TIME_TO_MATURITY_YEARS;
+    const double sqrt_t = sqrt(t);
+    const double d1 =
+        (log(spot / strike) +
+         (BLACK_SCHOLES_RISK_FREE_RATE + 0.5 * BLACK_SCHOLES_VOLATILITY * BLACK_SCHOLES_VOLATILITY) * t)
+        / (BLACK_SCHOLES_VOLATILITY * sqrt_t);
+    const double d2 = d1 - BLACK_SCHOLES_VOLATILITY * sqrt_t;
+    return spot * black_scholes_normal_cdf(d1)
+        - strike * exp(-BLACK_SCHOLES_RISK_FREE_RATE * t) * black_scholes_normal_cdf(d2);
+}
+
+// Replaces a DECIMAL field in place with its Black-Scholes call price, the
+// same shift-to-resize approach convert_currency_decimal_field uses. Unlike
+// currency conversion this necessarily goes through decimal_to_double /
+// encode_decimal (log/exp/erf have no exact fixed-point form), so a result
+// exactly on a rounding boundary can differ from the CPU path by one unit in
+// the last (0.001) place - the same caveat already documented for imputation.
+__device__ void convert_black_scholes_decimal_field(
+    uint8_t* row, uint32_t& row_len,
+    uint32_t length_pos, uint32_t bytes_pos) {
+    if (length_pos > row_len || row_len - length_pos < 4 || bytes_pos > row_len) {
+        return;
+    }
+    const uint32_t old_length = be32(row + length_pos);
+    if (old_length == 0 || old_length > row_len - bytes_pos) return;
+
+    const double spot = decimal_to_double(row + bytes_pos, old_length);
+    const double call = black_scholes_call_price(spot);
+    uint8_t converted[MAX_CURRENCY_DECIMAL_BYTES + 1];
+    const uint32_t new_length = encode_decimal(call, converted);
+    if (new_length == 0) return;
+
+    const uint32_t old_end = bytes_pos + old_length;
+    if (new_length > old_length) {
+        const uint32_t growth = new_length - old_length;
+        if (growth > MAX_ITEM_SIZE - row_len) return;
+        for (uint32_t i = row_len; i > old_end; --i) {
+            row[i + growth - 1] = row[i - 1];
+        }
+        row_len += growth;
+    } else if (new_length < old_length) {
+        const uint32_t shrink = old_length - new_length;
+        for (uint32_t i = old_end; i < row_len; ++i) {
+            row[i - shrink] = row[i];
+        }
+        row_len -= shrink;
+    }
+    for (uint32_t i = 0; i < new_length; ++i) {
+        row[bytes_pos + i] = converted[i];
+    }
+    put_be32(row + length_pos, new_length);
+}
+
 __device__ void copy_bytes(
     uint8_t* destination, uint32_t& position,
     const uint8_t* source, uint32_t length) {
@@ -807,6 +895,46 @@ __device__ void process_currency_conversion(
     }
 }
 
+// Mirrors process_currency_conversion exactly, down to the same field-walk
+// loop: only the conversion applied to the target DECIMAL field differs.
+__device__ void process_black_scholes(
+    Slot& destination, const ProcessSpec& spec) {
+    const bool framed =
+        destination.len >= 4 &&
+        be32(destination.value) == destination.len - 4;
+    const uint32_t base = framed ? 4 : 0;
+    const uint32_t null_bytes = (spec.field_count + 7) / 8;
+    uint32_t position = base + 12 + null_bytes;
+    if (spec.field_count == 0 || position > destination.len) return;
+    for (uint32_t field = 0; field < spec.field_count; ++field) {
+        const bool is_null =
+            (destination.value[base + 12 + field / 8] >> (field % 8)) & 1;
+        const uint32_t type = spec.field_types[field];
+        if (is_null) {
+            if (field == spec.field_index) return;
+            continue;
+        }
+        if (field == spec.field_index) {
+            if (type == 3) {
+                convert_black_scholes_decimal_field(
+                    destination.value, destination.len,
+                    position, position + 4);
+            }
+            if (framed) put_be32(destination.value, destination.len - 4);
+            return;
+        }
+        if (type == 1) {
+            position += 4;
+        } else if (type == 2 || type == 5) {
+            position += 8;
+        } else if (type == 3 || type == 4) {
+            if (position + 4 > destination.len) return;
+            position += 4 + be32(destination.value + position);
+        }
+        if (position > destination.len) return;
+    }
+}
+
 // Stateless functions modify their input slots directly. With no row copy to
 // cooperate on, tightly pack one row per CUDA thread.
 extern "C" __global__ void process_slots_in_place(
@@ -822,6 +950,8 @@ extern "C" __global__ void process_slots_in_place(
         process_increment(row, spec);
     } else if (spec.function == FUNCTION_CURRENCY_CONVERSION) {
         process_currency_conversion(row, spec);
+    } else if (spec.function == FUNCTION_BLACK_SCHOLES) {
+        process_black_scholes(row, spec);
     }
 }
 

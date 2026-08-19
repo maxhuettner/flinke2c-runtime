@@ -226,10 +226,183 @@ public final class ExternalRuntimeBinaryCodec {
         destination.put(offset + 1, (byte) (payloadLen >>> 16));
         destination.put(offset + 2, (byte) (payloadLen >>> 8));
         destination.put(offset + 3, (byte) payloadLen);
-        for (int i = 0; i < payloadLen; i++) {
-            destination.put(offset + Integer.BYTES + i, outBuf.buf()[i]);
-        }
+        // Bulk relative put is JIT-intrinsified for a direct destination buffer;
+        // the byte-at-a-time loop this replaced ran on the Flink task thread for
+        // every input row, on the same critical path that has to keep up with
+        // the source rate - the same class of bug as copyBytes() on the decode
+        // side, just on the hot ingest path instead of the completer thread.
+        final java.nio.ByteBuffer view = destination.duplicate();
+        view.position(offset + Integer.BYTES);
+        view.put(outBuf.buf(), 0, payloadLen);
         return frameLen;
+    }
+
+    /**
+     * Extracts one row's payload values without framing them, so the framing
+     * step (null-bitmap layout, wire-format packing, buffer writes) can run
+     * on a different thread than the one that read the row. Reading the row
+     * itself cannot be deferred - {@code pipeline.object-reuse} means its
+     * backing memory is not guaranteed to survive past this call - but once
+     * a value is out as an independent boxed Java object, nothing about
+     * packing it into bytes touches Flink's row abstraction or its
+     * reuse/lifecycle rules, so that part is safe to hand off. See
+     * {@link #writeExtractedRow} for the other half; used by
+     * {@code ImputationGpuFunction} to keep its Flink-thread-side
+     * {@code processElement} to just these getter calls, moving the actual
+     * byte-packing work onto its submitter thread.
+     *
+     * @return one entry per configured write field, null for a null source
+     *     field, otherwise a boxed value in the representation
+     *     {@link #writeValueBytes} expects for that field's {@link WireType}
+     */
+    public Object[] extractRowValues(RowData row, int[] payloadFieldIndices) {
+        if (writeWireTypes == null) {
+            throw new IllegalStateException("ExternalRuntimeBinaryCodec not configured for writing");
+        }
+        final int nFields = writeWireTypes.length;
+        final Object[] values = new Object[nFields];
+        for (int i = 0; i < nFields; i++) {
+            final int sourceIndex = payloadFieldIndices[i];
+            values[i] = row.isNullAt(sourceIndex) ? null : extractValue(i, row, sourceIndex);
+        }
+        return values;
+    }
+
+    private Object extractValue(int fieldPos, RowData row, int sourceIndex) {
+        final WireType wt = writeWireTypes[fieldPos];
+        final LogicalType targetType = writeTargetTypes[fieldPos];
+        final LogicalTypeRoot sourceRoot = writeSourceRoots[fieldPos];
+
+        switch (wt) {
+            case BOOL:
+                return row.getBoolean(sourceIndex);
+            case INT32:
+                switch (sourceRoot) {
+                    case TINYINT:
+                        return (int) row.getByte(sourceIndex);
+                    case SMALLINT:
+                        return (int) row.getShort(sourceIndex);
+                    default:
+                        return row.getInt(sourceIndex);
+                }
+            case INT64:
+                return row.getLong(sourceIndex);
+            case FLOAT32:
+                return row.getFloat(sourceIndex);
+            case FLOAT64:
+                return row.getDouble(sourceIndex);
+            case STRING:
+                return row.getString(sourceIndex).toBytes();
+            case BYTES:
+                return row.getBinary(sourceIndex);
+            case TIMESTAMP_MILLIS: {
+                final int precision = writeTimestampPrecision[fieldPos];
+                return row.getTimestamp(sourceIndex, precision).getMillisecond();
+            }
+            case DECIMAL_UNSCALED_I64: {
+                final DecimalType dt = (DecimalType) targetType;
+                final int srcPrecision = writeSourcePrecision[fieldPos];
+                final int srcScale = writeSourceScale[fieldPos];
+                return toUnscaledLong(row, sourceIndex, sourceRoot, dt.getPrecision(), dt.getScale(),
+                        srcPrecision, srcScale);
+            }
+            case DECIMAL_UNSCALED_BYTES: {
+                final DecimalType dt = (DecimalType) targetType;
+                final int srcPrecision = writeSourcePrecision[fieldPos];
+                final int srcScale = writeSourceScale[fieldPos];
+                if (sourceRoot == LogicalTypeRoot.DECIMAL && srcScale == dt.getScale()) {
+                    final DecimalData dec = row.getDecimal(sourceIndex, srcPrecision, srcScale);
+                    byte[] bytes = dec.toUnscaledBytes();
+                    // DECIMAL_UNSCALED_BYTES must never use a zero-length
+                    // representation. BigInteger zero is encoded as 00.
+                    if (bytes.length == 0) {
+                        bytes = new byte[] {0};
+                    }
+                    return bytes;
+                }
+                final BigInteger unscaled = toUnscaledBigInt(row, sourceIndex, sourceRoot, dt.getPrecision(),
+                        dt.getScale(), srcPrecision, srcScale);
+                return unscaled.toByteArray(); // two's complement big-endian
+            }
+            default:
+                throw new IllegalStateException("Unsupported wire type: " + wt);
+        }
+    }
+
+    /**
+     * Frames values previously returned by {@link #extractRowValues} into
+     * the wire format and writes them directly into a caller-owned buffer -
+     * the deferred half of {@link #encodeFramedRow}'s work, safe to call
+     * from a thread other than the one that read the row, since every value
+     * here is already an independent Java object with no tie back to the
+     * source {@code RowData}.
+     *
+     * @return complete frame length, including the four-byte length prefix
+     */
+    public int writeExtractedRow(
+            Object[] values, RowKind rowKind, long rowId,
+            java.nio.ByteBuffer destination, int offset, int maxFrameLength) throws IOException {
+        if (writeWireTypes == null) {
+            throw new IOException("ExternalRuntimeBinaryCodec not configured for writing");
+        }
+        final int nFields = writeWireTypes.length;
+        final int nullBytes = (nFields + 7) >>> 3;
+        outBuf.reset();
+        outBuf.putIntBE(rowKindToOp(rowKind));
+        if (includeRowId) outBuf.putLongBE(rowId);
+        final int nullBitmapPos = outBuf.position();
+        outBuf.ensureCapacity(nullBytes);
+        for (int i = 0; i < nullBytes; i++) outBuf.putByte((byte) 0);
+        for (int i = 0; i < nFields; i++) {
+            final Object value = values[i];
+            if (value == null) setNullBit(outBuf.buf(), nullBitmapPos, i);
+            else writeValueBytes(i, value);
+        }
+        final int payloadLen = outBuf.position();
+        final int frameLen = payloadLen + Integer.BYTES;
+        if (frameLen > maxFrameLength || offset < 0 || offset > destination.limit() - frameLen) {
+            throw new IOException("destination buffer is too small for encoded row");
+        }
+        destination.put(offset, (byte) (payloadLen >>> 24));
+        destination.put(offset + 1, (byte) (payloadLen >>> 16));
+        destination.put(offset + 2, (byte) (payloadLen >>> 8));
+        destination.put(offset + 3, (byte) payloadLen);
+        final java.nio.ByteBuffer view = destination.duplicate();
+        view.position(offset + Integer.BYTES);
+        view.put(outBuf.buf(), 0, payloadLen);
+        return frameLen;
+    }
+
+    private void writeValueBytes(int fieldPos, Object value) {
+        switch (writeWireTypes[fieldPos]) {
+            case BOOL:
+                outBuf.putByte((byte) (((Boolean) value) ? 1 : 0));
+                return;
+            case INT32:
+                outBuf.putIntBE((Integer) value);
+                return;
+            case INT64:
+            case TIMESTAMP_MILLIS:
+            case DECIMAL_UNSCALED_I64:
+                outBuf.putLongBE((Long) value);
+                return;
+            case FLOAT32:
+                outBuf.putIntBE(Float.floatToIntBits((Float) value));
+                return;
+            case FLOAT64:
+                outBuf.putLongBE(Double.doubleToLongBits((Double) value));
+                return;
+            case STRING:
+            case BYTES:
+            case DECIMAL_UNSCALED_BYTES: {
+                final byte[] bytes = (byte[]) value;
+                outBuf.putIntBE(bytes.length);
+                outBuf.putBytes(bytes);
+                return;
+            }
+            default:
+                throw new IllegalStateException("Unsupported wire type: " + writeWireTypes[fieldPos]);
+        }
     }
 
     private void writeValue(int fieldPos, RowData row, int sourceIndex) throws IOException {

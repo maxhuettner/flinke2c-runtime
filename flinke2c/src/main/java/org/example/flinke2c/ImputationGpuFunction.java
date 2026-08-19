@@ -70,9 +70,15 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
         final boolean hasTimestamp;
         final RowKind rowKind;
         final Object passthrough;
-        Pending(long id, boolean hasTimestamp, long timestamp, RowKind rowKind, Object passthrough) {
+        // Values already pulled out of the live RowData on the Flink thread
+        // (see ExternalRuntimeBinaryCodec#extractRowValues) - independent
+        // Java objects, safe for the submitter thread to frame into the wire
+        // format later without touching Flink's row abstraction at all.
+        final Object[] wireValues;
+        Pending(long id, boolean hasTimestamp, long timestamp, RowKind rowKind, Object passthrough,
+                Object[] wireValues) {
             this.id = id; this.hasTimestamp = hasTimestamp; this.timestamp = timestamp;
-            this.rowKind = rowKind; this.passthrough = passthrough;
+            this.rowKind = rowKind; this.passthrough = passthrough; this.wireValues = wireValues;
         }
     }
 
@@ -220,14 +226,15 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
         checkWorkerFailure();
         if (fillCount == 0) awaitLaneFree(nextLane);
         long id = nextRowId++;
-        ByteBuffer input = inputs[nextLane];
-        int base = fillCount * DirectCudaImputationNative.SLOT_STRIDE;
-        int length = codec.encodeFramedRow(row, fields, id, input,
-                base + DirectCudaImputationNative.SLOT_VALUE_OFFSET,
-                DirectCudaImputationNative.MAX_ITEM_SIZE);
-        input.putInt(base, length);
+        // Only pull values out of the row here - reading RowData is the one
+        // part that can't be deferred, since pipeline.object-reuse means its
+        // backing memory isn't guaranteed to outlive this call. Framing
+        // those values into the wire byte layout touches no Flink state and
+        // is deferred to the submitter thread (see runSubmitter), so this
+        // method stays to a handful of getter calls and a list append.
+        Object[] wireValues = codec.extractRowValues(row, fields);
         Object passthrough = passthroughGetter == null ? null : passthroughGetter.getFieldOrNull(row);
-        filling.add(new Pending(id, hasTimestamp, timestamp, row.getRowKind(), passthrough));
+        filling.add(new Pending(id, hasTimestamp, timestamp, row.getRowKind(), passthrough, wireValues));
         if (++fillCount == batchSize) submitFilling();
     }
 
@@ -287,6 +294,24 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
                 if (work == null) continue;
                 submitterBusy = true;
                 try {
+                    // The Flink thread only extracted field values (see
+                    // processElement); framing them into the pinned input
+                    // buffer's wire layout happens here, off the Flink
+                    // thread, in parallel with it already filling the next
+                    // batch. Safe to write into inputs[work.lane] now: the
+                    // Flink thread already confirmed this lane free (via
+                    // awaitLaneFree) before it started accumulating the rows
+                    // in this Work, and nothing else touches this lane's
+                    // input buffer between then and here.
+                    ByteBuffer input = inputs[work.lane];
+                    for (int i = 0; i < work.count; i++) {
+                        Pending row = work.rows.get(i);
+                        int base = i * DirectCudaImputationNative.SLOT_STRIDE;
+                        int length = codec.writeExtractedRow(row.wireValues, row.rowKind, row.id, input,
+                                base + DirectCudaImputationNative.SLOT_VALUE_OFFSET,
+                                DirectCudaImputationNative.MAX_ITEM_SIZE);
+                        input.putInt(base, length);
+                    }
                     DirectCudaImputationNative.submitBatch(handle, work.lane, work.count);
                     while (!submittedQueue.offer(work, 100L, TimeUnit.MILLISECONDS)) {
                         checkWorkerFailure();

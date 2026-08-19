@@ -752,3 +752,110 @@ specifically (it now does 100% of decode plus the `waitBatch` block) with
 async-profiler/JFR attached to the TaskManager under real load, the same way
 the async-UDF profiling above was done, rather than assuming which of the two
 fixes above mattered more.
+
+**Measured: the two bulk-copy fixes above did not close the gap.** That rules
+out the copy loops as the dominant cost and points at something structural
+instead: RDMA gets PRE (encode) and POST (decode+collect) on two genuinely
+separate Flink operators/threads (possibly two different TaskManagers - see
+"Data path" above), while `ImputationGpuFunction` is deliberately one
+operator (see its class Javadoc, and `GpuRuntimeOperator`'s), so its
+Flink-thread-side work (`processElement`, plus the trivial `collect()` loop
+in `poll()`) and its completer-thread-side work (`waitBatch` + decode) are
+the only two places CPU cost can land - there's no way to add a third
+Flink-visible thread for output the way RDMA has one, because Flink requires
+`output.collect()` to run only on the operator's own thread
+(`GpuRuntimeOperator`'s comment: "all output collection remains on this
+Flink operator thread").
+
+**A true PRE/POST operator pair for this path was already tried and
+abandoned.** `git log` shows `CudaCurrencyConversionOperator` +
+`java/flink/DirectCudaCurrencyNative.java` existed on this branch: a single
+operator extending Flink's `ExternalRuntimeOperator` directly, same as
+`RdmaPreOperator`/`RdmaPostOperator` do. Commit `a8f5ac8` ("fixed direct
+path") deleted both and introduced `GpuRuntimeFunction`/`GpuRuntimeOperator`
+instead, because the `table.exec.external-runtime.*` dispatch to a
+hand-written operator class never actually wired into the planner - there
+was no rule picking it up the way `RdmaPreOperator`/`RdmaPostOperator` are
+picked up for `type=rdma`. `GpuRuntimeOperator`'s `impl=` reflection loader
+is the thing that's actually confirmed to reach the planner, and a new
+PRE/POST pair for the direct-CUDA path would need exactly the same
+`ExternalRuntimeOperator` route that was already found to be a dead end. Do
+not repeat that route without first confirming (with real Flink planner
+source, not this repository) that the dispatch rule now exists.
+
+**What was done instead, staying entirely inside `GpuRuntimeFunction`:** the
+one Flink-thread-mandatory step - reading the live `RowData`, which
+`pipeline.object-reuse` means cannot be deferred past `processElement`
+returning - is now split from the wire-format framing step, which has no
+such constraint once values are out as independent Java objects.
+`ExternalRuntimeBinaryCodec.extractRowValues`/`writeExtractedRow` are the two
+halves; `processElement` now only calls the former (a handful of typed
+getters plus a list append), and the submitter thread calls the latter
+(null-bitmap layout, wire-format packing, the buffer write) right before
+`submitBatch`, in parallel with the Flink thread already filling the next
+batch. This moves real, previously Flink-thread-only CPU work onto a second
+thread without needing a second Flink operator at all - the closest
+approximation of RDMA's PRE/POST core split available within one operator.
+Traded off: each row's `Pending` now carries a small `Object[]` of extracted
+values (boxing the `Long`s that used to go straight into `outBuf` as
+primitives), a modest allocation cost this doesn't try to avoid.
+
+## GPU Black-Scholes
+
+`org.example.flinke2c.BlackScholesFunction` prices a European call option via
+Black-Scholes, treating the bid price as spot (30-day maturity, strike 10%
+out of the money, 3% risk-free rate, 25% volatility). Unlike currency
+conversion's single multiply, this is compute-bound — a `log`, two `exp`, a
+`sqrt`, and an `erf` approximation per row — making it a heavier stand-in map
+operator for CPU/GPU comparison. It's a single-DECIMAL-field transform, so
+both GPU paths reuse currency conversion's exact plumbing (lane design, wire
+ABI, field-walk loop) with only the kernel body swapped.
+
+**RDMA.** Select it in both RDMA Flink operators the same way as currency
+conversion:
+
+```text
+rdmaProcessingSpec={"function":"BLACK_SCHOLES","field_index":2,"fields":["INT64","INT64","DECIMAL_BYTES","TIMESTAMP_MILLIS","BYTES","INT64"]}
+```
+
+`field_index` may select any `DECIMAL_BYTES` field in the declared wire
+schema. The kernel (`process_black_scholes`/`convert_black_scholes_decimal_field`
+in `cuda/process_function.cu`) walks the framed row exactly like
+`process_currency_conversion` and replaces the target field in place, growing
+or shrinking the slot the same way. Unlike currency conversion's exact
+integer arithmetic, this necessarily goes through `decimal_to_double`/
+`encode_decimal` — `log`/`exp`/`erf` have no exact fixed-point form — so a
+result exactly on a rounding boundary can differ from the CPU path by one
+unit in the last (`0.001`) place, the same caveat already documented for
+imputation. A null price stays null; the field-walk loop returns without
+touching it, matching `process_currency_conversion`.
+
+**Direct CUDA (packed, dynamically loaded).** `BlackScholesGpuFunction` is
+`CurrencyConversionGpuFunction` with the kernel swapped — same lane/batching
+design, same `Input`/`Output` ABI (`direct_black_scholes_jni.cu`), same
+`GpuRuntimeFunction` packed-operator model:
+
+```sql
+SET 'table.exec.gpu-runtime.function-class' = 'org.example.flinke2c.BlackScholesFunction';
+SET 'table.exec.gpu-runtime.conf.org.example.flinke2c.BlackScholesFunction' =
+  'impl=org.example.flinke2c.BlackScholesGpuFunction;batchsize=1024;pipelinedepth=8;threadsperblock=256;device=0;fieldindex=0';
+```
+
+**Conf keys** (same style as `CurrencyConversionGpuFunction`): `batchsize`
+(default is the operator's configured batch size), `pipelinedepth` (default
+4, max 64), `threadsperblock` (default 256, max 1024), `device` (default 0),
+`fieldindex`/`pricefield` (default 2 — the row position of the `DECIMAL`
+column to price; must name a `DECIMAL` or `BIGINT` column).
+
+Build both new artifacts the same way as the other direct-CUDA libraries —
+`cuda/CMakeLists.txt` now has a `flinke2c_black_scholes_gpu` target alongside
+the currency/imputation ones, producing
+`cuda/build/libflinke2c_black_scholes_gpu.so`. Make it visible to every
+TaskManager the same way as `libflinke2c_currency_conversion_gpu.so`.
+
+**Not ported:** an `AsyncScalarFunction` version
+(`BlackScholesFunctionGpu`, analogous to `CurrencyConversionFunctionGpu`) —
+only the CPU `ScalarFunction` and the two GPU paths above exist for this
+function. Add one by close analogy if a three-way comparison against the
+async-UDF path specifically is needed; nothing about the kernel or wire
+format below would change.

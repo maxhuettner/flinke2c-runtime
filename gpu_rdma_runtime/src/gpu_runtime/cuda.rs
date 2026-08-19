@@ -74,6 +74,13 @@ impl CudaProcessSpec {
                 );
                 3
             }
+            ProcessingFunction::BlackScholes => {
+                ensure!(
+                    spec.fields[spec.field_index as usize] == WireFieldType::DecimalBytes,
+                    "BLACK_SCHOLES requires a DECIMAL_BYTES target field"
+                );
+                4
+            }
         };
         let mut field_types = [0u32; MAX_PROCESS_FIELDS];
         for (index, field) in spec.fields.iter().enumerate() {

@@ -222,15 +222,25 @@ The processing kernel also supports the stateful KNN price imputer used by
 operators with:
 
 ```text
-rdmaProcessingSpec={"function":"IMPUTE","field_index":0,"fields":["DECIMAL_BYTES","INT64","INT64","BYTES","BYTES","TIMESTAMP_MILLIS","BYTES"]}
+rdmaProcessingSpec={"function":"IMPUTE","field_index":0,"fields":["DECIMAL_UNSCALED_I64","INT64","INT64","BYTES","BYTES","TIMESTAMP_MILLIS","BYTES"]}
 ```
 
 The seven fields must be ordered as `price DECIMAL(23,3)`, `auction BIGINT`,
 `bidder BIGINT`, `channel STRING`, `url STRING`, `dateTime TIMESTAMP(3)`, and
-`extra STRING`. Null non-price fields are replaced with the same defaults as
-the Java UDF. A null price uses inverse-distance-weighted KNN with `K=10`, the
-newest 512 observations, and a 5,000-observation GPU ring. Only real prices
-enter history.
+`extra STRING`. **`price`'s wire field type is `DECIMAL_UNSCALED_I64`, not
+`DECIMAL_BYTES`** — a fixed 8-byte scale-3 unscaled long, unlike every other
+decimal-bearing function on this page (currency conversion, Black-Scholes),
+which still use the variable-length `DECIMAL_BYTES` format. This is
+IMPUTE-specific: `price`'s *declared* SQL type stays `DECIMAL(23,3)`, but
+its *wire* representation is narrower (`DECIMAL(18,3)`, comfortably beyond
+any realistic bid price) specifically to unlock `DecimalData`'s cheap
+compact-decimal path on both ends — see the packed-imputation section below
+for the full reasoning and cross-cutting change list. An old client still
+sending `DECIMAL_BYTES` at field 0 is rejected at bootstrap (schema
+validation), not silently misinterpreted. Null non-price fields are
+replaced with the same defaults as the Java UDF. A null price uses
+inverse-distance-weighted KNN with `K=10`, the newest 512 observations, and
+a 5,000-observation GPU ring. Only real prices enter history.
 
 Rows in a batch are logically processed in input order. The GPU evaluates
 missing rows in parallel, but each row includes earlier real prices from its
@@ -731,27 +741,186 @@ actually gates throughput:
   needs out of it before touching the next slot.
 
 **Full buffer-level `pipeline.object-reuse` (matching `RdmaPostOperator`'s
-`reuseRow`) is deliberately not enabled here — it would be a correctness bug
-given this class's architecture, not just an optimization.**
+`reuseRow`) was initially not enabled here, since it looked like a
+correctness bug given this class's architecture, not just an optimization.**
 `RdmaPostOperator` decodes and immediately collects one row at a time, so
 reusing a row's backing buffers before the next decode is always safe. This
 class decodes an entire batch ahead of time onto a queue that the Flink
 thread drains later (`completedQueue`), so a decoded row must stay
 independently valid — with its own backing bytes — until it is actually
 collected, which can be several batches later. `StringData.fromBytes` wraps
-its byte array rather than copying it, so sharing one scratch array across
-rows the way `ExternalRuntimeBinaryCodec.reuseBytes` does for
+its byte array rather than copying it, so naively sharing one scratch array
+across rows the way `ExternalRuntimeBinaryCodec.reuseBytes` does for
 `RdmaPostOperator` would let a later row's decode silently overwrite an
-earlier row's still-queued string field. Closing that gap safely needs a
-bounded pool of per-slot buffers (sized to `pipelinedepth * batchsize`),
-reused only once a given slot's row has actually been collected — a real
-change, not attempted here.
+earlier row's still-queued string field.
 
-If the gap still doesn't close after these two, profile the completer thread
-specifically (it now does 100% of decode plus the `waitBatch` block) with
-async-profiler/JFR attached to the TaskManager under real load, the same way
-the async-UDF profiling above was done, rather than assuming which of the two
-fixes above mattered more.
+**`perfcsv` profiling confirmed `decode()` as the single largest stage in
+the whole pipeline** (bigger than GPU `wait` time, bigger than `frame`,
+bigger than `collect`) — the per-row allocation this section already
+suspected, now measured rather than guessed. That justified doing the
+"real change" this section originally deferred: a **bounded pool of
+`GenericRowData` result rows**, sized `(pipelinedepth + 2) * batchsize`
+(the `+2` is headroom above the provable minimum — see below — not a
+required margin).
+
+The safety argument: `completedQueue` holds at most `pipelinedepth` batches
+before the completer thread blocks offering another, so at most
+`pipelinedepth * batchsize` rows can ever be "decoded but not yet
+collected" *once already queued* — plus up to one more batch's worth that
+finished decoding but hasn't been offered yet, if the queue happened to be
+momentarily full at that instant. A pool slot is assigned from a monotonic
+per-row counter, wrapped modulo the pool size, so slot `i % poolSize` is
+never reassigned to a new row until `poolSize` further rows have been
+decoded since — which, given that bound, always means every row that
+previously used that slot has already been collected. This is enforced by
+construction (the arithmetic bound above), not by a runtime check, so
+getting `poolSize` wrong would be a silent correctness bug rather than a
+crash — that's what the `+2` headroom and the field comments in
+`ImputationGpuFunction` (`resultPool`/`poolSize`) are for: cheap insurance,
+since a few thousand extra pre-allocated rows costs nothing next to the
+millions of row-allocations this exists to avoid.
+
+**Pooling the variable-length field `byte[]`s the same way, with an *exact*
+length match, was tried first and reverted after measuring it with
+`perfcsv` — it made `decode()` slower, not faster** (617 → 937 micros/batch
+on the same workload, total wall time slightly *up*). The reuse check only
+fired on an exact length match (`existing.length != len` → allocate fresh
+anyway), and `channel`/`url`/`extra` vary in length row to row, with a pool
+slot only recurring every `poolSize` (~18k) rows — unrelated to whatever
+length happened to occupy it last. The result: fresh allocation happened
+almost as often as with no pooling at all, plus the added cost of an extra
+array indirection and, likely the bigger factor, touching a large,
+rarely-revisited pool array that's cold in cache, in place of the JVM's TLAB
+bump-allocator — about as fast as allocation gets, and it keeps
+freshly-allocated short-lived objects cache-hot, which is exactly the case
+this is (an object read once and discarded almost immediately).
+
+**Fixed by switching STRING fields to *grow-only* pooling instead of exact-
+match** — `ExternalRuntimeBinaryCodec#copyBytesGrowable` reuses a slot's
+array whenever it's already `>= len` bytes, only reallocating when it's too
+small. That converges to each field's max-seen length and then stops
+allocating almost entirely, instead of needing an exact hit every time. This
+is safe specifically because `StringData.fromBytes(bytes, 0, len)` takes an
+explicit length and never reads past it — an oversized backing array is
+harmless. It is **not** safe for `BYTES` or `DECIMAL_UNSCALED_BYTES`
+(`price`): those hand the array off as the field value itself, with no
+length carried alongside it, so an oversized array wouldn't just waste
+space — for `price` specifically it's fed straight into `BigInteger(byte[])`,
+which reads every byte as part of the encoded value, so a stale oversized
+array would silently produce the *wrong number*. Both wire types keep using
+`copyBytes`'s exact-match-or-fresh behavior via a new `copyBytesGrowable`
+sibling; `price`'s call site passes `null` unconditionally, ignoring
+whatever `fieldScratch` the caller passed for the row as a whole, so its
+behavior can't drift from the known-safe baseline no matter what pooling
+is enabled for the row's other fields.
+
+Lesson for whoever reaches for this pattern next: a reuse pool only pays
+for itself when the reuse check actually *hits* most of the time — an
+exact-match check on a variable-length payload is a near-guaranteed miss;
+a grow-only check is a near-guaranteed hit once the pool has warmed up,
+but is only sound when the consumer of the returned array always carries
+an explicit length alongside it rather than trusting `array.length`.
+
+`ExternalRuntimeBinaryCodec`'s `readFramedRow(ByteBuffer, int, RowKind,
+GenericRowData, byte[][] fieldScratch)` overload (and `copyBytesGrowable`)
+are purely additive — the existing 4-argument overload still delegates to
+the codec's own internal `reuseObjects`/`reuseBytes` mechanism unchanged,
+and `RdmaPostOperator`'s byte[]-based decode path (`decodeFrame(byte[],
+...)`, `readValueIntoRow(byte[], ...)`, `copyBytes(int, byte[], ...)`)
+isn't touched at all.
+
+If the bottleneck moves after this, profile the completer thread again with
+`perfcsv` before guessing further — `frame` (submitter thread) does
+comparable per-row work encoding the wire format and hasn't had any pooling
+treatment, so it's a plausible next target if `decode()` stops dominating.
+
+**On rewriting this as GPU-side ("zero-serde") serialization instead:**
+considered and deliberately not attempted. The strongest version of that
+idea — the GPU writing bytes Flink's row type can consume with no parsing
+at all — means replicating `BinaryRowData`'s exact internal byte layout
+(null-bitmap width, fixed-region alignment, variable-length offset
+encoding) in CUDA code, without verified access to that layout for this
+Flink version. Getting it subtly wrong wouldn't fail loudly; it would
+silently hand downstream operators corrupted rows, which is a worse failure
+mode than a measured performance regression and not one to risk on a guess.
+The GPU kernels already do the actual interpretation work (string hashing,
+decimal parsing, the KNN search) — what's left on the JVM side is memory-
+layout packing/unpacking into Flink's row abstraction, which some row
+representation still has to do somewhere for `emitter.collect()` to have
+anything to hand downstream.
+
+**What was done instead: fixing the one field whose *format*, not its
+allocation, was the actual cost — `price`'s wire type.** Every field except
+`price` decodes as a fixed-width read plus a cheap cast (`readLongBE` +
+box, or a zero-parse `StringData.fromBytes` wrap). `price` alone went
+through `new BigInteger(bytes) → new BigDecimal(BigInteger, scale) →
+DecimalData.fromBigDecimal(...)` on every row, both directions — required
+only because `DECIMAL(23,3)` exceeds Flink's 18-digit compact-decimal
+threshold, forcing the full `BigDecimal`-backed `DecimalData`
+representation instead of the cheap `DecimalData.fromUnscaledLong(long,
+precision, scale)` path every other numeric field already gets. 18 digits
+before the decimal point is far beyond any realistic bid price, so the wire
+representation for `price` is now `DECIMAL(18,3)` /
+`DECIMAL_UNSCALED_I64` (a fixed 8-byte scale-3 unscaled long, no length
+prefix) instead of `DECIMAL(23,3)` / `DECIMAL_UNSCALED_BYTES` (a
+length-prefixed variable-length two's-complement byte array). This is
+**not** the same category of change as the pooling attempts — it removes
+work (two fewer object constructions and a digit-counting precision check
+per row) rather than trying to avoid paying for the same work through
+reuse, which is exactly why the pooling attempts couldn't have fixed this
+regardless of strategy.
+
+This is the one lever so far that isn't JVM-only: the wire *bytes* for
+`price` are produced by the GPU kernel, and that kernel
+(`process_function.cu`) is shared verbatim between the RDMA and
+direct-CUDA paths, so the change touches both.
+
+- **`process_function.cu`**: `BidView::price_unscaled` (an `int64_t`)
+  replaces the old `price`/`price_length` byte-pointer pair. `parse_bid`
+  reads a fixed 8 bytes (`be64`) instead of `read_variable`. A new
+  `decimal_to_double_i64`/`encode_decimal_i64` pair (fixed-width
+  counterparts to the existing `decimal_to_double`/`encode_decimal`, which
+  stay exactly as they were) handles the `int64_t ↔ double` conversion for
+  the KNN math and the imputed-value re-encode. `write_imputed_bid` writes
+  price as a plain `put_be64` — no length prefix — for both the
+  pass-through (observed) and imputed cases; the output-length formula and
+  field offsets were updated to match the now-fixed width. None of this
+  touches `ImputationObservation` (still plain `double`) or the actual KNN
+  logic — only the wire parsing/writing boundary.
+- **RDMA protocol** (`control_protocol.rs`): new `WireFieldType::
+  DecimalUnscaledI64` variant, distinct from the existing `DecimalBytes`
+  (which currency conversion and Black-Scholes keep using unchanged).
+  `gpu_runtime/cuda.rs`'s `IMPUTATION_SCHEMA` and its validation error
+  message now expect `DECIMAL_UNSCALED_I64` at field 0; an
+  `rdmaProcessingSpec` for IMPUTE must be updated to match (`"fields":
+  ["DECIMAL_UNSCALED_I64","INT64","INT64","BYTES","BYTES",
+  "TIMESTAMP_MILLIS","BYTES"]` instead of the old `"DECIMAL_BYTES"` at
+  index 0) — an **old RDMA client config using the previous spec will now
+  be rejected at bootstrap**, not silently misinterpreted, since
+  `from_protocol` validates the whole fields array against the exact
+  expected schema. The new variant's numeric `field_types` tag (6) isn't
+  actually read by `parse_bid`/`write_imputed_bid` (IMPUTE's field walk is
+  hardcoded, not driven by that array — only `process_currency_conversion`/
+  `process_increment` consult it generically), but is assigned and kept
+  accurate anyway for anyone reading the schema. `direct_imputation_jni.cu`'s
+  own hardcoded `imputation_spec()` (the local JNI path's equivalent, unrelated
+  to the Rust protocol) was updated to the same tag for the same reason.
+- **`ImputationGpuFunction.java`**: `WIRES[0]` changed from
+  `DECIMAL_UNSCALED_BYTES` to `DECIMAL_UNSCALED_I64`; `writeTargets[0]`/
+  `readSources[0]` (the wire's own declared type, now factored into a
+  `WIRE_PRICE_TYPE` constant) changed from `DecimalType(23, 3)` to
+  `DecimalType(18, 3)`. Deliberately **not** changed: `readTargets[0]`,
+  still derived from `resultType` — i.e., whatever `ImputationFunction`'s
+  actual declared SQL result type is (`DECIMAL(23,3)`, per
+  `ImputationFunction.ImputedBid`'s `@DataTypeHint`) stays exactly as
+  declared; nothing about the SQL-visible result type or the source
+  `bids.price` column's type changes. This works because
+  `ExternalRuntimeBinaryCodec#castIfNeeded`'s `DECIMAL` branch materializes
+  using the *source* type first (cheap, since the wire source is now
+  compact) and only then widens via `DecimalDataUtils.castFrom` to the
+  target's actual precision/scale — narrow-compact-in,
+  wide-if-declared-out, with the expensive representation only where the
+  SQL contract actually requires it.
 
 **Measured: the two bulk-copy fixes above did not close the gap.** That rules
 out the copy loops as the dominant cost and points at something structural

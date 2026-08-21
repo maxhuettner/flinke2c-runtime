@@ -51,6 +51,12 @@ pub enum WireFieldType {
     Int32,
     Int64,
     DecimalBytes,
+    // Fixed 8-byte scale-3 unscaled decimal, no length prefix - unlike
+    // DecimalBytes above. Only IMPUTE's price field (index 0) uses this;
+    // see process_function.cu's BidView::price_unscaled and the README's
+    // imputation section for why price specifically moved off the
+    // variable-length format the other decimal-bearing paths still use.
+    DecimalUnscaledI64,
     Bytes,
     TimestampMillis,
 }

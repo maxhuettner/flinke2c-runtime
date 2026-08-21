@@ -51,8 +51,11 @@ impl CudaProcessSpec {
         let function = match spec.function {
             ProcessingFunction::Increment => 1,
             ProcessingFunction::Impute => {
+                // Field 0 (price) is DECIMAL_UNSCALED_I64, not
+                // DECIMAL_BYTES like the other decimal-bearing functions -
+                // see WireFieldType::DecimalUnscaledI64's doc comment.
                 const IMPUTATION_SCHEMA: [WireFieldType; 7] = [
-                    WireFieldType::DecimalBytes,
+                    WireFieldType::DecimalUnscaledI64,
                     WireFieldType::Int64,
                     WireFieldType::Int64,
                     WireFieldType::Bytes,
@@ -63,7 +66,7 @@ impl CudaProcessSpec {
                 ensure!(
                     spec.field_index == 0 && spec.fields.as_slice() == IMPUTATION_SCHEMA.as_slice(),
                     "IMPUTE requires field_index 0 and fields \
-                     [DECIMAL_BYTES, INT64, INT64, BYTES, BYTES, TIMESTAMP_MILLIS, BYTES]"
+                     [DECIMAL_UNSCALED_I64, INT64, INT64, BYTES, BYTES, TIMESTAMP_MILLIS, BYTES]"
                 );
                 2
             }
@@ -90,6 +93,11 @@ impl CudaProcessSpec {
                 WireFieldType::DecimalBytes => 3,
                 WireFieldType::Bytes => 4,
                 WireFieldType::TimestampMillis => 5,
+                // Not consulted by parse_bid/write_imputed_bid (IMPUTE's
+                // field walk is hardcoded, not driven by field_types), but
+                // the match has to be exhaustive since WireFieldType is
+                // shared across every function's schema.
+                WireFieldType::DecimalUnscaledI64 => 6,
             };
         }
         Ok(Self {
@@ -701,7 +709,7 @@ mod tests {
             function: ProcessingFunction::Impute,
             field_index: 0,
             fields: vec![
-                WireFieldType::DecimalBytes,
+                WireFieldType::DecimalUnscaledI64,
                 WireFieldType::Int64,
                 WireFieldType::Int64,
                 WireFieldType::Bytes,
@@ -733,7 +741,7 @@ mod tests {
         assert_eq!(spec.function, 2);
         assert_eq!(spec.field_index, 0);
         assert_eq!(spec.field_count, 7);
-        assert_eq!(&spec.field_types[..7], &[3, 2, 2, 4, 4, 5, 4]);
+        assert_eq!(&spec.field_types[..7], &[6, 2, 2, 4, 4, 5, 4]);
     }
 
     #[test]

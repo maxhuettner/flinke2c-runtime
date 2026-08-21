@@ -116,7 +116,13 @@ ProcessSpec imputation_spec() {
     spec.function = FUNCTION_IMPUTE;
     spec.field_index = 0;
     spec.field_count = 7;
-    spec.field_types[0] = 3;
+    // Not actually consulted by parse_bid/write_imputed_bid (IMPUTE's field
+    // walk is hardcoded, not driven by field_types), but kept accurate: 6 =
+    // DECIMAL_UNSCALED_I64, matching gpu_runtime/cuda.rs's field_types
+    // mapping on the RDMA side. price moved off the DECIMAL_BYTES (3)
+    // variable-length format - see BidView::price_unscaled's comment in
+    // process_function.cu.
+    spec.field_types[0] = 6;
     spec.field_types[1] = 2;
     spec.field_types[2] = 2;
     spec.field_types[3] = 4;

@@ -69,8 +69,12 @@ __device__ uint32_t imputation_history_size;
 struct BidView {
     bool valid;
     bool price_missing;
-    const uint8_t* price;
-    uint32_t price_length;
+    // Fixed-width DECIMAL_UNSCALED_I64 (8 bytes, no length prefix) - not a
+    // byte pointer/length pair like the other variable-length fields below.
+    // See the README's imputation section for why price specifically moved
+    // off the variable-length DECIMAL_UNSCALED_BYTES format the other
+    // decimal-bearing paths (Black-Scholes, currency conversion) still use.
+    int64_t price_unscaled;
     int64_t auction;
     int64_t bidder;
     const uint8_t* channel;
@@ -305,8 +309,7 @@ __device__ bool read_variable(
 __device__ bool parse_bid(const Slot& slot, BidView& bid) {
     bid.valid = false;
     bid.price_missing = true;
-    bid.price = nullptr;
-    bid.price_length = 0;
+    bid.price_unscaled = 0;
     bid.auction = 0;
     bid.bidder = 0;
     bid.channel = nullptr;
@@ -326,11 +329,10 @@ __device__ bool parse_bid(const Slot& slot, BidView& bid) {
     uint32_t position = 17;
 
     bid.price_missing = null_field(nulls, 0);
-    if (!bid.price_missing &&
-        (!read_variable(
-             slot.value, row_length, position, bid.price, bid.price_length) ||
-         bid.price_length == 0)) {
-        return false;
+    if (!bid.price_missing) {
+        if (position + 8 > row_length) return false;
+        bid.price_unscaled = int64_t(be64(slot.value + position));
+        position += 8;
     }
 
     if (!null_field(nulls, 1)) {
@@ -417,9 +419,18 @@ __device__ double decimal_to_double(const uint8_t* value, uint32_t length) {
     return result / 1000.0;
 }
 
+// Fixed-width counterpart to decimal_to_double above, for price's
+// DECIMAL_UNSCALED_I64 wire representation (a plain scale-3 unscaled
+// int64, no byte-array parsing needed). The byte-array version above stays
+// as-is for the paths still using DECIMAL_UNSCALED_BYTES (Black-Scholes,
+// currency conversion).
+__device__ __forceinline__ double decimal_to_double_i64(int64_t unscaled) {
+    return double(unscaled) / 1000.0;
+}
+
 __device__ ImputationObservation observation_from(const BidView& bid) {
     ImputationObservation observation;
-    observation.price = decimal_to_double(bid.price, bid.price_length);
+    observation.price = decimal_to_double_i64(bid.price_unscaled);
     observation.bidder = bid.bidder;
     observation.timestamp_seconds = double(bid.timestamp_millis) / 1000.0;
     observation.channel_hash = bid_channel_hash(bid);
@@ -670,6 +681,26 @@ __device__ uint32_t encode_decimal(double price, uint8_t* output) {
     return width;
 }
 
+// Fixed-width counterpart to encode_decimal above, for price's
+// DECIMAL_UNSCALED_I64 wire representation. Same round-HALF_UP(price *
+// 1000) semantics, but returns the unscaled value directly instead of a
+// variable-length byte encoding - safe as a plain int64 because the wire
+// precision (DECIMAL(18,3), at most 18 significant digits) is always well
+// within int64's ~19-digit range, unlike encode_decimal's byte path, which
+// exists specifically to also cover magnitudes outside that range for the
+// callers still using DECIMAL_UNSCALED_BYTES (Black-Scholes, currency
+// conversion). NaN/Inf/out-of-range collapse to 0, matching the Java UDF's
+// 0.000 default and encode_decimal's own handling.
+__device__ __forceinline__ int64_t encode_decimal_i64(double price) {
+    if (!isfinite(price)) return 0;
+    const double scaled = price * 1000.0;
+    // int64 range is roughly +-9.223e18; stay well clear of the boundary
+    // where the double->int64 cast itself becomes undefined behavior.
+    if (scaled >= 9.0e18 || scaled <= -9.0e18) return 0;
+    const double rounded = scaled >= 0.0 ? floor(scaled + 0.5) : ceil(scaled - 0.5);
+    return static_cast<int64_t>(rounded);
+}
+
 // Abramowitz & Stegun approximation 7.1.26 (max absolute error 1.5e-7),
 // matching BlackScholesFunction.erf / direct_black_scholes_jni.cu's
 // erf_approx exactly, so all three paths agree to floating-point precision.
@@ -762,13 +793,13 @@ __device__ void copy_bytes(
 __device__ bool write_imputed_bid(
     const Slot& source, Slot& destination, const BidView& bid,
     double imputed_price) {
-    uint8_t price_bytes[40];
-    const uint8_t* price = bid.price;
-    uint32_t price_length = bid.price_length;
-    if (bid.price_missing) {
-        price_length = encode_decimal(imputed_price, price_bytes);
-        price = price_bytes;
-    }
+    // Fixed 8 bytes, no length prefix - see BidView::price_unscaled's
+    // comment. An observed price is written back exactly as parsed
+    // (no double round trip, same precision-preservation guarantee the
+    // variable-length path used to document); a missing one is imputed and
+    // re-encoded via encode_decimal_i64.
+    const int64_t price_unscaled =
+        bid.price_missing ? encode_decimal_i64(imputed_price) : bid.price_unscaled;
     const uint8_t* channel =
         bid.channel == nullptr ? DEFAULT_CHANNEL_BYTES : bid.channel;
     const uint32_t channel_length =
@@ -776,7 +807,7 @@ __device__ bool write_imputed_bid(
             ? uint32_t(sizeof(DEFAULT_CHANNEL_BYTES))
             : bid.channel_length;
     const uint32_t output_length =
-        17 + 4 + price_length + 8 + 8 +
+        17 + 8 + 8 + 8 +
         4 + channel_length + 4 + bid.url_length + 8 +
         4 + bid.extra_length;
     if (output_length > MAX_ITEM_SIZE) return false;
@@ -788,9 +819,8 @@ __device__ bool write_imputed_bid(
     destination.value[16] = 0;
     uint32_t position = 17;
 
-    put_be32(destination.value + position, price_length);
-    position += 4;
-    copy_bytes(destination.value, position, price, price_length);
+    put_be64(destination.value + position, uint64_t(price_unscaled));
+    position += 8;
     put_be64(destination.value + position, uint64_t(bid.auction));
     position += 8;
     put_be64(destination.value + position, uint64_t(bid.bidder));

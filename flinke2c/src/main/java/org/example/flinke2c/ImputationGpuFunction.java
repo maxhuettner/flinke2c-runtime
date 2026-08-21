@@ -28,11 +28,34 @@ import java.util.concurrent.atomic.LongAdder;
 public final class ImputationGpuFunction implements GpuRuntimeFunction {
     private static final long serialVersionUID = 1L;
     private static final int FIELDS = 7;
+    // price (field 0) is DECIMAL_UNSCALED_I64, not DECIMAL_UNSCALED_BYTES:
+    // a fixed 8-byte scale-3 unscaled long, wired at DECIMAL(18,3) (see
+    // WIRE_PRICE_TYPE below) regardless of the source column's or the
+    // result type's actual declared precision. perfcsv profiling found
+    // decode()'s single biggest per-field cost was price's
+    // BigInteger->BigDecimal->DecimalData(non-compact) chain, required only
+    // because DECIMAL(23,3) exceeds Flink's 18-digit compact-decimal
+    // threshold; 18 digits before the decimal point is far beyond any
+    // realistic bid price, so this trades an unused precision margin for
+    // DecimalData.fromUnscaledLong's much cheaper compact-decimal
+    // construction on both encode and decode. This changes the wire bytes
+    // the GPU kernel itself produces/consumes (process_function.cu's
+    // BidView::price_unscaled, parse_bid, write_imputed_bid), shared with
+    // the RDMA path - see the README's imputation section for the full
+    // cross-cutting change list.
     private static final ExternalRuntimeBinaryCodec.WireType[] WIRES = {
-        ExternalRuntimeBinaryCodec.WireType.DECIMAL_UNSCALED_BYTES,
+        ExternalRuntimeBinaryCodec.WireType.DECIMAL_UNSCALED_I64,
         ExternalRuntimeBinaryCodec.WireType.INT64, ExternalRuntimeBinaryCodec.WireType.INT64,
         ExternalRuntimeBinaryCodec.WireType.STRING, ExternalRuntimeBinaryCodec.WireType.STRING,
         ExternalRuntimeBinaryCodec.WireType.TIMESTAMP_MILLIS, ExternalRuntimeBinaryCodec.WireType.STRING};
+    // The wire's own declared type for price, independent of both the
+    // source bids.price column's actual precision (whatever it is - not
+    // touched) and the UDF's declared DECIMAL(23,3) result type (also not
+    // touched - Flink SQL's contract for ImputationFunction's output is
+    // fixed by ImputationFunction.ImputedBid's own @DataTypeHint). Kept at
+    // scale 3 to match both, so no rescaling path is ever exercised;
+    // precision 18 is what actually unlocks the compact DecimalData path.
+    private static final DecimalType WIRE_PRICE_TYPE = new DecimalType(18, 3);
 
     private transient GpuRuntimeFunction.Emitter emitter;
     private transient ExternalRuntimeBinaryCodec codec;
@@ -53,6 +76,12 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
     private transient volatile boolean completerBusy;
     private transient int[] fields;
     private transient int[] resultFieldWireIndexes;
+    // Inverse of resultFieldWireIndexes: wireIndexToResultField[w] is the result
+    // field that wire field w decodes into, or -1 if w isn't part of the result
+    // row at all. Lets decode() write straight into the final result row (see
+    // ExternalRuntimeBinaryCodec#readFramedRowInto) instead of decoding into a
+    // scratch row and then copying every field out of it by hand.
+    private transient int[] wireIndexToResultField;
     private transient int resultPriceField;
     private transient int passthroughResultField;
     private transient int passthroughInputIndex;
@@ -60,13 +89,19 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
     private transient RowType resultType;
     private transient int batchSize, depth, nextLane, fillCount, threadsPerBlock, cudaDevice;
     private transient long nextRowId;
-    // decode() runs on the single completer thread, one row at a time, and
-    // copies every field it needs out of this row into the row it hands off
-    // before touching the next slot - so reusing one container here (instead
-    // of allocating a fresh 7-field GenericRowData per row) is safe even
-    // though the *result* rows it feeds must stay independently valid until
-    // drainCompleted() later collects them.
-    private transient GenericRowData wireScratch;
+    // Pooling decode()'s per-row allocations (the result GenericRowData,
+    // and separately the STRING fields' backing byte[]s, tried both with an
+    // exact length match and grow-only) was tried and reverted. Measured
+    // with perfcsv across several variants, every one made decode() slower,
+    // not faster (616 baseline -> 914-937 micros/batch), which is itself
+    // informative: it means allocation avoidance was never the real lever
+    // here. decode() used to also build a separate scratch row per batch and
+    // copy every field out of it into the result row by hand; that copy (not
+    // reuse) was real, avoidable work, so it's gone too - see
+    // ExternalRuntimeBinaryCodec#readFramedRowInto, which decodes straight
+    // into the result row via wireIndexToResultField. See the README's
+    // "packed direct CUDA imputation" section for the full measurement
+    // history.
     // Null when perfcsv is unset (the default): every call site below is
     // guarded, so disabled logging costs nothing beyond the null checks.
     private transient PerfStats perf;
@@ -111,21 +146,17 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
         }
     }
 
+    // Two parallel lists rather than one list of a (metadata, row) wrapper: avoids
+    // an extra small object allocated per row (9.2M of them across a full run)
+    // purely to hold two references that decode() and drainCompleted() already
+    // know how to keep aligned by index.
     private static final class CompletedBatch {
-        final List<CompletedRow> rows;
+        final List<Pending> metas;
+        final List<GenericRowData> rows;
 
-        CompletedBatch(List<CompletedRow> rows) {
+        CompletedBatch(List<Pending> metas, List<GenericRowData> rows) {
+            this.metas = metas;
             this.rows = rows;
-        }
-    }
-
-    private static final class CompletedRow {
-        final Pending metadata;
-        final GenericRowData result;
-
-        CompletedRow(Pending metadata, GenericRowData result) {
-            this.metadata = metadata;
-            this.result = result;
         }
     }
 
@@ -165,7 +196,7 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
         }
         validate(types);
         LogicalType[] writeTargets = types.clone();
-        writeTargets[0] = new DecimalType(23, 3);
+        writeTargets[0] = WIRE_PRICE_TYPE;
         resultFieldWireIndexes = new int[resultType.getFieldCount()];
         resultPriceField = -1;
         passthroughResultField = -1;
@@ -197,9 +228,15 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
         if (resultPriceField < 0) throw new IllegalArgumentException("result row does not contain the configured price field");
         passthroughGetter = passthroughInputIndex < 0
                 ? null : RowData.createFieldGetter(rowType.getTypeAt(passthroughInputIndex), passthroughInputIndex);
+        wireIndexToResultField = new int[FIELDS];
+        java.util.Arrays.fill(wireIndexToResultField, -1);
+        for (int f = 0; f < resultFieldWireIndexes.length; f++) {
+            int wireIndex = resultFieldWireIndexes[f];
+            if (wireIndex >= 0) wireIndexToResultField[wireIndex] = f;
+        }
 
         LogicalType[] readSources = types.clone();
-        readSources[0] = new DecimalType(23, 3);
+        readSources[0] = WIRE_PRICE_TYPE;
         LogicalType[] readTargets = new LogicalType[FIELDS];
         for (int i = 0; i < FIELDS; i++) {
             int resultIndex = resultNames.indexOf(inputNames.get(fields[i]));
@@ -219,7 +256,6 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
                 timestampPrecision, null, null, null, false);
         decodeCodec = new ExternalRuntimeBinaryCodec(true, null, null, null, null, null, null,
                 WIRES, readSources, readTargets, false);
-        wireScratch = new GenericRowData(FIELDS);
         emitter = output;
         handle = DirectCudaImputationNative.create(cudaDevice, batchSize, depth, threadsPerBlock,
                 perfCsvPath != null);
@@ -240,7 +276,7 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
         submitterBusy = false;
         completerBusy = false;
         perf = perfCsvPath == null ? null
-                : new PerfStats("extract", "frame", "submit", "wait",
+                : new PerfStats("extract", "laneWait", "frame", "submit", "wait",
                         "gpuH2D", "gpuPrepare", "gpuProcess", "gpuCommit", "gpuD2H",
                         "decode", "collect");
         totalRows = new LongAdder();
@@ -263,7 +299,21 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
     public void processElement(RowData row, boolean hasTimestamp, long timestamp) throws Exception {
         drainCompleted();
         checkWorkerFailure();
-        if (fillCount == 0) awaitLaneFree(nextLane);
+        // Measures time the Flink thread spends blocked here waiting for the
+        // submitter/completer to free up the next lane - i.e. backpressure from
+        // the GPU pipeline not keeping up with the input rate, as opposed to
+        // time spent in any of the named stages below. A non-trivial laneWait
+        // means pipelineDepth (or the completer's wait+decode cost) is the
+        // actual throughput ceiling, not extract/frame/submit.
+        if (fillCount == 0) {
+            if (perf == null) {
+                awaitLaneFree(nextLane);
+            } else {
+                long t0 = System.nanoTime();
+                awaitLaneFree(nextLane);
+                perf.record("laneWait", System.nanoTime() - t0);
+            }
+        }
         long id = nextRowId++;
         // Only pull values out of the row here - reading RowData is the one
         // part that can't be deferred, since pipeline.object-reuse means its
@@ -450,7 +500,8 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
 
     private CompletedBatch decode(Work work) throws Exception {
         ByteBuffer output = outputs[work.lane];
-        List<CompletedRow> results = new ArrayList<>(work.count);
+        List<Pending> metas = new ArrayList<>(work.count);
+        List<GenericRowData> rows = new ArrayList<>(work.count);
         for (int i = 0; i < work.count; i++) {
             int base = i * DirectCudaImputationNative.SLOT_STRIDE;
             int length = output.getInt(base);
@@ -458,36 +509,41 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
                 throw new IOException("invalid output slot");
             }
             Pending meta = work.rows.get(i);
-            ExternalRuntimeBinaryCodec.RowWithId decoded = decodeCodec.readFramedRow(
+            GenericRowData result = new GenericRowData(resultType.getFieldCount());
+            // Decodes straight into result via wireIndexToResultField, instead of
+            // decoding into a scratch row and then copying every field out of it
+            // by hand - see ExternalRuntimeBinaryCodec#readFramedRowInto.
+            long rowId = decodeCodec.readFramedRowInto(
                     output, base + DirectCudaImputationNative.SLOT_VALUE_OFFSET,
-                    RowKind.INSERT, wireScratch);
-            if (decoded.rowId != meta.id) {
+                    result, wireIndexToResultField);
+            if (rowId != meta.id) {
                 throw new IOException(
                         "packed imputation row order violation: lane=" + work.lane
                                 + ", slot=" + i
                                 + ", expectedRowId=" + meta.id
-                                + ", actualRowId=" + decoded.rowId
+                                + ", actualRowId=" + rowId
                                 + ", frameLength=" + length);
             }
-            GenericRowData result = new GenericRowData(resultType.getFieldCount());
             result.setRowKind(meta.rowKind);
-            GenericRowData wireRow = (GenericRowData) decoded.row;
-            for (int f = 0; f < resultFieldWireIndexes.length; f++) {
-                int wireIndex = resultFieldWireIndexes[f];
-                result.setField(f, wireIndex >= 0 ? wireRow.getField(wireIndex) : meta.passthrough);
+            if (passthroughResultField >= 0) {
+                result.setField(passthroughResultField, meta.passthrough);
             }
-            results.add(new CompletedRow(meta, result));
+            metas.add(meta);
+            rows.add(result);
         }
-        return new CompletedBatch(results);
+        return new CompletedBatch(metas, rows);
     }
 
     private void drainCompleted() throws Exception {
         CompletedBatch batch;
         while ((batch = completedQueue.poll()) != null) {
             long collectStart = perf == null ? 0L : System.nanoTime();
-            for (CompletedRow row : batch.rows) {
-                Pending meta = row.metadata;
-                emitter.collect(row.result, meta.hasTimestamp, meta.timestamp);
+            List<Pending> metas = batch.metas;
+            List<GenericRowData> rows = batch.rows;
+            int n = rows.size();
+            for (int i = 0; i < n; i++) {
+                Pending meta = metas.get(i);
+                emitter.collect(rows.get(i), meta.hasTimestamp, meta.timestamp);
             }
             if (perf != null) perf.record("collect", System.nanoTime() - collectStart);
         }
@@ -528,7 +584,7 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
             handle = 0L; inputs = null; outputs = null; workQueue = null;
             submittedQueue = null; completedQueue = null; laneMonitor = null; laneBusy = null;
             submitter = null; completer = null; perfFlusher = null; filling = null;
-            codec = null; decodeCodec = null; wireScratch = null; emitter = null;
+            codec = null; decodeCodec = null; emitter = null;
             submitterBusy = false; completerBusy = false;
             perf = null; totalRows = null; totalBatches = null;
         }

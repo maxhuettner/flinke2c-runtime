@@ -15,11 +15,14 @@ import org.apache.flink.types.RowKind;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
-import java.util.Map;
+import java.util.concurrent.atomic.LongAdder;
 
 /** Dynamically loadable packed GPU implementation of bid-price imputation. */
 public final class ImputationGpuFunction implements GpuRuntimeFunction {
@@ -55,7 +58,7 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
     private transient int passthroughInputIndex;
     private transient RowData.FieldGetter passthroughGetter;
     private transient RowType resultType;
-    private transient int batchSize, depth, nextLane, fillCount;
+    private transient int batchSize, depth, nextLane, fillCount, threadsPerBlock, cudaDevice;
     private transient long nextRowId;
     // decode() runs on the single completer thread, one row at a time, and
     // copies every field it needs out of this row into the row it hands off
@@ -64,6 +67,20 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
     // though the *result* rows it feeds must stay independently valid until
     // drainCompleted() later collects them.
     private transient GenericRowData wireScratch;
+    // Null when perfcsv is unset (the default): every call site below is
+    // guarded, so disabled logging costs nothing beyond the null checks.
+    private transient PerfStats perf;
+    private transient Path perfCsvPath;
+    private transient long openNanos;
+    private transient LongAdder totalRows;
+    private transient LongAdder totalBatches;
+    // Writes a growing snapshot every perfFlushMillis while the job is still
+    // running, not just once at close(): a streaming query normally never
+    // reaches close() on its own, and a killed (not gracefully cancelled)
+    // job never reaches it at all, so waiting for close() alone can mean the
+    // CSV never gets a single row.
+    private transient Thread perfFlusher;
+    private transient long perfFlushMillis;
 
     private static final class Pending {
         final long id, timestamp;
@@ -117,10 +134,19 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
         Map<String, String> c = context.getConf();
         batchSize = intValue(c, "batchsize", context.getBatchSize());
         depth = intValue(c, "pipelinedepth", 4);
-        int threads = intValue(c, "threadsperblock", 256);
-        int device = intValue(c, "device", 0);
+        threadsPerBlock = intValue(c, "threadsperblock", 256);
+        cudaDevice = intValue(c, "device", 0);
+        // Per-stage timing CSV, disabled unless a path is given. Set via the
+        // same conf string as the other keys, e.g.
+        // impl=...ImputationGpuFunction;...;perfcsv=/tmp/imputation-perf.csv
+        String perfCsv = c.get("perfcsv");
+        perfCsvPath = perfCsv == null || perfCsv.isEmpty() ? null : Paths.get(perfCsv);
+        // How often to write a running snapshot while still open, on top of
+        // the one always written at close(). 0 (or perfcsv unset) disables
+        // periodic flushing - only the close()-time row is written then.
+        perfFlushMillis = 1000L * intValue(c, "perfflushseconds", 30);
         if (batchSize <= 0 || batchSize > 65536 || depth <= 0 || depth > 64 ||
-                threads < 32 || threads > 1024 || threads % 32 != 0) {
+                threadsPerBlock < 32 || threadsPerBlock > 1024 || threadsPerBlock % 32 != 0) {
             throw new IllegalArgumentException("invalid packed imputation configuration");
         }
         RowType rowType = context.getInputRowType();
@@ -195,7 +221,8 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
                 WIRES, readSources, readTargets, false);
         wireScratch = new GenericRowData(FIELDS);
         emitter = output;
-        handle = DirectCudaImputationNative.create(device, batchSize, depth, threads);
+        handle = DirectCudaImputationNative.create(cudaDevice, batchSize, depth, threadsPerBlock,
+                perfCsvPath != null);
         if (handle == 0L) throw new IllegalStateException("packed CUDA imputation context creation failed");
         inputs = new ByteBuffer[depth]; outputs = new ByteBuffer[depth];
         workQueue = new ArrayBlockingQueue<>(depth);
@@ -212,12 +239,24 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
         workerRunning = true;
         submitterBusy = false;
         completerBusy = false;
+        perf = perfCsvPath == null ? null
+                : new PerfStats("extract", "frame", "submit", "wait",
+                        "gpuH2D", "gpuPrepare", "gpuProcess", "gpuCommit", "gpuD2H",
+                        "decode", "collect");
+        totalRows = new LongAdder();
+        totalBatches = new LongAdder();
+        openNanos = System.nanoTime();
         submitter = new Thread(this::runSubmitter, "gpu-imputation-submit");
         completer = new Thread(this::runCompleter, "gpu-imputation-completion");
         submitter.setDaemon(true);
         completer.setDaemon(true);
         submitter.start();
         completer.start();
+        if (perf != null && perfFlushMillis > 0L) {
+            perfFlusher = new Thread(this::runPerfFlusher, "gpu-imputation-perf-flush");
+            perfFlusher.setDaemon(true);
+            perfFlusher.start();
+        }
     }
 
     @Override
@@ -232,9 +271,17 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
         // those values into the wire byte layout touches no Flink state and
         // is deferred to the submitter thread (see runSubmitter), so this
         // method stays to a handful of getter calls and a list append.
-        Object[] wireValues = codec.extractRowValues(row, fields);
+        Object[] wireValues;
+        if (perf == null) {
+            wireValues = codec.extractRowValues(row, fields);
+        } else {
+            long t0 = System.nanoTime();
+            wireValues = codec.extractRowValues(row, fields);
+            perf.record("extract", System.nanoTime() - t0);
+        }
         Object passthrough = passthroughGetter == null ? null : passthroughGetter.getFieldOrNull(row);
         filling.add(new Pending(id, hasTimestamp, timestamp, row.getRowKind(), passthrough, wireValues));
+        if (perf != null) totalRows.increment();
         if (++fillCount == batchSize) submitFilling();
     }
 
@@ -304,6 +351,7 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
                     // in this Work, and nothing else touches this lane's
                     // input buffer between then and here.
                     ByteBuffer input = inputs[work.lane];
+                    long frameStart = perf == null ? 0L : System.nanoTime();
                     for (int i = 0; i < work.count; i++) {
                         Pending row = work.rows.get(i);
                         int base = i * DirectCudaImputationNative.SLOT_STRIDE;
@@ -312,7 +360,13 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
                                 DirectCudaImputationNative.MAX_ITEM_SIZE);
                         input.putInt(base, length);
                     }
+                    if (perf != null) perf.record("frame", System.nanoTime() - frameStart);
+                    long submitStart = perf == null ? 0L : System.nanoTime();
                     DirectCudaImputationNative.submitBatch(handle, work.lane, work.count);
+                    if (perf != null) {
+                        perf.record("submit", System.nanoTime() - submitStart);
+                        totalBatches.increment();
+                    }
                     while (!submittedQueue.offer(work, 100L, TimeUnit.MILLISECONDS)) {
                         checkWorkerFailure();
                     }
@@ -332,8 +386,33 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
                 if (work == null) continue;
                 completerBusy = true;
                 try {
-                    DirectCudaImputationNative.waitBatch(handle, work.lane);
+                    if (perf == null) {
+                        DirectCudaImputationNative.waitBatch(handle, work.lane);
+                    } else {
+                        long waitStart = System.nanoTime();
+                        // waitBatchTimed does the same synchronize as
+                        // waitBatch, plus (since this handle was created
+                        // with profiling=true) returns how long the GPU
+                        // itself spent in each stage between submit and
+                        // now - combines with the surrounding host-side
+                        // stages in the same CSV row, so "wait" (CPU wall
+                        // time blocked here) and the gpu* stages together
+                        // show whether time is going into the GPU work
+                        // itself or into host-side launch/scheduling gaps
+                        // around it.
+                        float[] gpuMillis = DirectCudaImputationNative.waitBatchTimed(handle, work.lane);
+                        perf.record("wait", System.nanoTime() - waitStart);
+                        if (gpuMillis != null && gpuMillis.length == 5) {
+                            perf.record("gpuH2D", (long) (gpuMillis[0] * 1_000_000.0));
+                            perf.record("gpuPrepare", (long) (gpuMillis[1] * 1_000_000.0));
+                            perf.record("gpuProcess", (long) (gpuMillis[2] * 1_000_000.0));
+                            perf.record("gpuCommit", (long) (gpuMillis[3] * 1_000_000.0));
+                            perf.record("gpuD2H", (long) (gpuMillis[4] * 1_000_000.0));
+                        }
+                    }
+                    long decodeStart = perf == null ? 0L : System.nanoTime();
                     CompletedBatch completed = decode(work);
+                    if (perf != null) perf.record("decode", System.nanoTime() - decodeStart);
                     // decode() has copied all results out of the native output
                     // buffer, so the lane can be reused while completed rows
                     // wait for collection on the Flink thread.
@@ -405,10 +484,12 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
     private void drainCompleted() throws Exception {
         CompletedBatch batch;
         while ((batch = completedQueue.poll()) != null) {
+            long collectStart = perf == null ? 0L : System.nanoTime();
             for (CompletedRow row : batch.rows) {
                 Pending meta = row.metadata;
                 emitter.collect(row.result, meta.hasTimestamp, meta.timestamp);
             }
+            if (perf != null) perf.record("collect", System.nanoTime() - collectStart);
         }
     }
 
@@ -427,17 +508,82 @@ public final class ImputationGpuFunction implements GpuRuntimeFunction {
         }
         finally {
             workerRunning = false;
-            if (submitter != null) submitter.interrupt();
-            if (completer != null) completer.interrupt();
-            if (submitter != null) submitter.join(5000L);
-            if (completer != null) completer.join(5000L);
+            // Stop the periodic flusher before the final write below, so
+            // the two never race on the same file (PerfStats.appendCsv is
+            // synchronized as a defense in depth, but there's no reason to
+            // rely on that when a clean handoff is this easy). Each join is
+            // independently interruption-safe: Thread.join() throws
+            // InterruptedException if *this* (closing) thread is
+            // interrupted while waiting, and an uncaught one here would
+            // abort the rest of this finally block, skipping the native
+            // destroy() call and the final perf row entirely.
+            interruptAndJoinQuietly(perfFlusher);
+            interruptAndJoinQuietly(submitter);
+            interruptAndJoinQuietly(completer);
+            // flush() above drains every in-flight batch, so row/batch
+            // counts are final by the time this runs - log before anything
+            // is nulled out below.
+            writePerfCsv("final");
             if (handle != 0L) DirectCudaImputationNative.destroy(handle);
             handle = 0L; inputs = null; outputs = null; workQueue = null;
             submittedQueue = null; completedQueue = null; laneMonitor = null; laneBusy = null;
-            submitter = null; completer = null; filling = null;
+            submitter = null; completer = null; perfFlusher = null; filling = null;
             codec = null; decodeCodec = null; wireScratch = null; emitter = null;
             submitterBusy = false; completerBusy = false;
+            perf = null; totalRows = null; totalBatches = null;
         }
+    }
+
+    private static void interruptAndJoinQuietly(Thread thread) {
+        if (thread == null) return;
+        thread.interrupt();
+        try {
+            thread.join(5000L);
+        } catch (InterruptedException e) {
+            // Restore this (closing) thread's interrupted status for
+            // whatever called close() to observe, but don't let it cut the
+            // rest of close()'s cleanup short - the native handle still
+            // needs destroying and the final perf row still needs writing
+            // either way.
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Runs on its own daemon thread while perf logging is enabled, writing a growing
+     * snapshot every perfFlushMillis so a still-running (or uncleanly killed) job still
+     * leaves something in the CSV instead of only ever writing at close(). */
+    private void runPerfFlusher() {
+        try {
+            while (workerRunning) {
+                Thread.sleep(perfFlushMillis);
+                if (workerRunning) writePerfCsv("periodic");
+            }
+        } catch (InterruptedException expected) {
+            // close() is stopping this thread; the authoritative final row
+            // is written there, after the pipeline has fully drained.
+        }
+    }
+
+    private void writePerfCsv(String label) {
+        // Captured once up front: close() can null the perf* fields out
+        // from under this method if perfFlusher.join(5000L) ever times out
+        // (it interrupts and joins the flusher before doing exactly that),
+        // and re-reading a field after a null check is a real TOCTOU, not
+        // just a style nit, once two threads are both allowed to touch it.
+        PerfStats snapshot = perf;
+        LongAdder rows = totalRows;
+        LongAdder batches = totalBatches;
+        Path csvPath = perfCsvPath;
+        if (snapshot == null || rows == null || batches == null || csvPath == null) return;
+        long wallMillis = (System.nanoTime() - openNanos) / 1_000_000L;
+        Map<String, String> extra = PerfStats.columns();
+        extra.put("rows", Long.toString(rows.sum()));
+        extra.put("batches", Long.toString(batches.sum()));
+        extra.put("batchSize", Integer.toString(batchSize));
+        extra.put("pipelineDepth", Integer.toString(depth));
+        extra.put("threadsPerBlock", Integer.toString(threadsPerBlock));
+        extra.put("device", Integer.toString(cudaDevice));
+        snapshot.appendCsv(csvPath, "ImputationGpuFunction-" + label, wallMillis, extra);
     }
 
     private static void validate(LogicalType[] t) {

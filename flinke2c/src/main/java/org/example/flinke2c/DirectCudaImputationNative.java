@@ -16,10 +16,20 @@ public final class DirectCudaImputationNative {
 
     private DirectCudaImputationNative() {}
 
-    public static native long create(int device, int capacity, int pipelineDepth, int threadsPerBlock);
+    public static native long create(int device, int capacity, int pipelineDepth, int threadsPerBlock,
+            boolean profiling);
     public static native ByteBuffer inputBuffer(long handle, int lane);
     public static native ByteBuffer outputBuffer(long handle, int lane);
     public static native void submitBatch(long handle, int lane, int count);
     public static native void waitBatch(long handle, int lane);
+    /**
+     * Same wait as {@link #waitBatch}, but for a handle created with
+     * {@code profiling=true}: also returns the elapsed milliseconds of each
+     * GPU-side stage (H2D copy, the three imputation kernels, D2H copy) as
+     * {@code [h2dMs, prepareMs, processMs, commitMs, d2hMs]}. An empty array
+     * means either profiling wasn't enabled at {@link #create} or this lane
+     * had nothing pending.
+     */
+    public static native float[] waitBatchTimed(long handle, int lane);
     public static native void destroy(long handle);
 }

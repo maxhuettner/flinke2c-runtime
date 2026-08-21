@@ -800,6 +800,111 @@ Traded off: each row's `Pending` now carries a small `Object[]` of extracted
 values (boxing the `Long`s that used to go straight into `outBuf` as
 primitives), a modest allocation cost this doesn't try to avoid.
 
+**Per-stage timing CSV.** Set `perfcsv=/path/to/file.csv` in the conf string
+to stop guessing where time goes and measure it directly:
+
+```sql
+SET 'table.exec.gpu-runtime.conf.org.example.flinke2c.ImputationFunction' =
+  'impl=org.example.flinke2c.ImputationGpuFunction;batchsize=1024;pipelinedepth=16;threadsperblock=128;device=0;perfcsv=/tmp/imputation-perf.csv';
+```
+
+`PerfStats` (`flinke2c/.../PerfStats.java`) accumulates wall-clock time and a
+call count per named stage with `LongAdder`s, so recording from the Flink
+thread, the submitter thread, and the completer thread never contends on a
+lock. `ImputationGpuFunction` records eleven stages, matching the pipeline
+above: `extract` (Flink thread, per row - reading the live `RowData`),
+`frame` (submitter thread, per batch - wire-format packing),
+`submit` (submitter thread, per batch - the async JNI launch call itself;
+should stay near zero, since it only enqueues GPU work),
+`wait` (completer thread, per batch - `cudaEventSynchronize`, the CPU wall
+time blocked waiting on the GPU), five `gpu*` stages breaking that GPU time
+down further (see below), `decode` (completer thread, per batch - parsing
+the output slots back into `GenericRowData`), and `collect` (Flink thread,
+per completed batch - the `emitter.collect()` loop). One row is appended to
+the CSV per `open()`..`close()` lifecycle (the local-GPU equivalent of "a new
+connection"), with `timestamp,host,label,wallMillis`, then `rows`, `batches`,
+`batchSize`, `pipelineDepth`, `threadsPerBlock`, `device`, then
+`<stage>TotalMillis,<stage>AvgMicros,<stage>Count` for each stage - total
+tells you where the time actually went, average tells you the per-call cost
+once you already know which stage dominates. A header line is written only
+if the file doesn't exist yet, so the same path can be reused across runs to
+build up a comparison table. Disabled (zero overhead beyond a null check per
+call site) unless `perfcsv` is set. Unset by default; nothing changes for
+existing jobs that don't pass it.
+
+**Rows are written periodically, not only at `close()`.** A streaming query
+over a source that's never stopped (still running, no cancel, no bounded
+end reached yet) never calls `close()` at all, by definition - there's
+nothing to catch there short of stopping the job. For that case: a separate
+daemon thread (`gpu-imputation-perf-flush`) writes a growing cumulative
+snapshot every `perfflushseconds` (default 30; the label column reads
+`ImputationGpuFunction-periodic` for these and `ImputationGpuFunction-final`
+for the one `close()` always writes last, once the pipeline has fully
+drained). Set `perfflushseconds=0` to disable periodic snapshots and only
+ever write the final row.
+
+`close()` itself was also missing a robustness fix: it calls
+`Thread.join(5000L)` on the flusher/submitter/completer threads while
+tearing down, and an uncaught `InterruptedException` there (if the closing
+thread itself gets interrupted mid-wait) would abort the rest of the
+`finally` block, skipping both the final `perfcsv` row and the native
+`DirectCudaImputationNative.destroy(handle)` call. Each join now goes
+through `interruptAndJoinQuietly`, which restores the closing thread's
+interrupted status for its own caller to see but always lets the rest of
+cleanup - the destroy call and the final CSV row - run regardless.
+
+Two other things worth checking if a row still doesn't show up where
+expected. First, on a cluster the file is written on whichever TaskManager
+the operator instance actually runs on - the CUDA device it drives is local
+to that machine - which is not necessarily the machine running the SQL
+client; both the `host` column and the log line below name that host
+directly so this doesn't have to be worked out from the Flink UI's task
+list. Second, `PerfStats` logs at WARN on that TaskManager if a write fails
+(permissions, a bad path, ...) instead of swallowing it silently, and at
+INFO with the host and the resolved absolute path the first time a write
+succeeds - check there if a file that should exist doesn't.
+
+(An earlier version of this note claimed `GpuRuntimeOperator` should also
+hook `StreamOperator.dispose()`, reasoning that `close()` is only guaranteed
+on a graceful finish and `dispose()` is Flink's hook for every termination
+path including a plain cancel. That doesn't hold for the Flink version this
+targets - there is no `dispose()` to override - so that change was reverted.
+If cancelling a job (rather than letting it finish or stopping it with a
+savepoint) still turns out to skip `close()` here, that's a real gap worth
+revisiting against the actual `StreamOperator` lifecycle for this Flink
+version specifically, not by assuming an API shape from a different one.)
+
+**GPU-side kernel timing, combined into the same row.** `wait` alone only
+says how long the CPU blocked; it doesn't say whether that time went into
+the H2D copy, one of the three kernels, or the D2H copy. `perfcsv` also
+switches on GPU-side timing (`direct_imputation_jni.cu`'s `Context::profiling`,
+set from `DirectCudaImputationNative.create`'s new `profiling` argument -
+`perfCsvPath != null`, the same flag that creates the Java-side `PerfStats`),
+which adds five extra timed `cudaEvent_t`s per lane (the lane-reuse/history-
+ordering event stays `cudaEventDisableTiming`, since that one is recorded on
+every `submitBatch` call regardless of profiling and timed events are
+marginally heavier). `submitBatch` records one around each stage; a new
+native call, `waitBatchTimed`, reads them back with `cudaEventElapsedTime`
+once `waitBatch`'s own `cudaEventSynchronize` confirms the batch is done
+(safe to do unsynchronized at that point - events recorded earlier on the
+same stream are already known complete, since a CUDA stream executes and
+records events in issue order) and returns `[h2dMs, prepareMs, processMs,
+commitMs, d2hMs]`. The completer thread feeds these straight into the same
+`PerfStats` instance as `gpuH2D`/`gpuPrepare`/`gpuProcess`/`gpuCommit`/
+`gpuD2H`, so they land as columns in the exact same CSV row as the
+CPU-side stages - "combine" here means literally the same row, not a
+separate file to cross-reference. Comparing `wait`'s total against the sum
+of the five `gpu*` totals separates two different problems that look
+identical from tps alone: if they're close, the GPU kernels themselves are
+the ceiling (matches expectations from `commit_imputation_history_state`
+being single-threaded and unable to pipeline across batches - see the
+batch-size/pipeline-depth sweep guidance above); if `wait` is
+meaningfully larger, the gap is host-side launch/scheduling overhead the
+GPU-side numbers can't see. Both `waitBatch` (untimed) and `waitBatchTimed`
+still exist as separate native calls - profiling off costs nothing beyond
+the five null pointer checks in `submitBatch`, since `waitBatch` is used
+unchanged in that case.
+
 ## GPU Black-Scholes
 
 `org.example.flinke2c.BlackScholesFunction` prices a European call option via

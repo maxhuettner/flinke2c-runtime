@@ -7,9 +7,12 @@ import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.data.TimestampData;
 import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.data.writer.BinaryRowWriter;
 import org.apache.flink.table.types.logical.DecimalType;
+import org.apache.flink.table.types.logical.LocalZonedTimestampType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.LogicalTypeRoot;
+import org.apache.flink.table.types.logical.TimestampType;
 import org.apache.flink.types.RowKind;
 
 import javax.annotation.Nullable;
@@ -879,6 +882,209 @@ public final class ExternalRuntimeBinaryCodec {
                     : skipValue(i, frame, p, limit);
         }
         return rowId;
+    }
+
+    /**
+     * Same decode as {@link #readFramedRowInto}, but writes straight into a
+     * {@link BinaryRowWriter} instead of a {@code GenericRowData}. Every fixed-width
+     * field ({@code writeInt}/{@code writeLong}/{@code writeDouble}/...) lands in the
+     * row's packed byte layout with no boxed wrapper object retained in the row - unlike
+     * {@code GenericRowData}, which stores every field as a boxed {@code Object} in an
+     * {@code Object[]} for the row's whole lifetime. String/decimal/timestamp fields
+     * still go through the same intermediate {@code StringData}/{@code DecimalData}/
+     * {@code TimestampData} construction {@link #castIfNeeded} already did for the
+     * {@code GenericRowData} path, but that object is now transient - consumed and
+     * discarded by the writer call on the spot - rather than retained until the row
+     * itself is collected, which can be several batches later on a queued decode path
+     * like this codec's callers use.
+     *
+     * <p>Row kind is intentionally not touched here, matching {@link #readFramedRowInto}:
+     * callers derive it from their own per-row metadata and should call {@link
+     * BinaryRowWriter#writeRowKind} themselves before {@link BinaryRowWriter#complete}.
+     *
+     * @return the frame's row id ({@code includeRowId} must be true)
+     */
+    public long readFramedRowIntoBinary(
+            java.nio.ByteBuffer frame, int offset, BinaryRowWriter writer, int[] wireIndexToTargetField)
+            throws IOException {
+        if (readWireTypes == null) {
+            throw new IOException("ExternalRuntimeBinaryCodec not configured for reading");
+        }
+        if (offset < 0 || offset > frame.limit() - Integer.BYTES) {
+            throw new IOException("Truncated frame header");
+        }
+        final int frameLen = readIntBE(frame, offset);
+        if (frameLen < 0 || frameLen > DEFAULT_MAX_FRAME_SIZE
+                || frameLen > frame.limit() - offset - Integer.BYTES) {
+            throw new IOException("Invalid frame length: " + frameLen);
+        }
+        int p = offset + Integer.BYTES;
+        final int limit = p + frameLen;
+        if (p + 4 > limit) throw new IOException("Truncated payload: missing operation");
+        p += 4; // __op: the caller sets row kind from its own metadata, not the wire.
+        final long rowId;
+        if (includeRowId) {
+            if (p + 8 > limit) throw new IOException("Truncated payload: missing row id");
+            rowId = readLongBE(frame, p);
+            p += 8;
+        } else {
+            rowId = -1L;
+        }
+        final int nFields = readWireTypes.length;
+        final int nullBytes = (nFields + 7) >>> 3;
+        if (p + nullBytes > limit) throw new IOException("Truncated payload: missing nullBitmap");
+        final int nullBitmapPos = p;
+        p += nullBytes;
+        for (int i = 0; i < nFields; i++) {
+            final int targetField = wireIndexToTargetField[i];
+            if (isNullBitSet(frame, nullBitmapPos, i)) {
+                if (targetField >= 0) writer.setNullAt(targetField);
+                continue; // no bytes on the wire for a null field - nothing to skip.
+            }
+            p = targetField >= 0
+                    ? readValueIntoWriter(i, frame, p, limit, writer, targetField)
+                    : skipValue(i, frame, p, limit);
+        }
+        return rowId;
+    }
+
+    private int readValueIntoWriter(
+            int i, java.nio.ByteBuffer buf, int p, int limit, BinaryRowWriter writer, int targetField)
+            throws IOException {
+        final WireType wt = readWireTypes[i];
+        final LogicalType targetType = readTargetTypes[i];
+        if (targetType == null) {
+            throw new IOException(
+                    "readFramedRowIntoBinary requires a known read target type for wire field " + i);
+        }
+        switch (wt) {
+            case BOOL:
+                if (p + 1 > limit) throw new IOException("Truncated BOOL");
+                writeCastedValue(writer, targetField,
+                        castIfNeeded(buf.get(p) != 0, readSourceTypes[i], targetType), targetType);
+                return p + 1;
+            case INT32:
+                if (p + 4 > limit) throw new IOException("Truncated INT32");
+                writeCastedValue(writer, targetField,
+                        castIfNeeded(readIntBE(buf, p), readSourceTypes[i], targetType), targetType);
+                return p + 4;
+            case INT64:
+            case TIMESTAMP_MILLIS:
+                if (p + 8 > limit) throw new IOException("Truncated INT64");
+                writeCastedValue(writer, targetField,
+                        castIfNeeded(readLongBE(buf, p), readSourceTypes[i], targetType), targetType);
+                return p + 8;
+            case FLOAT32:
+                if (p + 4 > limit) throw new IOException("Truncated FLOAT32");
+                writeCastedValue(writer, targetField,
+                        castIfNeeded(Float.intBitsToFloat(readIntBE(buf, p)), readSourceTypes[i], targetType),
+                        targetType);
+                return p + 4;
+            case FLOAT64:
+                if (p + 8 > limit) throw new IOException("Truncated FLOAT64");
+                writeCastedValue(writer, targetField,
+                        castIfNeeded(Double.longBitsToDouble(readLongBE(buf, p)), readSourceTypes[i], targetType),
+                        targetType);
+                return p + 8;
+            case STRING: {
+                if (p + 4 > limit) throw new IOException("Truncated STRING len");
+                final int len = readIntBE(buf, p);
+                p += 4;
+                if (len < 0 || p + len > limit) throw new IOException("Invalid STRING len: " + len);
+                // Written straight into the writer's own backing segment inside
+                // writeCastedValue -> writer.writeString, so - unlike the GenericRowData
+                // path - this scratch array's contents don't need to outlive this call.
+                final byte[] bytes = copyBytes(i, buf, p, len);
+                final StringData sd = StringData.fromBytes(bytes, 0, len);
+                writeCastedValue(writer, targetField, castIfNeeded(sd, readSourceTypes[i], targetType), targetType);
+                return p + len;
+            }
+            case BYTES: {
+                if (p + 4 > limit) throw new IOException("Truncated BYTES len");
+                final int len = readIntBE(buf, p);
+                p += 4;
+                if (len < 0 || p + len > limit) throw new IOException("Invalid BYTES len: " + len);
+                writeCastedValue(writer, targetField,
+                        castIfNeeded(copyBytes(i, buf, p, len), readSourceTypes[i], targetType), targetType);
+                return p + len;
+            }
+            case DECIMAL_UNSCALED_I64:
+                if (p + 8 > limit) throw new IOException("Truncated DECIMAL_UNSCALED_I64");
+                writeCastedValue(writer, targetField,
+                        castIfNeeded(readLongBE(buf, p), readSourceTypes[i], targetType), targetType);
+                return p + 8;
+            case DECIMAL_UNSCALED_BYTES: {
+                if (p + 4 > limit) throw new IOException("Truncated DECIMAL_UNSCALED_BYTES len");
+                final int len = readIntBE(buf, p);
+                p += 4;
+                if (len < 0 || p + len > limit) throw new IOException("Invalid DECIMAL bytes len: " + len);
+                writeCastedValue(writer, targetField,
+                        castIfNeeded(copyBytes(i, buf, p, len), readSourceTypes[i], targetType), targetType);
+                return p + len;
+            }
+            default:
+                throw new IOException("Unsupported read wire type: " + wt);
+        }
+    }
+
+    /**
+     * Writes a value already cast to {@code targetType}'s runtime representation (i.e.
+     * already run through {@link #castIfNeeded}) into a {@link BinaryRowWriter} field.
+     * Public so callers decoding straight into a {@code BinaryRowWriter} (see {@link
+     * #readFramedRowIntoBinary}) can also use it for fields that don't come off this
+     * codec's wire at all - e.g. a value pulled via {@code RowData.createFieldGetter}
+     * and passed through unchanged - since Flink's internal per-type representation
+     * (the same one {@code RowData.createFieldGetter} itself produces) is standardized
+     * regardless of where the value came from.
+     */
+    public static void writeCastedValue(BinaryRowWriter writer, int pos, Object value, LogicalType targetType) {
+        switch (targetType.getTypeRoot()) {
+            case BOOLEAN:
+                writer.writeBoolean(pos, (Boolean) value);
+                return;
+            case TINYINT:
+                writer.writeByte(pos, (Byte) value);
+                return;
+            case SMALLINT:
+                writer.writeShort(pos, (Short) value);
+                return;
+            case INTEGER:
+            case DATE:
+            case TIME_WITHOUT_TIME_ZONE:
+                writer.writeInt(pos, (Integer) value);
+                return;
+            case BIGINT:
+                writer.writeLong(pos, (Long) value);
+                return;
+            case FLOAT:
+                writer.writeFloat(pos, (Float) value);
+                return;
+            case DOUBLE:
+                writer.writeDouble(pos, (Double) value);
+                return;
+            case CHAR:
+            case VARCHAR:
+                writer.writeString(pos, (StringData) value);
+                return;
+            case BINARY:
+            case VARBINARY:
+                writer.writeBinary(pos, (byte[]) value);
+                return;
+            case TIMESTAMP_WITHOUT_TIME_ZONE:
+                writer.writeTimestamp(pos, (TimestampData) value, ((TimestampType) targetType).getPrecision());
+                return;
+            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+                writer.writeTimestamp(
+                        pos, (TimestampData) value, ((LocalZonedTimestampType) targetType).getPrecision());
+                return;
+            case DECIMAL: {
+                final DecimalType dt = (DecimalType) targetType;
+                writer.writeDecimal(pos, (DecimalData) value, dt.getPrecision());
+                return;
+            }
+            default:
+                throw new IllegalStateException("Unsupported target type for binary row write: " + targetType);
+        }
     }
 
     private static Object castIfNeeded(Object value, LogicalType sourceType, LogicalType targetType) {

@@ -53,6 +53,17 @@ struct Lane {
     Output* device_output = nullptr;
     Input* host_input = nullptr;
     Output* host_output = nullptr;
+    // Only created/recorded when Context::profiling is set (see
+    // waitBatchTimed). event above stays timing-disabled regardless -
+    // that's the one every submitBatch call touches for lane reuse, and
+    // cudaEventDisableTiming is lighter weight for that hot path. This
+    // single kernel has no cross-lane dependency (unlike imputation's
+    // shared history state), so these three give a clean H2D/kernel/D2H
+    // breakdown of the GPU-side portion of the host-observed "wait".
+    cudaEvent_t t_h2d_start = nullptr;
+    cudaEvent_t t_h2d_end = nullptr;
+    cudaEvent_t t_kernel_end = nullptr;
+    cudaEvent_t t_d2h_end = nullptr;
 };
 
 struct Context {
@@ -60,6 +71,7 @@ struct Context {
     uint32_t capacity = 0;
     uint32_t threads_per_block = 0;
     std::vector<Lane> lanes;
+    bool profiling = false;
 };
 
 void throw_java(JNIEnv* env, const char* class_name, const std::string& message) {
@@ -103,6 +115,18 @@ void release_lane(Context* context, Lane& lane) {
     }
     if (lane.event != nullptr) {
         cudaEventDestroy(lane.event);
+    }
+    if (lane.t_h2d_start != nullptr) {
+        cudaEventDestroy(lane.t_h2d_start);
+    }
+    if (lane.t_h2d_end != nullptr) {
+        cudaEventDestroy(lane.t_h2d_end);
+    }
+    if (lane.t_kernel_end != nullptr) {
+        cudaEventDestroy(lane.t_kernel_end);
+    }
+    if (lane.t_d2h_end != nullptr) {
+        cudaEventDestroy(lane.t_d2h_end);
     }
     if (lane.stream != nullptr) {
         cudaStreamDestroy(lane.stream);
@@ -195,7 +219,7 @@ bool require_lane(JNIEnv* env, Context* context, jint lane, uint32_t& out) {
 
 jlong create_impl(
         JNIEnv* env, jint cuda_device, jint batch_capacity, jint pipeline_depth,
-        jint threads_per_block) {
+        jint threads_per_block, jboolean profiling) {
     if (cuda_device < 0 || batch_capacity <= 0 || pipeline_depth <= 0) {
         throw_java(
                 env,
@@ -223,6 +247,7 @@ jlong create_impl(
     context->device = cuda_device;
     context->capacity = static_cast<uint32_t>(batch_capacity);
     context->threads_per_block = static_cast<uint32_t>(threads_per_block);
+    context->profiling = profiling != JNI_FALSE;
     context->lanes.resize(static_cast<uint32_t>(pipeline_depth));
 
     if (!cuda_ok(env, cudaSetDevice(context->device), "cudaSetDevice")) {
@@ -265,6 +290,14 @@ jlong create_impl(
                             output_bytes,
                             cudaHostAllocPortable),
                     "cudaHostAlloc(black-scholes output)")) {
+            release_context(context);
+            return 0;
+        }
+        if (context->profiling &&
+            (!cuda_ok(env, cudaEventCreate(&lane.t_h2d_start), "cudaEventCreate t_h2d_start") ||
+             !cuda_ok(env, cudaEventCreate(&lane.t_h2d_end), "cudaEventCreate t_h2d_end") ||
+             !cuda_ok(env, cudaEventCreate(&lane.t_kernel_end), "cudaEventCreate t_kernel_end") ||
+             !cuda_ok(env, cudaEventCreate(&lane.t_d2h_end), "cudaEventCreate t_d2h_end"))) {
             release_context(context);
             return 0;
         }
@@ -317,9 +350,13 @@ void submit_batch_impl(JNIEnv* env, jlong handle, jint lane, jint count) {
     }
 
     Lane& active = context->lanes[lane_index];
+    const bool profiling = context->profiling;
     const uint32_t batch_count = static_cast<uint32_t>(count);
     const size_t input_bytes = sizeof(Input) * batch_count;
     const size_t output_bytes = sizeof(Output) * batch_count;
+    if (profiling && !cuda_ok(env, cudaEventRecord(active.t_h2d_start, active.stream), "cudaEventRecord t_h2d_start")) {
+        return;
+    }
     if (!cuda_ok(
                 env,
                 cudaMemcpyAsync(
@@ -331,6 +368,9 @@ void submit_batch_impl(JNIEnv* env, jlong handle, jint lane, jint count) {
                 "cudaMemcpyAsync(black-scholes input)")) {
         return;
     }
+    if (profiling && !cuda_ok(env, cudaEventRecord(active.t_h2d_end, active.stream), "cudaEventRecord t_h2d_end")) {
+        return;
+    }
 
     const uint32_t threads_per_block = context->threads_per_block;
     const uint32_t block_count =
@@ -340,6 +380,9 @@ void submit_batch_impl(JNIEnv* env, jlong handle, jint lane, jint count) {
             active.device_input,
             active.device_output,
             batch_count);
+    if (profiling && !cuda_ok(env, cudaEventRecord(active.t_kernel_end, active.stream), "cudaEventRecord t_kernel_end")) {
+        return;
+    }
     if (!cuda_ok(
                 env,
                 cudaGetLastError(),
@@ -355,6 +398,9 @@ void submit_batch_impl(JNIEnv* env, jlong handle, jint lane, jint count) {
                         cudaMemcpyDeviceToHost,
                         active.stream),
                 "cudaMemcpyAsync(black-scholes output)")) {
+        return;
+    }
+    if (profiling && !cuda_ok(env, cudaEventRecord(active.t_d2h_end, active.stream), "cudaEventRecord t_d2h_end")) {
         return;
     }
     if (!cuda_ok(env, cudaEventRecord(active.event, active.stream), "cudaEventRecord")) {
@@ -380,6 +426,43 @@ void wait_batch_impl(JNIEnv* env, jlong handle, jint lane) {
     }
 }
 
+// Same wait as wait_batch_impl, but for a context created with
+// profiling=true: also returns the elapsed milliseconds of the GPU-side H2D
+// copy, kernel, and D2H copy as [h2dMs, kernelMs, d2hMs]. Safe to read all
+// three events with cudaEventElapsedTime unsynchronized here - active.event
+// is recorded last on the same stream, and cudaEventSynchronize on it above
+// guarantees every earlier event on that stream has already completed.
+jfloatArray wait_batch_timed_impl(JNIEnv* env, jlong handle, jint lane) {
+    Context* context = require_context(env, handle);
+    uint32_t lane_index;
+    if (context == nullptr || !require_lane(env, context, lane, lane_index)) {
+        return nullptr;
+    }
+    Lane& active = context->lanes[lane_index];
+    if (!active.event_pending) {
+        return nullptr;
+    }
+    if (!cuda_ok(env, cudaEventSynchronize(active.event), "cudaEventSynchronize")) {
+        return nullptr;
+    }
+    active.event_pending = false;
+    if (!context->profiling) {
+        return nullptr;
+    }
+    float h2d_ms = 0.0f, kernel_ms = 0.0f, d2h_ms = 0.0f;
+    if (!cuda_ok(env, cudaEventElapsedTime(&h2d_ms, active.t_h2d_start, active.t_h2d_end), "cudaEventElapsedTime h2d") ||
+        !cuda_ok(env, cudaEventElapsedTime(&kernel_ms, active.t_h2d_end, active.t_kernel_end), "cudaEventElapsedTime kernel") ||
+        !cuda_ok(env, cudaEventElapsedTime(&d2h_ms, active.t_kernel_end, active.t_d2h_end), "cudaEventElapsedTime d2h")) {
+        return nullptr;
+    }
+    const float values[3] = {h2d_ms, kernel_ms, d2h_ms};
+    jfloatArray result = env->NewFloatArray(3);
+    if (result != nullptr) {
+        env->SetFloatArrayRegion(result, 0, 3, values);
+    }
+    return result;
+}
+
 void destroy_impl(jlong handle) {
     release_context(reinterpret_cast<Context*>(handle));
 }
@@ -394,8 +477,8 @@ void destroy_impl(jlong handle) {
 extern "C" JNIEXPORT jlong JNICALL
 Java_org_example_flinke2c_DirectCudaBlackScholesNative_create(
         JNIEnv* env, jclass, jint cuda_device, jint batch_capacity, jint pipeline_depth,
-        jint threads_per_block) {
-    return create_impl(env, cuda_device, batch_capacity, pipeline_depth, threads_per_block);
+        jint threads_per_block, jboolean profiling) {
+    return create_impl(env, cuda_device, batch_capacity, pipeline_depth, threads_per_block, profiling);
 }
 
 extern "C" JNIEXPORT jobject JNICALL
@@ -420,6 +503,12 @@ extern "C" JNIEXPORT void JNICALL
 Java_org_example_flinke2c_DirectCudaBlackScholesNative_waitBatch(
         JNIEnv* env, jclass, jlong handle, jint lane) {
     wait_batch_impl(env, handle, lane);
+}
+
+extern "C" JNIEXPORT jfloatArray JNICALL
+Java_org_example_flinke2c_DirectCudaBlackScholesNative_waitBatchTimed(
+        JNIEnv* env, jclass, jlong handle, jint lane) {
+    return wait_batch_timed_impl(env, handle, lane);
 }
 
 extern "C" JNIEXPORT void JNICALL

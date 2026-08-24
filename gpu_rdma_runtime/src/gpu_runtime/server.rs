@@ -1,9 +1,11 @@
 use std::collections::VecDeque;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{ensure, Context, Result};
 use sideway::ibverbs::device_context::Mtu;
@@ -12,6 +14,12 @@ use sideway::ibverbs::queue_pair::QueuePair;
 use crate::constants::RING_BUFFER_ELEMENTS;
 use crate::control_helpers::{mtu_value, recv_json, send_json};
 use crate::control_protocol::{BootstrapHello, ClientRole, EndpointBootstrap, InputDone, ProcessingSpec, RdmaDestination};
+
+// Best-effort diagnostics sink for StageTimings::append_csv, matching the
+// Java-side PerfStats convention of a fixed perfcsv path per pipeline. This
+// path isn't user-configurable (unlike the Java side's perfcsv= conf entry)
+// since the RDMA server has no per-job conf to read it from.
+const PERF_CSV_PATH: &str = "/tmp/perf_gpu.csv";
 
 use super::cuda::CudaBatch;
 use super::endpoint::GpuRdmaEndpoint;
@@ -133,7 +141,7 @@ fn run_cycle(config: &ServerConfig<'_>, listener: &TcpListener) -> Result<()> {
         println!("server warm-up complete");
     }
     let started = Instant::now();
-    let timings = process_slots(
+    let mut timings = process_slots(
         &mut endpoint,
         &post_remote,
         &mut pre_stream,
@@ -152,7 +160,9 @@ fn run_cycle(config: &ServerConfig<'_>, listener: &TcpListener) -> Result<()> {
         elapsed,
         timings.processed as f64 / elapsed.as_secs_f64()
     );
+    timings.label = format!("{:?}", pre_remote.processing.function);
     timings.print();
+    timings.append_csv();
     println!("cycle complete; waiting for next pre/post client pair");
     Ok(())
 }
@@ -181,6 +191,7 @@ struct PendingBatch {
 #[derive(Default)]
 struct StageTimings {
     enabled: bool,
+    label: String,
     batches: u64,
     receive: Duration,
     flush: Duration,
@@ -213,6 +224,64 @@ impl StageTimings {
             self.output_drain.as_secs_f64() * 1_000_000.0
         );
     }
+
+    // Appends one row to PERF_CSV_PATH: epoch-millis timestamp, label,
+    // processed slot count, batch count, then <stage>TotalMillis/AvgMicros/
+    // Count per stage, in the pipeline's own chronological order (receive ->
+    // flush -> submit -> cudaWait -> output -> outputDrain) - same shape and
+    // ordering convention as PerfStats.appendCsv on the Java side. Writes a
+    // header line first if the file doesn't already exist. Best-effort: a
+    // write failure is only logged, never propagated, since this is
+    // diagnostics, not the server's actual output.
+    fn append_csv(&self) {
+        if !self.enabled || self.batches == 0 {
+            return;
+        }
+        if let Err(error) = self.try_append_csv() {
+            eprintln!("perf_gpu.csv write failed (diagnostics only): {error:#}");
+        }
+    }
+
+    fn try_append_csv(&self) -> Result<()> {
+        let path = Path::new(PERF_CSV_PATH);
+        let write_header = !path.exists();
+        let stages: [(&str, Duration, u64); 6] = [
+            ("receive", self.receive, self.batches),
+            ("flush", self.flush, self.batches),
+            ("submit", self.submit, self.batches),
+            ("cudaWait", self.cuda_wait, self.batches),
+            ("output", self.output, self.batches),
+            ("outputDrain", self.output_drain, 1),
+        ];
+
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        if write_header {
+            let mut header = String::from("timestampEpochMillis,label,processedSlots,batches");
+            for (name, _, _) in &stages {
+                header.push_str(&format!(",{name}TotalMillis,{name}AvgMicros,{name}Count"));
+            }
+            header.push('\n');
+            file.write_all(header.as_bytes())?;
+        }
+
+        let timestamp_millis = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+        let mut row = format!("{timestamp_millis},{},{},{}", csv_safe(&self.label), self.processed, self.batches);
+        for (_, total, count) in &stages {
+            let total_millis = total.as_secs_f64() * 1000.0;
+            let avg_micros = if *count == 0 { 0.0 } else { total.as_secs_f64() * 1_000_000.0 / *count as f64 };
+            row.push_str(&format!(",{total_millis:.3},{avg_micros:.3},{count}"));
+        }
+        row.push('\n');
+        file.write_all(row.as_bytes())?;
+        Ok(())
+    }
+}
+
+fn csv_safe(value: &str) -> String {
+    if !value.contains([',', '"', '\n']) {
+        return value.to_string();
+    }
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 fn process_slots(

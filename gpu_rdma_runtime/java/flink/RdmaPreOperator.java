@@ -40,6 +40,8 @@ public final class RdmaPreOperator extends RdmaOperator implements BoundedOneInp
     private transient int pendingSlotCount;
     private transient ArrayDeque<StreamRecord<RowData>> pendingElements;
     private transient long nextRowId;
+    private transient java.nio.ByteBuffer batchBuffer;
+    private transient int[] frameLengths;
 
     public RdmaPreOperator(String conf, RowType rowType) {
         super(conf, rowType, null, RustRdmaRingBuffer.Factory.PRE);
@@ -74,6 +76,9 @@ public final class RdmaPreOperator extends RdmaOperator implements BoundedOneInp
         this.pendingSlotCount = 0;
         this.pendingElements = new ArrayDeque<>(rdmaConfig.batchSize);
         this.nextRowId = 0L;
+        this.batchBuffer =
+                java.nio.ByteBuffer.allocateDirect(rdmaConfig.batchSize * rdmaConfig.maxItemSize);
+        this.frameLengths = new int[rdmaConfig.batchSize];
         LOG.info(
                 "RdmaPreOperator opened {}:{} (batchSize={}, ringElements={}, maxItemSize={})",
                 rdmaConfig.host,
@@ -85,15 +90,11 @@ public final class RdmaPreOperator extends RdmaOperator implements BoundedOneInp
 
     @Override
     protected RowData processRow(RowData inRow) throws Exception {
-        final byte[] slot = codec.encodeFramedRow(inRow, payloadFieldIndicesArray, nextRowId++);
-        if (slot.length > rdmaConfig.maxItemSize) {
-            throw new IOException(
-                    "Encoded row exceeds RDMA Slot.value capacity: "
-                            + slot.length
-                            + " > "
-                            + rdmaConfig.maxItemSize);
-        }
-        writeInputSlot(slot);
+        final int offset = pendingSlotCount * rdmaConfig.maxItemSize;
+        frameLengths[pendingSlotCount] =
+                codec.encodeFramedRow(
+                        inRow, payloadFieldIndicesArray, nextRowId++,
+                        batchBuffer, offset, rdmaConfig.maxItemSize);
         pendingSlotCount++;
         return placeholder(inRow.getRowKind());
     }
@@ -140,8 +141,10 @@ public final class RdmaPreOperator extends RdmaOperator implements BoundedOneInp
                             + pendingElements.size()
                             + " placeholders");
         }
-        // Publish first. output.collect() may synchronously enter a chained
-        // POST operator, which waits for this batch's RDMA response.
+        // Hand the whole batch to Rust in one native call, then publish. Publish
+        // must run first relative to output.collect(): that call may synchronously
+        // enter a chained POST operator, which waits for this batch's RDMA response.
+        writeInputBatch(batchBuffer, frameLengths, count);
         publishInputBatch(count);
         pendingSlotCount = 0;
         while (!pendingElements.isEmpty()) {
@@ -197,6 +200,8 @@ public final class RdmaPreOperator extends RdmaOperator implements BoundedOneInp
         }
         pendingSlotCount = 0;
         pendingElements = null;
+        batchBuffer = null;
+        frameLengths = null;
         codec = null;
         if (error != null) {
             throw error;

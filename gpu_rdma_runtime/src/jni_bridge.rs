@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use jni::objects::{JByteArray, JClass, JObject, JString};
+use jni::objects::{JByteArray, JByteBuffer, JClass, JIntArray, JObject, JString};
 use jni::sys::{jint, jlong, jobjectArray};
 use jni::JNIEnv;
 use rand::Rng;
@@ -172,6 +172,61 @@ pub extern "system" fn Java_org_apache_flink_table_runtime_functions_table_exter
             timestamp_ns: now_ns(),
             value: payload,
         })?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        fail(&mut env, error);
+    }
+}
+
+/// Batched counterpart to `writeSlot`: the Java caller has already framed every
+/// row in the batch into one shared direct `ByteBuffer` (fixed `MAX_ITEM_SIZE`
+/// stride per row, real length given per-entry in `frame_lengths`), so this
+/// takes a single JNI crossing and a zero-copy read of that buffer instead of
+/// the one-crossing-plus-array-copy-per-row the row-at-a-time path pays for
+/// every element of a batch.
+#[no_mangle]
+pub extern "system" fn Java_org_apache_flink_table_runtime_functions_table_externalruntime_RustRdmaNative_writeBatch(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    batch: JByteBuffer<'_>,
+    frame_lengths: JIntArray<'_>,
+    count: jint,
+) {
+    let result = (|| -> Result<()> {
+        let count: usize = count.try_into().context("invalid batch count")?;
+        let base_ptr = env.get_direct_buffer_address(&batch)?;
+        let capacity = env.get_direct_buffer_capacity(&batch)?;
+        let mut lengths = vec![0i32; count];
+        env.get_int_array_region(&frame_lengths, 0, &mut lengths)?;
+
+        let s = session(handle)?;
+        let mut sender = require_pre(s)?.lock().unwrap();
+        for (i, &frame_len) in lengths.iter().enumerate() {
+            anyhow::ensure!(frame_len >= 0, "invalid negative frame length {frame_len}");
+            let frame_len = frame_len as usize;
+            anyhow::ensure!(frame_len <= MAX_ITEM_SIZE, "RDMA slot exceeds {MAX_ITEM_SIZE} bytes");
+            let base = i * MAX_ITEM_SIZE;
+            anyhow::ensure!(base + frame_len <= capacity, "batch buffer too small for frame {i}");
+            // SAFETY: base_ptr/capacity come from GetDirectBufferAddress/Capacity for
+            // the direct buffer the Java caller allocated and does not touch again
+            // until this call returns; base+frame_len is bounds-checked above.
+            let frame = unsafe { std::slice::from_raw_parts(base_ptr.add(base), frame_len) };
+            let mut payload = [0u8; MAX_ITEM_SIZE];
+            payload[..frame_len].copy_from_slice(frame);
+
+            while sender.available_send_slots() == 0 {
+                let credit: u32 = recv_json(&mut s.control.lock().unwrap()).context("receive GPU input credit")?;
+                anyhow::ensure!(credit > 0 && credit as u64 <= sender.posted_slots(), "invalid GPU input credit {credit}");
+                sender.complete_round_trips(credit as usize)?;
+            }
+            sender.write_slot_local(Slot {
+                len: frame_len as u32,
+                timestamp_ns: now_ns(),
+                value: payload,
+            })?;
+        }
         Ok(())
     })();
     if let Err(error) = result {

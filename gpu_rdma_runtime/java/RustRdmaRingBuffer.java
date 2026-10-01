@@ -43,6 +43,14 @@ final class RustRdmaRingBuffer implements RdmaRingBuffer {
     }
 
     @Override
+    public void writeInputBatch(java.nio.ByteBuffer batch, int[] frameLengths, int count) throws IOException {
+        if (!batch.isDirect()) {
+            throw new IOException("RDMA batch buffer must be direct");
+        }
+        RustRdmaNative.writeBatch(handle, batch, frameLengths, count);
+    }
+
+    @Override
     public void publishInputBatch(int count) throws IOException {
         if (count <= 0 || count >= capacity()) {
             throw new IOException("Invalid RDMA batch count: " + count);

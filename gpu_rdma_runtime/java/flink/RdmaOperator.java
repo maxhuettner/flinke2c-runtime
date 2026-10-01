@@ -118,6 +118,21 @@ public abstract class RdmaOperator extends ExternalRuntimeOperator {
         requireSession().writeInputSlot(slot);
     }
 
+    /**
+     * Writes a whole batch of already-framed rows in one native call instead of one
+     * per row. {@code batch} must be a direct buffer holding each row's frame at a
+     * fixed {@code rdmaConfig.maxItemSize} stride starting at offset 0; {@code
+     * frameLengths[i]} is row {@code i}'s real encoded length.
+     */
+    protected final void writeInputBatch(java.nio.ByteBuffer batch, int[] frameLengths, int count)
+            throws IOException {
+        if (count <= 0 || count > rdmaConfig.batchSize) {
+            throw new IOException(
+                    "RDMA batch size must be in 1.." + rdmaConfig.batchSize + ", but was " + count);
+        }
+        requireSession().writeInputBatch(batch, frameLengths, count);
+    }
+
     protected final void publishInputBatch(int count) throws IOException {
         if (count <= 0 || count > rdmaConfig.batchSize) {
             throw new IOException(
@@ -188,6 +203,14 @@ public abstract class RdmaOperator extends ExternalRuntimeOperator {
         int maxItemSize();
 
         void writeInputSlot(byte[] value) throws IOException;
+
+        /**
+         * Writes {@code count} already-framed rows from a shared direct buffer in one
+         * call. {@code batch} holds each row's frame at a fixed stride of the ring's
+         * {@code maxItemSize()} starting at offset 0; {@code frameLengths[i]} is row
+         * {@code i}'s real encoded length (at most {@code maxItemSize()}).
+         */
+        void writeInputBatch(java.nio.ByteBuffer batch, int[] frameLengths, int count) throws IOException;
 
         void publishInputBatch(int count) throws IOException;
 

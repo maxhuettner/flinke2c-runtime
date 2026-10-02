@@ -502,6 +502,8 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
                 udf: udf_handle,
                 method: &config.args.udf_method,
             })?;
+            // Responses must reach POST as soon as a batch is done, not when the BufWriter fills.
+            writer.flush().context("flush responses to POST")?;
             Ok(())
         };
 

@@ -1,9 +1,13 @@
 package org.example.flinke2c.runtime;
 
+import java.lang.invoke.CallSite;
+import java.lang.invoke.LambdaMetafactory;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
+import java.util.function.Function;
 
 public final class ScalarFunctionAdapter {
     private static final ColumnarResult EMPTY_COLUMNAR_RESULT =
@@ -32,6 +36,8 @@ public final class ScalarFunctionAdapter {
     private final MethodHandle evalHandle;
     private final MethodHandle evalHandleBound;
     private final MethodHandle evalHandleSpreader;
+    /** Single-arg fast path via a generated lambda. */
+    private final Function<Object, Object> evalFunction;
     private final ValueParser[] parsers;
     private final int[] decimalScales;
     private final int argCount;
@@ -58,6 +64,7 @@ public final class ScalarFunctionAdapter {
         this.evalHandle = lookup.unreflect(resolvedEval);
         this.evalHandleBound = evalHandle.bindTo(udf);
         this.evalHandleSpreader = evalHandleBound.asSpreader(Object[].class, argCount);
+        this.evalFunction = argCount == 1 ? buildEvalFunction(lookup, evalHandle, udf) : null;
     }
 
     private ColumnarResult evalBatchToColumnsTypedOut(Object[] columns, boolean[][] nulls)
@@ -128,6 +135,24 @@ public final class ScalarFunctionAdapter {
             Object outputArray = OutputWriters.allocateOutputArray(evalMethod.getReturnType(), rowCount);
             boolean[][] outputNulls = new boolean[1][rowCount];
             int scale = decimalScales[0];
+
+            if (outputArray instanceof byte[]) {
+                byte[] out = (byte[]) outputArray;
+                boolean[] outNulls = outputNulls[0];
+                for (int row = 0; row < rowCount; row++) {
+                    if (isNull != null && isNull[row]) {
+                        outNulls[row] = true;
+                        continue;
+                    }
+                    Object result = invokeEvalSingle(DecimalUtils.decimalFromBytes(values, row, scale));
+                    if (result == null) {
+                        outNulls[row] = true;
+                        continue;
+                    }
+                    DecimalUtils.writeDecimalBytes(out, row, (BigDecimal) result);
+                }
+                return new ColumnarResult(new Object[] { out }, outputNulls);
+            }
 
             for (int row = 0; row < rowCount; row++) {
                 if (isNull != null && isNull[row]) {
@@ -232,7 +257,30 @@ public final class ScalarFunctionAdapter {
         }
     }
 
+    @SuppressWarnings("unchecked")
+    private static Function<Object, Object> buildEvalFunction(
+            MethodHandles.Lookup lookup, MethodHandle evalHandle, Object udf) {
+        try {
+            MethodType implType = evalHandle.type(); // (Udf, Param)Ret
+            MethodType instantiated = implType.dropParameterTypes(0, 1).wrap();
+            CallSite site = LambdaMetafactory.metafactory(
+                    lookup,
+                    "apply",
+                    MethodType.methodType(Function.class, implType.parameterType(0)),
+                    MethodType.methodType(Object.class, Object.class),
+                    evalHandle,
+                    instantiated);
+            return (Function<Object, Object>) site.getTarget().invoke(udf);
+        } catch (Throwable t) {
+            // Non-public UDF class, void return, etc.: fall back to the method handle.
+            return null;
+        }
+    }
+
     private Object invokeEvalSingle(Object arg) throws Exception {
+        if (evalFunction != null) {
+            return evalFunction.apply(arg);
+        }
         try {
             return evalHandleBound.invoke(arg);
         } catch (Throwable t) {

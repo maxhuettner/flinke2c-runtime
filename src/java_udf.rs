@@ -112,6 +112,14 @@ struct CachedInputArrays {
     nulls_wrapper: GlobalRef,
     column_refs: Vec<GlobalRef>,
     null_refs: Vec<Option<GlobalRef>>,
+    /// String columns travel packed: `Object[]{byte[] utf8, int[] offsets}` (see `pack_strings`).
+    string_state: Vec<Option<StringCache>>,
+}
+
+struct StringCache {
+    /// Current length of the packed `byte[]` held in the column's `Object[]`; grown on demand.
+    data_cap: std::cell::Cell<usize>,
+    offsets: GlobalRef,
 }
 
 impl std::fmt::Debug for CachedInputArrays {
@@ -304,7 +312,18 @@ impl JavaUdfHandle {
                 jni::signature::ReturnType::Object,
                 args,
             )
-        }?;
+        };
+        let ret = match ret {
+            Ok(ret) => ret,
+            Err(err) => {
+                // Print the Java stack trace; otherwise the error is just "Java exception was thrown".
+                if env.exception_check().unwrap_or(false) {
+                    let _ = env.exception_describe();
+                    let _ = env.exception_clear();
+                }
+                return Err(err).context("invoke UDF adapter method");
+            }
+        };
         check_exception(env, "invoke method")?;
         let result_obj = ret.l()?;
         if result_obj.is_null() {
@@ -712,7 +731,7 @@ fn new_string_array_from_strings<'local>(env: &mut JNIEnv<'local>, values: &[Str
 
 /// Array classes used for column type dispatch. Bootstrap array classes (or `String[]`)
 /// never unload, so the global refs stay valid across UDF reloads.
-struct ArrayClasses([GlobalRef; 7]);
+struct ArrayClasses([GlobalRef; 8]);
 
 impl ArrayClasses {
     /// Borrowed, non-owning view of one cached class; valid while `self` lives.
@@ -726,13 +745,13 @@ fn array_classes(env: &mut JNIEnv<'_>) -> Result<&'static ArrayClasses> {
     if let Some(c) = CLASSES.get() {
         return Ok(c);
     }
-    let names = ["[J", "[I", "[D", "[F", "[Z", "[B", "[Ljava/lang/String;"];
+    let names = ["[J", "[I", "[D", "[F", "[Z", "[B", "[Ljava/lang/String;", "[Ljava/lang/Object;"];
     let mut refs = Vec::with_capacity(names.len());
     for name in names {
         let class = env.find_class(name)?;
         refs.push(env.new_global_ref(&class)?);
     }
-    let refs: [GlobalRef; 7] = refs.try_into().map_err(|_| anyhow::anyhow!("array class cache"))?;
+    let refs: [GlobalRef; 8] = refs.try_into().map_err(|_| anyhow::anyhow!("array class cache"))?;
     let _ = CLASSES.set(ArrayClasses(refs));
     Ok(CLASSES.get().expect("array classes initialized"))
 }
@@ -750,6 +769,7 @@ fn typed_columns_to_vec(
     let boolean_array_class = classes.view(4);
     let byte_array_class = classes.view(5);
     let string_array_class = classes.view(6);
+    let object_array_class = classes.view(7);
 
     let col_len = env.get_array_length(&columns_obj)? as usize;
     let nulls = nulls_matrix_to_vec(env, nulls_obj, col_len)?;
@@ -814,6 +834,12 @@ fn typed_columns_to_vec(
         }
         if env.is_instance_of(&col_obj, &string_array_class)? {
             let values = string_array_to_vec(env, col_obj)?;
+            columns.push(InputColumn::String(values));
+            continue;
+        }
+        if env.is_instance_of(&col_obj, &object_array_class)? {
+            // Packed strings: Object[]{byte[] utf8, int[] offsets}; nulls come from the null matrix.
+            let values = packed_strings_to_vec(env, col_obj, nulls_col.as_deref())?;
             columns.push(InputColumn::String(values));
             continue;
         }
@@ -939,6 +965,64 @@ fn string_array_to_vec(env: &mut JNIEnv<'_>, array_obj: JObject<'_>) -> Result<V
     Ok(out)
 }
 
+/// Packs strings as concatenated UTF-8 plus `len + 1` offsets, so a whole column crosses JNI as two
+/// bulk array copies instead of one JNI call per string. Null strings are empty and flagged.
+fn pack_strings(values: &[Option<String>]) -> (Vec<u8>, Vec<i32>, Vec<bool>) {
+    let total: usize = values.iter().map(|v| v.as_ref().map_or(0, String::len)).sum();
+    let mut data = Vec::with_capacity(total);
+    let mut offsets = Vec::with_capacity(values.len() + 1);
+    let mut nulls = Vec::with_capacity(values.len());
+    offsets.push(0);
+    for value in values {
+        match value {
+            Some(v) => {
+                data.extend_from_slice(v.as_bytes());
+                nulls.push(false);
+            }
+            None => nulls.push(true),
+        }
+        offsets.push(data.len() as i32);
+    }
+    (data, offsets, nulls)
+}
+
+fn as_jbytes(bytes: &[u8]) -> &[jbyte] {
+    // u8 -> i8 reinterpretation (same size and alignment).
+    unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const jbyte, bytes.len()) }
+}
+
+fn packed_strings_to_vec(
+    env: &mut JNIEnv<'_>,
+    holder: JObject<'_>,
+    nulls: Option<&[bool]>,
+) -> Result<Vec<Option<String>>> {
+    let holder = JObjectArray::from(holder);
+    let data_arr = JByteArray::from(env.get_object_array_element(&holder, 0)?);
+    let offsets_arr = jni::objects::JIntArray::from(env.get_object_array_element(&holder, 1)?);
+
+    let data_len = env.get_array_length(&data_arr)? as usize;
+    let mut raw = vec![0_i8; data_len];
+    env.get_byte_array_region(&data_arr, 0, &mut raw)?;
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u8, raw.len()) };
+
+    let offsets_len = env.get_array_length(&offsets_arr)? as usize;
+    let mut offsets = vec![0_i32; offsets_len];
+    env.get_int_array_region(&offsets_arr, 0, &mut offsets)?;
+
+    let rows = offsets_len.saturating_sub(1);
+    let mut out = Vec::with_capacity(rows);
+    for row in 0..rows {
+        if nulls.is_some_and(|n| n.get(row).copied().unwrap_or(false)) {
+            out.push(None);
+            continue;
+        }
+        let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
+        let slice = bytes.get(start..end).context("packed string offsets out of range")?;
+        out.push(Some(std::str::from_utf8(slice).context("invalid UTF-8 in packed string")?.to_owned()));
+    }
+    Ok(out)
+}
+
 fn new_string_array<'local>(env: &mut JNIEnv<'local>, values: &[Option<String>]) -> Result<JObject<'local>> {
     let string_class = env.find_class("java/lang/String")?;
     let array: JObjectArray = env.new_object_array(values.len() as i32, string_class, JObject::null())?;
@@ -980,23 +1064,33 @@ fn allocate_input_cache(env: &mut JNIEnv<'_>, columns: &[InputColumn]) -> Result
 
     let mut column_refs = Vec::with_capacity(columns.len());
     let mut null_refs = Vec::with_capacity(columns.len());
+    let mut string_state = Vec::with_capacity(columns.len());
 
     for (idx, col_type) in col_types.iter().enumerate() {
         let col_elem = env.get_object_array_element(&col_array, idx as i32)?;
         column_refs.push(env.new_global_ref(&col_elem)?);
 
         if *col_type == ColumnKind::String {
-            null_refs.push(None);
+            let holder = JObjectArray::from(env.new_local_ref(&col_elem)?);
+            let data = env.get_object_array_element(&holder, 0)?;
+            let data_cap = env.get_array_length(&JByteArray::from(data))? as usize;
+            let offsets = env.get_object_array_element(&holder, 1)?;
+            string_state.push(Some(StringCache {
+                data_cap: std::cell::Cell::new(data_cap),
+                offsets: env.new_global_ref(&offsets)?,
+            }));
         } else {
-            let null_elem = env.get_object_array_element(&nulls_array, idx as i32)?;
-            if null_elem.is_null() {
-                let arr = env.new_boolean_array(row_count as i32)?;
-                let obj = JObject::from(arr);
-                env.set_object_array_element(&nulls_array, idx as i32, &obj)?;
-                null_refs.push(Some(env.new_global_ref(&obj)?));
-            } else {
-                null_refs.push(Some(env.new_global_ref(&null_elem)?));
-            }
+            string_state.push(None);
+        }
+
+        let null_elem = env.get_object_array_element(&nulls_array, idx as i32)?;
+        if null_elem.is_null() {
+            let arr = env.new_boolean_array(row_count as i32)?;
+            let obj = JObject::from(arr);
+            env.set_object_array_element(&nulls_array, idx as i32, &obj)?;
+            null_refs.push(Some(env.new_global_ref(&obj)?));
+        } else {
+            null_refs.push(Some(env.new_global_ref(&null_elem)?));
         }
     }
 
@@ -1010,12 +1104,13 @@ fn allocate_input_cache(env: &mut JNIEnv<'_>, columns: &[InputColumn]) -> Result
         nulls_wrapper,
         column_refs,
         null_refs,
+        string_state,
     })
 }
 
 fn fill_cached_columns(env: &mut JNIEnv<'_>, cache: &CachedInputArrays, columns: &[InputColumn]) -> Result<()> {
     for (idx, column) in columns.iter().enumerate() {
-        fill_column_data(env, &cache.column_refs[idx], column)?;
+        fill_column_data(env, &cache.column_refs[idx], column, cache.string_state[idx].as_ref())?;
         if let Some(null_ref) = &cache.null_refs[idx] {
             fill_null_data(env, null_ref, column, cache.row_count)?;
         }
@@ -1023,19 +1118,28 @@ fn fill_cached_columns(env: &mut JNIEnv<'_>, cache: &CachedInputArrays, columns:
     Ok(())
 }
 
-fn fill_column_data(env: &mut JNIEnv<'_>, global: &GlobalRef, column: &InputColumn) -> Result<()> {
+fn fill_column_data(
+    env: &mut JNIEnv<'_>,
+    global: &GlobalRef,
+    column: &InputColumn,
+    string_cache: Option<&StringCache>,
+) -> Result<()> {
     let local = env.new_local_ref(global.as_obj())?;
     match column {
         InputColumn::String(values) => {
-            let array = JObjectArray::from(local);
-            for (idx, value) in values.iter().enumerate() {
-                if let Some(v) = value {
-                    let jstr = env.new_string(v)?;
-                    env.set_object_array_element(&array, idx as i32, JObject::from(jstr))?;
-                } else {
-                    env.set_object_array_element(&array, idx as i32, JObject::null())?;
-                }
+            let cache = string_cache.context("string column cache missing")?;
+            let (data, offsets, _) = pack_strings(values);
+            let holder = JObjectArray::from(local);
+            if data.len() > cache.data_cap.get() {
+                let new_cap = (data.len() * 2).max(1024);
+                let grown = env.new_byte_array(new_cap as i32)?;
+                env.set_object_array_element(&holder, 0, &grown)?;
+                cache.data_cap.set(new_cap);
             }
+            let data_arr = JByteArray::from(env.get_object_array_element(&holder, 0)?);
+            env.set_byte_array_region(&data_arr, 0, as_jbytes(&data))?;
+            let offsets_arr = jni::objects::JIntArray::from(env.new_local_ref(cache.offsets.as_obj())?);
+            env.set_int_array_region(&offsets_arr, 0, &offsets)?;
         }
         InputColumn::I64 { values, .. } => {
             env.set_long_array_region(&JLongArray::from(local), 0, values)?;
@@ -1062,8 +1166,12 @@ fn fill_column_data(env: &mut JNIEnv<'_>, global: &GlobalRef, column: &InputColu
 }
 
 fn fill_null_data(env: &mut JNIEnv<'_>, global: &GlobalRef, column: &InputColumn, row_count: usize) -> Result<()> {
+    let string_nulls: Vec<bool>;
     let nulls = match column {
-        InputColumn::String(_) => return Ok(()),
+        InputColumn::String(values) => {
+            string_nulls = values.iter().map(Option::is_none).collect();
+            Some(string_nulls.as_slice())
+        }
         InputColumn::I64 { is_null, .. }
         | InputColumn::I32 { is_null, .. }
         | InputColumn::F64 { is_null, .. }
@@ -1120,8 +1228,17 @@ fn input_column_to_java<'local>(
 ) -> Result<(JObject<'local>, Option<JObject<'local>>)> {
     match column {
         InputColumn::String(values) => {
-            let array = new_string_array(env, values)?;
-            Ok((array, None))
+            let (data, offsets, nulls) = pack_strings(values);
+            let object_class = env.find_class("java/lang/Object")?;
+            let holder = env.new_object_array(2, object_class, JObject::null())?;
+            let data_arr = env.new_byte_array(data.len().max(1) as i32)?;
+            env.set_byte_array_region(&data_arr, 0, as_jbytes(&data))?;
+            let offsets_arr = env.new_int_array(offsets.len() as i32)?;
+            env.set_int_array_region(&offsets_arr, 0, &offsets)?;
+            env.set_object_array_element(&holder, 0, &data_arr)?;
+            env.set_object_array_element(&holder, 1, &offsets_arr)?;
+            let nulls = build_nulls_array(env, Some(&nulls))?;
+            Ok((JObject::from(holder), nulls))
         }
         InputColumn::I64 { values, is_null } => {
             let array = env.new_long_array(values.len() as i32)?;

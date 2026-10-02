@@ -1,6 +1,7 @@
 package org.example.flinke2c.runtime;
 
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.sql.Date;
 import java.sql.Time;
 import java.sql.Timestamp;
@@ -159,6 +160,20 @@ final class ColumnReaders {
                 return parser.parse(value);
             };
         }
+        if (column instanceof Object[]) {
+            // Packed strings from the native runtime: {byte[] utf8, int[] offsets}.
+            Object[] packed = (Object[]) column;
+            byte[] utf8 = (byte[]) packed[0];
+            int[] offsets = (int[]) packed[1];
+            return row -> {
+                if (isNull(nulls, row)) {
+                    return defaultValue(paramType);
+                }
+                int start = offsets[row];
+                String value = new String(utf8, start, offsets[row + 1] - start, StandardCharsets.UTF_8);
+                return parser.parse(value);
+            };
+        }
 
         throw new IllegalArgumentException("Unsupported column type: " + column.getClass());
     }
@@ -188,6 +203,12 @@ final class ColumnReaders {
         }
         if (column instanceof String[]) {
             return ((String[]) column).length;
+        }
+        if (column instanceof Object[]) {
+            Object[] packed = (Object[]) column;
+            if (packed.length == 2 && packed[1] instanceof int[]) {
+                return ((int[]) packed[1]).length - 1;
+            }
         }
         throw new IllegalArgumentException("Unsupported column type: " + column.getClass());
     }

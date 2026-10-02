@@ -18,6 +18,13 @@ public final class ScalarFunctionAdapter {
         private final boolean[][] nulls;
 
         ColumnarResult(Object[] columns, boolean[][] nulls) {
+            // String outputs cross to the runtime packed (one UTF-8 byte[] + offsets) instead of
+            // as String[], which would cost one JNI call per string on the native side.
+            for (int i = 0; i < columns.length; i++) {
+                if (columns[i] instanceof String[]) {
+                    columns[i] = StringPacking.pack((String[]) columns[i], nulls[i]);
+                }
+            }
             this.columns = columns;
             this.nulls = nulls;
         }

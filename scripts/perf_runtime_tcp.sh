@@ -27,4 +27,4 @@ RT_PID=$!
 trap 'kill $RT_PID 2>/dev/null || true' EXIT
 sleep 1
 
-target/release/examples/load_client "$PORT" "$ROWS" 100 "${BATCH:-2048}"
+target/release/examples/load_client "$PORT" "$ROWS" 100 "${BATCH:-2048}" "${MODE:-filter}"

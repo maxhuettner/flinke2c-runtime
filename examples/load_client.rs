@@ -1,5 +1,5 @@
 //! Synthetic PRE/POST client for measuring the runtime's TCP path in isolation.
-//! Usage: load_client <port> [rows] [extra_len] [batch_size]
+//! Usage: load_client <port> [rows] [extra_len] [batch_size] [filter|imputation]
 //! Sends `rows` bid-shaped rows as PRE (one frame per row, like the Flink operator)
 //! and reads the counted responses as POST. Prints end-to-end rows/s.
 
@@ -12,6 +12,13 @@ const PRE_CONFIG: &str = r#"{"role":"pre","functionClass":"org.example.flinke2c.
 "preFields":[{"name":"__op","wireType":"INT32"},{"name":"__rowId","wireType":"INT64"},{"name":"auction","wireType":"BIGINT"},{"name":"bidder","wireType":"BIGINT"},{"name":"price","wireType":"DECIMAL(23,3)"},{"name":"dateTime","wireType":"TIMESTAMP"},{"name":"extra","wireType":"STRING"},{"name":"latency_ts","wireType":"BIGINT"}],
 "postFields":[{"name":"__op","wireType":"INT32"},{"name":"__rowId","wireType":"INT64"},{"name":"auction","wireType":"BIGINT"},{"name":"bidder","wireType":"BIGINT"},{"name":"price","wireType":"DECIMAL(23,3)"},{"name":"dateTime","wireType":"TIMESTAMP"},{"name":"extra","wireType":"STRING"},{"name":"latency_ts","wireType":"BIGINT"}]}"#;
 const POST_CONFIG: &str = r#"{"role":"post"}"#;
+
+/// Config copied from what the Flink PRE operator sends for the ImputationFunction query.
+const IMPUTATION_PRE_CONFIG: &str = r#"{"role":"pre","functionClass":"org.example.flinke2c.ImputationFunction","functionKind":"scalar","externalOnly":true,"reorderResponses":false,"countedResponses":true,"batchSize":__BATCH__,
+"functionArgs":[{"name":"price","type":"DECIMAL(23, 3)"},{"name":"auction","type":"BIGINT"},{"name":"bidder","type":"BIGINT"},{"name":"channel","type":"VARCHAR(2147483647)"},{"name":"url","type":"VARCHAR(2147483647)"},{"name":"dateTime","type":"TIMESTAMP(3)"},{"name":"extra","type":"VARCHAR(2147483647)"}],
+"functionResults":[{"outputName":"price","outputType":"DECIMAL(23, 3)"}],
+"preFields":[{"name":"__op","wireType":"INT32"},{"name":"__rowId","wireType":"INT64"},{"name":"auction","wireType":"INT64"},{"name":"bidder","wireType":"INT64"},{"name":"price","wireType":"DECIMAL_UNSCALED_BYTES"},{"name":"channel","wireType":"STRING"},{"name":"url","wireType":"STRING"},{"name":"dateTime","wireType":"TIMESTAMP_MILLIS"},{"name":"extra","wireType":"STRING"},{"name":"latency_ts","wireType":"INT64"}],
+"postFields":[{"name":"__op","wireType":"INT32"},{"name":"__rowId","wireType":"INT64"},{"name":"auction","wireType":"INT64"},{"name":"bidder","wireType":"INT64"},{"name":"price","wireType":"DECIMAL_UNSCALED_BYTES"},{"name":"channel","wireType":"STRING"},{"name":"url","wireType":"STRING"},{"name":"dateTime","wireType":"TIMESTAMP_MILLIS"},{"name":"extra","wireType":"STRING"},{"name":"latency_ts","wireType":"INT64"}]}"#;
 
 fn send_config(stream: &mut TcpStream, json: &str) {
     stream.write_all(&(json.len() as i32).to_be_bytes()).unwrap();
@@ -35,11 +42,15 @@ fn main() {
     let rows: u64 = args.next().map(|v| v.parse().unwrap()).unwrap_or(5_000_000);
     let extra_len: usize = args.next().map(|v| v.parse().unwrap()).unwrap_or(100);
     let batch_size: usize = args.next().map(|v| v.parse().unwrap()).unwrap_or(2048);
+    let imputation = args.next().as_deref() == Some("imputation");
     let addr = ("127.0.0.1", port);
 
     let mut pre = TcpStream::connect(addr).expect("connect PRE");
     pre.set_nodelay(true).unwrap();
-    send_config(&mut pre, &PRE_CONFIG.replace("__BATCH__", &batch_size.to_string()));
+    send_config(
+        &mut pre,
+        &(if imputation { IMPUTATION_PRE_CONFIG } else { PRE_CONFIG }).replace("__BATCH__", &batch_size.to_string()),
+    );
     let mut post = TcpStream::connect(addr).expect("connect POST");
     post.set_nodelay(true).unwrap();
     send_config(&mut post, POST_CONFIG);
@@ -79,17 +90,38 @@ fn main() {
         payload.clear();
         payload.extend_from_slice(&0i32.to_be_bytes()); // op = INSERT
         payload.extend_from_slice(&(row_id as i64).to_be_bytes());
-        payload.push(0); // null bitmap (6 payload fields)
-        payload.extend_from_slice(&(row_id as i64 % 1000).to_be_bytes()); // auction
-        payload.extend_from_slice(&(rng as i64 & 0xffff).to_be_bytes()); // bidder
-        let mut dec = Vec::with_capacity(16);
-        twos_complement_be(price_unscaled, &mut dec);
-        payload.extend_from_slice(&(dec.len() as i32).to_be_bytes());
-        payload.extend_from_slice(&dec);
-        payload.extend_from_slice(&1_700_000_000_000i64.to_be_bytes()); // dateTime
-        payload.extend_from_slice(&(extra.len() as i32).to_be_bytes());
-        payload.extend_from_slice(&extra);
-        payload.extend_from_slice(&0i64.to_be_bytes()); // latency_ts
+        if imputation {
+            // fields: auction, bidder, price, channel, url, dateTime, extra, latency_ts
+            payload.push(if rng % 10 == 0 { 1 << 2 } else { 0 }); // ~10% null price (bit 2)
+            payload.extend_from_slice(&(row_id as i64 % 1000).to_be_bytes());
+            payload.extend_from_slice(&(rng as i64 & 0xffff).to_be_bytes());
+            if rng % 10 != 0 {
+                let mut dec = Vec::with_capacity(16);
+                twos_complement_be(price_unscaled, &mut dec);
+                payload.extend_from_slice(&(dec.len() as i32).to_be_bytes());
+                payload.extend_from_slice(&dec);
+            }
+            for text in [&b"Google"[..], &b"https://www.nexmark.com/item.htm?query=1&id=12345"[..]] {
+                payload.extend_from_slice(&(text.len() as i32).to_be_bytes());
+                payload.extend_from_slice(text);
+            }
+            payload.extend_from_slice(&(1_700_000_000_000i64 + row_id as i64).to_be_bytes());
+            payload.extend_from_slice(&(extra.len() as i32).to_be_bytes());
+            payload.extend_from_slice(&extra);
+            payload.extend_from_slice(&0i64.to_be_bytes());
+        } else {
+            payload.push(0); // null bitmap (6 payload fields)
+            payload.extend_from_slice(&(row_id as i64 % 1000).to_be_bytes()); // auction
+            payload.extend_from_slice(&(rng as i64 & 0xffff).to_be_bytes()); // bidder
+            let mut dec = Vec::with_capacity(16);
+            twos_complement_be(price_unscaled, &mut dec);
+            payload.extend_from_slice(&(dec.len() as i32).to_be_bytes());
+            payload.extend_from_slice(&dec);
+            payload.extend_from_slice(&1_700_000_000_000i64.to_be_bytes()); // dateTime
+            payload.extend_from_slice(&(extra.len() as i32).to_be_bytes());
+            payload.extend_from_slice(&extra);
+            payload.extend_from_slice(&0i64.to_be_bytes()); // latency_ts
+        }
 
         w.write_all(&(payload.len() as i32).to_be_bytes()).unwrap();
         w.write_all(&payload).unwrap();

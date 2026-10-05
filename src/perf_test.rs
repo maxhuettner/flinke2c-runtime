@@ -14,6 +14,11 @@ const UDF_CLASS: &str = "org.example.flinke2c.CurrencyConversionFunction";
 const ADAPTER_CLASS: &str = "org.example.flinke2c.runtime.ScalarFunctionAdapter";
 const METHOD: &str = "evalBatchFast"; // runtime appends "Fast" to the configured udf_method
 
+/// The UDF handle API takes borrowed columns; adapt an owned column vector.
+fn refs(columns: &[InputColumn]) -> Vec<&InputColumn> {
+    columns.iter().collect()
+}
+
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
@@ -43,13 +48,13 @@ fn decimals(cols: &[InputColumn]) -> (&[i128], Option<&[bool]>) {
 
 fn bench(handle: &mut UdfHandle, input: &[InputColumn], warmup: usize, iters: usize) -> (Duration, Vec<Duration>) {
     for _ in 0..warmup {
-        handle.call_typed_columns_to_typed_results(METHOD, input).unwrap();
+        handle.call_typed_columns_to_typed_results(METHOD, &refs(input)).unwrap();
     }
     let mut samples = Vec::with_capacity(iters);
     let total = Instant::now();
     for _ in 0..iters {
         let t = Instant::now();
-        let out = handle.call_typed_columns_to_typed_results(METHOD, input).unwrap();
+        let out = handle.call_typed_columns_to_typed_results(METHOD, &refs(input)).unwrap();
         samples.push(t.elapsed());
         std::hint::black_box(out);
     }
@@ -98,8 +103,8 @@ fn currency_conversion_rust_vs_java() {
         let input = vec![make_input(rows)];
 
         // Correctness: both implementations must agree before timing means anything.
-        let j_out = java.call_typed_columns_to_typed_results(METHOD, &input).unwrap();
-        let r_out = rust.call_typed_columns_to_typed_results(METHOD, &input).unwrap();
+        let j_out = java.call_typed_columns_to_typed_results(METHOD, &refs(&input)).unwrap();
+        let r_out = rust.call_typed_columns_to_typed_results(METHOD, &refs(&input)).unwrap();
         let (jv, jn) = decimals(&j_out);
         let (rv, rn) = decimals(&r_out);
         assert_eq!(jv.len(), rv.len());
@@ -201,13 +206,13 @@ fn make_imputation_input(rows: usize, null_pct: u64) -> Vec<InputColumn> {
 
 fn bench_named(handle: &mut UdfHandle, input: &[InputColumn], names: &[String], warmup: usize, iters: usize) -> (Duration, Vec<Duration>) {
     for _ in 0..warmup {
-        handle.call_typed_columns_to_named_results(NAMED_METHOD, input, names).unwrap();
+        handle.call_typed_columns_to_named_results(NAMED_METHOD, &refs(input), names).unwrap();
     }
     let mut samples = Vec::with_capacity(iters);
     let total = Instant::now();
     for _ in 0..iters {
         let t = Instant::now();
-        let out = handle.call_typed_columns_to_named_results(NAMED_METHOD, input, names).unwrap();
+        let out = handle.call_typed_columns_to_named_results(NAMED_METHOD, &refs(input), names).unwrap();
         samples.push(t.elapsed());
         std::hint::black_box(out);
     }
@@ -269,8 +274,8 @@ fn imputation_rust_vs_java() {
 
         // Both keep their own history, so compare the very first batch after fresh construction.
         if rows == *batch_sizes_first(&std::env::var("PERF_BATCH_SIZES").ok()).get_or_insert(rows) {
-            let j_out = java.call_typed_columns_to_named_results(NAMED_METHOD, &input, &names).unwrap();
-            let r_out = rust.call_typed_columns_to_named_results(NAMED_METHOD, &input, &names).unwrap();
+            let j_out = java.call_typed_columns_to_named_results(NAMED_METHOD, &refs(&input), &names).unwrap();
+            let r_out = rust.call_typed_columns_to_named_results(NAMED_METHOD, &refs(&input), &names).unwrap();
             if let (InputColumn::Decimal128 { values: jv, .. }, InputColumn::Decimal128 { values: rv, .. }) = (&j_out[0], &r_out[0]) {
                 let mismatches = jv.iter().zip(rv).filter(|(a, b)| (**a - **b).abs() > 1).count();
                 println!("  first-batch price mismatches (>0.001): {mismatches} / {rows}");
@@ -307,8 +312,8 @@ fn imputation_rust_vs_java() {
             let mut fresh =
                 UdfHandle::new(UdfLanguage::Java, &jars, ADAPTER_CLASS, IMPUTATION_CLASS, &arg_types, &PathBuf::new()).unwrap();
             for round in 0..3 {
-                let a = reference.call_typed_columns_to_named_results(NAMED_METHOD, &input, &names).unwrap();
-                let b = fresh.call_typed_columns_to_named_results(NAMED_METHOD, &input, &names).unwrap();
+                let a = reference.call_typed_columns_to_named_results(NAMED_METHOD, &refs(&input), &names).unwrap();
+                let b = fresh.call_typed_columns_to_named_results(NAMED_METHOD, &refs(&input), &names).unwrap();
                 let same = a.len() == b.len()
                     && a.iter().zip(&b).all(|(x, y)| match (x, y) {
                         (InputColumn::String(p), InputColumn::String(q)) => p == q,

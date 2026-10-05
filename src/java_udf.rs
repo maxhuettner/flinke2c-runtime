@@ -132,7 +132,7 @@ impl std::fmt::Debug for CachedInputArrays {
 }
 
 impl CachedInputArrays {
-    fn matches(&self, columns: &[InputColumn]) -> bool {
+    fn matches(&self, columns: &[&InputColumn]) -> bool {
         if columns.is_empty() {
             return false;
         }
@@ -203,7 +203,7 @@ impl JavaUdfHandle {
     pub fn call_typed_columns_to_typed_results(
         &mut self,
         method: &str,
-        columns: &[InputColumn],
+        columns: &[&InputColumn],
     ) -> Result<Vec<InputColumn>> {
         if columns.is_empty() {
             return Ok(Vec::new());
@@ -236,7 +236,7 @@ impl JavaUdfHandle {
     pub fn call_typed_columns_to_named_results(
         &mut self,
         method: &str,
-        columns: &[InputColumn],
+        columns: &[&InputColumn],
         output_names: &[String],
     ) -> Result<Vec<InputColumn>> {
         if columns.is_empty() {
@@ -346,7 +346,7 @@ impl JavaUdfHandle {
         extract_columnar_result(env, result_obj, columns_id, nulls_id)
     }
 
-    fn prepare_input_arrays(&mut self, env: &mut JNIEnv<'_>, columns: &[InputColumn]) -> Result<()> {
+    fn prepare_input_arrays(&mut self, env: &mut JNIEnv<'_>, columns: &[&InputColumn]) -> Result<()> {
         if self.cached_input_arrays.as_ref().is_some_and(|c| c.matches(columns)) {
             let cache = self.cached_input_arrays.as_ref().unwrap();
             fill_cached_columns(env, cache, columns)
@@ -1039,7 +1039,7 @@ fn new_string_array<'local>(env: &mut JNIEnv<'local>, values: &[Option<String>])
 
 fn new_typed_columns<'local>(
     env: &mut JNIEnv<'local>,
-    columns: &[InputColumn],
+    columns: &[&InputColumn],
 ) -> Result<(JObjectArray<'local>, JObjectArray<'local>)> {
     let object_class = env.find_class("java/lang/Object")?;
     let boolean_array_class = env.find_class("[Z")?;
@@ -1057,9 +1057,9 @@ fn new_typed_columns<'local>(
     Ok((col_array, nulls_array))
 }
 
-fn allocate_input_cache(env: &mut JNIEnv<'_>, columns: &[InputColumn]) -> Result<CachedInputArrays> {
+fn allocate_input_cache(env: &mut JNIEnv<'_>, columns: &[&InputColumn]) -> Result<CachedInputArrays> {
     let row_count = columns[0].len();
-    let col_types: Vec<ColumnKind> = columns.iter().map(ColumnKind::of).collect();
+    let col_types: Vec<ColumnKind> = columns.iter().map(|c| ColumnKind::of(c)).collect();
     let (col_array, nulls_array) = new_typed_columns(env, columns)?;
 
     let mut column_refs = Vec::with_capacity(columns.len());
@@ -1108,7 +1108,7 @@ fn allocate_input_cache(env: &mut JNIEnv<'_>, columns: &[InputColumn]) -> Result
     })
 }
 
-fn fill_cached_columns(env: &mut JNIEnv<'_>, cache: &CachedInputArrays, columns: &[InputColumn]) -> Result<()> {
+fn fill_cached_columns(env: &mut JNIEnv<'_>, cache: &CachedInputArrays, columns: &[&InputColumn]) -> Result<()> {
     for (idx, column) in columns.iter().enumerate() {
         fill_column_data(env, &cache.column_refs[idx], column, cache.string_state[idx].as_ref())?;
         if let Some(null_ref) = &cache.null_refs[idx] {

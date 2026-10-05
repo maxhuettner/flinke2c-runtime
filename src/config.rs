@@ -21,6 +21,9 @@ pub struct Args {
     pub workers: usize,
     #[arg(long, default_value_t = 0)]
     pub max_in_flight: usize,
+    /// With --workers 1, run reader/writer on their own threads (opt-in, uses ~1.7 cores).
+    #[arg(long, default_value_t = false)]
+    pub pipelined_single_worker: bool,
 
     #[arg(long, default_value_t = true)]
     pub udf_reload_watch: bool,

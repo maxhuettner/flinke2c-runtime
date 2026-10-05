@@ -292,6 +292,20 @@ fn read_i64_be(buf: &[u8], p: &mut usize) -> Result<i64> {
     Ok(read_u64_be(buf, p)? as i64)
 }
 
+fn read_len_slice<'a>(buf: &'a [u8], p: &mut usize) -> Result<&'a [u8]> {
+    let len = read_i32_be(buf, p)?;
+    if len < 0 {
+        bail!("negative length");
+    }
+    let len = len as usize;
+    if *p + len > buf.len() {
+        bail!("truncated len-bytes: need {}, have {}", len, buf.len().saturating_sub(*p));
+    }
+    let out = &buf[*p..*p + len];
+    *p += len;
+    Ok(out)
+}
+
 fn read_len_bytes(buf: &[u8], p: &mut usize) -> Result<Vec<u8>> {
     let len = read_i32_be(buf, p)?;
     if len < 0 {
@@ -346,6 +360,23 @@ fn read_i32_be_stream_opt<R: Read>(r: &mut R) -> Result<Option<i32>> {
 }
 
 // DECIMAL helpers: Java BigInteger.toByteArray() compatible representation
+/// Appends the minimal big-endian two's complement encoding of `v`, prefixed with its i32 length,
+/// without allocating a temporary `Vec`.
+pub fn write_i128_twos_complement_be_minimal_prefixed(out: &mut Vec<u8>, v: i128) {
+    let bytes = v.to_be_bytes();
+    let mut start = 0usize;
+    while start < 15 {
+        let (b0, b1) = (bytes[start], bytes[start + 1]);
+        if (b0 == 0x00 && (b1 & 0x80) == 0x00) || (b0 == 0xFF && (b1 & 0x80) == 0x80) {
+            start += 1;
+            continue;
+        }
+        break;
+    }
+    write_i32_be_vec(out, (16 - start) as i32);
+    out.extend_from_slice(&bytes[start..]);
+}
+
 pub fn i128_to_twos_complement_be_minimal(v: i128) -> Vec<u8> {
     let bytes = v.to_be_bytes(); // 16 bytes
     let mut start = 0usize;
@@ -382,15 +413,20 @@ pub struct ColumnarBatch {
     pub ops: Vec<i32>,
     pub row_ids: Vec<i64>,
     pub columns: Vec<InputColumn>,
+    /// Per column: `String`s from the previous batch, kept with their capacity so decoding the
+    /// next batch reuses them instead of allocating one per row.
+    string_pools: Vec<Vec<String>>,
 }
 
 impl ColumnarBatch {
     pub fn new(types: &[FieldType], capacity: usize) -> Self {
         let columns = types.iter().map(|t| new_empty_column(t, capacity)).collect();
+        let string_pools = types.iter().map(|_| Vec::new()).collect();
         ColumnarBatch {
             ops: Vec::with_capacity(capacity),
             row_ids: Vec::with_capacity(capacity),
             columns,
+            string_pools,
         }
     }
 
@@ -401,7 +437,10 @@ impl ColumnarBatch {
     pub fn clear(&mut self) {
         self.ops.clear();
         self.row_ids.clear();
-        for col in &mut self.columns {
+        for (col, pool) in self.columns.iter_mut().zip(self.string_pools.iter_mut()) {
+            if let InputColumn::String(values) = col {
+                pool.extend(values.drain(..).flatten());
+            }
             clear_column(col);
         }
     }
@@ -456,7 +495,7 @@ pub fn decode_payload_into_batch(
             continue;
         }
         if needed_flag {
-            decode_field_into_column(payload, &mut p, ftype, &mut batch.columns[i])?;
+            decode_field_into_column(payload, &mut p, ftype, &mut batch.columns[i], &mut batch.string_pools[i])?;
         } else {
             skip_field(payload, &mut p, ftype)?;
         }
@@ -556,7 +595,13 @@ fn push_null_typed<T>(values: &mut Vec<T>, is_null: &mut Option<Vec<bool>>, defa
     }
 }
 
-fn decode_field_into_column(buf: &[u8], p: &mut usize, t: &FieldType, col: &mut InputColumn) -> Result<()> {
+fn decode_field_into_column(
+    buf: &[u8],
+    p: &mut usize,
+    t: &FieldType,
+    col: &mut InputColumn,
+    string_pool: &mut Vec<String>,
+) -> Result<()> {
     match t {
         FieldType::Boolean => {
             let b = read_u8(buf, p)?;
@@ -604,9 +649,12 @@ fn decode_field_into_column(buf: &[u8], p: &mut usize, t: &FieldType, col: &mut 
             }
         }
         FieldType::String | FieldType::Unknown(_) => {
-            let bytes = read_len_bytes(buf, p)?;
-            let s = String::from_utf8(bytes).context("invalid UTF-8")?;
+            let bytes = read_len_slice(buf, p)?;
+            let text = std::str::from_utf8(bytes).context("invalid UTF-8")?;
             if let InputColumn::String(values) = col {
+                let mut s = string_pool.pop().unwrap_or_default();
+                s.clear();
+                s.push_str(text);
                 values.push(Some(s));
             }
         }
@@ -676,6 +724,76 @@ mod tests {
 
         let row_id = decode_ack_control_frame(&payload).expect("valid ACK control frame");
         assert_eq!(row_id, 42);
+    }
+
+    #[test]
+    fn prefixed_decimal_writer_matches_vec_encoding() {
+        use super::{i128_to_twos_complement_be_minimal, write_i128_twos_complement_be_minimal_prefixed};
+        let samples = [
+            0i128,
+            1,
+            -1,
+            127,
+            128,
+            -128,
+            -129,
+            255,
+            256,
+            908_000,
+            -908_000,
+            i64::MAX as i128,
+            i64::MIN as i128,
+            i128::MAX,
+            i128::MIN,
+            1i128 << 100,
+            -(1i128 << 100),
+        ];
+        for v in samples {
+            let expected = i128_to_twos_complement_be_minimal(v);
+            let mut out = Vec::new();
+            write_i128_twos_complement_be_minimal_prefixed(&mut out, v);
+            assert_eq!(&out[..4], &(expected.len() as i32).to_be_bytes(), "length prefix for {v}");
+            assert_eq!(&out[4..], &expected[..], "bytes for {v}");
+        }
+    }
+
+    fn string_payload(row_id: i64, text: Option<&str>) -> Vec<u8> {
+        let mut payload = Vec::new();
+        write_i32_be_vec(&mut payload, 0); // op
+        write_i64_be_vec(&mut payload, row_id);
+        payload.push(if text.is_none() { 1 } else { 0 }); // null bitmap, one string field
+        if let Some(text) = text {
+            write_i32_be_vec(&mut payload, text.len() as i32);
+            payload.extend_from_slice(text.as_bytes());
+        }
+        payload
+    }
+
+    #[test]
+    fn reused_strings_never_leak_previous_batch_contents() {
+        use super::{ColumnarBatch, decode_payload_into_batch};
+        use crate::config::FieldType;
+        use crate::udf::InputColumn;
+
+        let types = [FieldType::String];
+        let needed = [true];
+        let mut batch = ColumnarBatch::new(&types, 8);
+
+        let rounds: [&[Option<&str>]; 4] = [
+            &[Some("hello world, a long string"), Some("x"), Some("")],
+            &[Some("ab"), None, Some("a much longer string than before, with ünïcödé € 東京")],
+            &[None, None],
+            &[Some("short"), Some("a"), Some("another fairly long string to grow the pool"), None],
+        ];
+        for round in rounds {
+            for (i, text) in round.iter().enumerate() {
+                decode_payload_into_batch(&string_payload(i as i64, *text), &mut batch, &types, &needed).unwrap();
+            }
+            let InputColumn::String(values) = &batch.columns[0] else { panic!("string column") };
+            let expected: Vec<Option<String>> = round.iter().map(|t| t.map(str::to_string)).collect();
+            assert_eq!(values, &expected);
+            batch.clear();
+        }
     }
 
     #[test]

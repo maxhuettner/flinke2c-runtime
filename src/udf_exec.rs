@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
+use std::borrow::Cow;
 use std::io::Write;
 
 use crate::codec::{
-    ColumnarBatch, OutputBlock, i128_to_twos_complement_be_minimal, set_null_bit, write_i32_be_stream,
+    ColumnarBatch, OutputBlock, set_null_bit, write_i128_twos_complement_be_minimal_prefixed, write_i32_be_stream,
     write_i32_be_vec, write_i64_be_vec, write_u32_be_vec, write_u64_be_vec,
 };
 use crate::config::{FieldType, FunctionKind, PayloadSource, PostFieldSourceKind, SessionConfig};
@@ -28,7 +29,8 @@ pub fn apply_udf_to_batch_stream<W: Write>(config: &mut ColumnarUdfConfig<W>) ->
         return Ok(());
     }
 
-    let input_columns = extract_arg_columns(batch, session);
+    let arg_columns = extract_arg_columns(batch, session);
+    let input_columns: Vec<&InputColumn> = arg_columns.iter().map(|c| c.as_ref()).collect();
     let output_columns = call_udf_to_columns(&mut *config.udf, config.method, &input_columns, &session.output_names)?;
 
     if output_columns.len() < session.output_positions.len() {
@@ -127,7 +129,8 @@ pub fn apply_udf_to_batch(
         return Ok(Vec::new());
     }
 
-    let input_columns = extract_arg_columns(batch, session);
+    let arg_columns = extract_arg_columns(batch, session);
+    let input_columns: Vec<&InputColumn> = arg_columns.iter().map(|c| c.as_ref()).collect();
     let output_columns = call_udf_to_columns(udf, method, &input_columns, &session.output_names)?;
 
     if output_columns.len() < session.output_positions.len() {
@@ -210,18 +213,20 @@ pub fn apply_udf_to_batch(
     Ok(out)
 }
 
-fn extract_arg_columns(batch: &ColumnarBatch, session: &SessionConfig) -> Vec<InputColumn> {
+/// The batch columns the UDF takes as arguments, borrowed (no per-call clone of string data).
+/// Arguments that don't map to a payload column become an all-null placeholder.
+fn extract_arg_columns<'a>(batch: &'a ColumnarBatch, session: &SessionConfig) -> Vec<Cow<'a, InputColumn>> {
     session
         .arg_positions
         .iter()
         .map(|&pos| {
             if let Some(slot) = session.pre_pos_to_payload_slot.get(pos).and_then(|s| *s) {
-                batch.columns[slot].clone()
+                Cow::Borrowed(&batch.columns[slot])
             } else {
-                InputColumn::I64 {
+                Cow::Owned(InputColumn::I64 {
                     values: vec![0; batch.len()],
                     is_null: Some(vec![true; batch.len()]),
-                }
+                })
             }
         })
         .collect()
@@ -282,7 +287,7 @@ fn column_to_v_at(col: &InputColumn, row: usize) -> V {
 fn call_udf_to_columns(
     udf: &mut UdfHandle,
     method: &str,
-    input_columns: &[InputColumn],
+    input_columns: &[&InputColumn],
     output_names: &[String],
 ) -> Result<Vec<InputColumn>> {
     let columns_method = if method.ends_with("Fast") || method.ends_with("ToColumnsTypedOut") {
@@ -475,17 +480,20 @@ fn encode_input_column_at(out: &mut Vec<u8>, col: &InputColumn, row: usize, ftyp
             let x = input_column_to_f64(col, row, ftype)?;
             write_u64_be_vec(out, x.to_bits());
         }
-        FieldType::String | FieldType::Unknown(_) => {
-            let s = input_column_to_string(col, row, ftype)?;
-            let bytes = s.as_bytes();
-            write_i32_be_vec(out, bytes.len() as i32);
-            out.extend_from_slice(bytes);
-        }
-        FieldType::Bytes => {
-            let s = input_column_to_string(col, row, ftype)?;
-            let bytes = s.into_bytes();
-            write_i32_be_vec(out, bytes.len() as i32);
-            out.extend_from_slice(&bytes);
+        FieldType::String | FieldType::Unknown(_) | FieldType::Bytes => {
+            if let InputColumn::String(values) = col {
+                // Borrow instead of cloning the String for every row.
+                let s = values
+                    .get(row)
+                    .and_then(|v| v.as_deref())
+                    .ok_or_else(|| anyhow::anyhow!("null string value"))?;
+                write_i32_be_vec(out, s.len() as i32);
+                out.extend_from_slice(s.as_bytes());
+            } else {
+                let s = input_column_to_string(col, row, ftype)?;
+                write_i32_be_vec(out, s.len() as i32);
+                out.extend_from_slice(s.as_bytes());
+            }
         }
         FieldType::Date => {
             let millis = input_column_to_i64(col, row, ftype)?;
@@ -499,9 +507,7 @@ fn encode_input_column_at(out: &mut Vec<u8>, col: &InputColumn, row: usize, ftyp
                 let as_i64 = i64::try_from(unscaled).map_err(|_| anyhow::anyhow!("DECIMAL_UNSCALED_I64 overflow"))?;
                 write_i64_be_vec(out, as_i64);
             } else {
-                let bytes = i128_to_twos_complement_be_minimal(unscaled);
-                write_i32_be_vec(out, bytes.len() as i32);
-                out.extend_from_slice(&bytes);
+                write_i128_twos_complement_be_minimal_prefixed(out, unscaled);
             }
         }
         FieldType::DecimalUnscaledI64 => {
@@ -511,9 +517,7 @@ fn encode_input_column_at(out: &mut Vec<u8>, col: &InputColumn, row: usize, ftyp
         }
         FieldType::DecimalUnscaledBytes => {
             let unscaled = input_column_to_decimal(col, row, ftype)?;
-            let bytes = i128_to_twos_complement_be_minimal(unscaled);
-            write_i32_be_vec(out, bytes.len() as i32);
-            out.extend_from_slice(&bytes);
+            write_i128_twos_complement_be_minimal_prefixed(out, unscaled);
         }
     }
     Ok(false)

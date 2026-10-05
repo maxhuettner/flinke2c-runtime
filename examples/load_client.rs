@@ -60,6 +60,7 @@ fn main() {
         let mut buf = vec![0u8; 1 << 16];
         let mut bytes = 0u64;
         let mut passed = 0u64;
+        let mut checksum: u64 = 0xcbf29ce484222325; // FNV-1a over every response byte
         for _ in 0..rows {
             let mut len = [0u8; 4];
             r.read_exact(&mut len).unwrap();
@@ -72,9 +73,12 @@ fn main() {
             if i32::from_be_bytes(buf[13..17].try_into().unwrap()) > 0 {
                 passed += 1;
             }
+            for b in &buf[..len] {
+                checksum = (checksum ^ *b as u64).wrapping_mul(0x100000001b3);
+            }
             bytes += 4 + len as u64;
         }
-        (bytes, passed)
+        (bytes, passed, checksum)
     });
 
     let extra = vec![b'x'; extra_len];
@@ -128,11 +132,11 @@ fn main() {
     }
     w.flush().unwrap();
     let sent = start.elapsed();
-    let (bytes, passed) = reader.join().unwrap();
+    let (bytes, passed, checksum) = reader.join().unwrap();
     let total = start.elapsed();
 
     println!(
-        "rows={rows} sent_in={:.2}s total={:.2}s  => {:.0} rows/s end-to-end, {:.1} MB/s back, passed={:.1}%",
+        "rows={rows} sent_in={:.2}s total={:.2}s  => {:.0} rows/s end-to-end, {:.1} MB/s back, passed={:.1}% checksum={checksum:016x}",
         sent.as_secs_f64(),
         total.as_secs_f64(),
         rows as f64 / total.as_secs_f64(),

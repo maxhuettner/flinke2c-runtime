@@ -58,7 +58,7 @@ impl UdfHandle {
     pub fn call_typed_columns_to_typed_results(
         &mut self,
         method: &str,
-        columns: &[InputColumn],
+        columns: &[&InputColumn],
     ) -> Result<Vec<InputColumn>> {
         match self {
             UdfHandle::Java(handle) => handle.call_typed_columns_to_typed_results(method, columns),
@@ -69,7 +69,7 @@ impl UdfHandle {
     pub fn call_typed_columns_to_named_results(
         &mut self,
         method: &str,
-        columns: &[InputColumn],
+        columns: &[&InputColumn],
         output_names: &[String],
     ) -> Result<Vec<InputColumn>> {
         match self {

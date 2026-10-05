@@ -85,7 +85,7 @@ impl RustUdfHandle {
     pub fn call_typed_columns_to_typed_results(
         &mut self,
         _method: &str,
-        columns: &[InputColumn],
+        columns: &[&InputColumn],
     ) -> Result<Vec<InputColumn>> {
         self.call_eval(columns, &[])
     }
@@ -93,13 +93,13 @@ impl RustUdfHandle {
     pub fn call_typed_columns_to_named_results(
         &mut self,
         _method: &str,
-        columns: &[InputColumn],
+        columns: &[&InputColumn],
         output_names: &[String],
     ) -> Result<Vec<InputColumn>> {
         self.call_eval(columns, output_names)
     }
 
-    fn call_eval(&mut self, columns: &[InputColumn], output_names: &[String]) -> Result<Vec<InputColumn>> {
+    fn call_eval(&mut self, columns: &[&InputColumn], output_names: &[String]) -> Result<Vec<InputColumn>> {
         let batch = RustInputBatch::new(columns)?;
         let output_views = build_str_views(output_names);
         let function_view = str_to_view(&self.function_class);
@@ -230,7 +230,7 @@ enum Buffer {
 }
 
 impl RustInputBatch {
-    fn new(columns: &[InputColumn]) -> Result<Self> {
+    fn new(columns: &[&InputColumn]) -> Result<Self> {
         let mut out = Vec::with_capacity(columns.len());
         let mut buffers = Vec::new();
 

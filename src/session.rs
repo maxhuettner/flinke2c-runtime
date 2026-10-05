@@ -172,6 +172,13 @@ enum FrameReadOwned {
     Eof,
 }
 
+/// Result of reading one frame into a shared arena (see `read_framed_payload_into_arena`).
+enum FrameReadArena {
+    Payload,
+    Timeout,
+    Eof,
+}
+
 struct AckRelay {
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<Result<()>>>,
@@ -279,6 +286,27 @@ fn read_exact_retry<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Like `read_framed_payload_timeout`, but appends the payload to `arena` instead of allocating a
+/// `Vec` per frame; the caller tracks frame boundaries via `arena.len()` after each `Payload`.
+fn read_framed_payload_into_arena<R: Read>(reader: &mut R, arena: &mut Vec<u8>) -> Result<FrameReadArena> {
+    let len = match read_frame_len_or_timeout(reader)? {
+        FrameLenRead::Len(v) => v,
+        FrameLenRead::Timeout => return Ok(FrameReadArena::Timeout),
+        FrameLenRead::Eof => return Ok(FrameReadArena::Eof),
+    };
+    if len < 0 {
+        bail!("invalid negative frame length: {}", len);
+    }
+    let len: usize = len.try_into().context("frame length overflow")?;
+    if len > DEFAULT_MAX_FRAME_SIZE {
+        bail!("frame length {} exceeds max_frame_size {}", len, DEFAULT_MAX_FRAME_SIZE);
+    }
+    let start = arena.len();
+    arena.resize(start + len, 0);
+    read_exact_retry(reader, &mut arena[start..])?;
+    Ok(FrameReadArena::Payload)
 }
 
 fn read_framed_payload_timeout<R: Read>(reader: &mut R) -> Result<FrameReadOwned> {
@@ -461,7 +489,7 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
     let comm_batch_size = resolve_comm_batch_size(pre_cfg, post_cfg);
     let udf_batch_size = resolve_udf_batch_size(config.args);
 
-    if worker_count == 1 {
+    if worker_count == 1 && !config.args.pipelined_single_worker {
         if class_changed || types_changed || config.udf.is_none() {
             let rust_udf_lib = resolve_rust_udf_lib(
                 &config.args.rust_udf_lib,
@@ -489,9 +517,11 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
         let mut last_reload_version = reload_signal.as_ref().map(|s| s.current()).unwrap_or(0);
         let udf_class = config.current_udf_class.as_ref().context("missing UDF class")?.clone();
 
-        let mut batch_payloads: Vec<Vec<u8>> = Vec::with_capacity(comm_batch_size);
+        // Frames of the current batch are read back-to-back into one arena (`ends` holds each
+        // frame's end offset), so a batch costs no per-frame allocation.
+        let mut arena: Vec<u8> = Vec::with_capacity(comm_batch_size * 256);
+        let mut ends: Vec<usize> = Vec::with_capacity(comm_batch_size);
         let mut batch_start: Option<Instant> = None;
-        let mut last_recv: Option<Instant> = None;
         let mut udf_batch = ColumnarBatch::new(&session_cfg.pre_payload_types, udf_batch_size);
         let mut flush_batch = |batch: &ColumnarBatch| -> Result<()> {
             maybe_reload_udf(udf_handle, &udf_class, reload_signal.as_ref(), &mut last_reload_version)?;
@@ -507,14 +537,16 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
             Ok(())
         };
 
-        let mut process_payloads = |payloads: &[Vec<u8>]| -> Result<()> {
-            for payload in payloads {
+        let mut process_payloads = |arena: &[u8], ends: &[usize]| -> Result<()> {
+            let mut from = 0usize;
+            for &to in ends {
                 decode_payload_into_batch(
-                    payload,
+                    &arena[from..to],
                     &mut udf_batch,
                     &session_cfg.pre_payload_types,
                     &session_cfg.pre_payload_needed,
                 )?;
+                from = to;
                 if udf_batch.len() >= udf_batch_size {
                     flush_batch(&udf_batch)?;
                     udf_batch.clear();
@@ -527,58 +559,56 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
             Ok(())
         };
 
-        loop {
-            if let Some(remaining) = next_batch_timeout(Instant::now(), batch_start, last_recv) {
-                if remaining == Duration::from_millis(0) {
-                    if !batch_payloads.is_empty() {
-                        let payloads = std::mem::take(&mut batch_payloads);
-                        process_payloads(&payloads)?;
-                        batch_start = None;
-                        last_recv = None;
-                        set_batch_read_timeout(&mut reader, &mut current_timeout, None)?;
-                        continue;
-                    }
-                } else {
-                    set_batch_read_timeout(&mut reader, &mut current_timeout, Some(remaining))?;
-                }
-            } else {
-                set_batch_read_timeout(&mut reader, &mut current_timeout, None)?;
-            }
+        // flush a partial batch after DEFAULT_BATCH_IDLE_MS idle or DEFAULT_BATCH_MAX_LATENCY_MS age
+        const LATENCY_CHECK_EVERY: usize = 64;
+        let idle_timeout = if DEFAULT_BATCH_IDLE_MS > 0 {
+            Some(Duration::from_millis(DEFAULT_BATCH_IDLE_MS))
+        } else if DEFAULT_BATCH_MAX_LATENCY_MS > 0 {
+            Some(Duration::from_millis(DEFAULT_BATCH_MAX_LATENCY_MS))
+        } else {
+            None
+        };
+        let max_latency = Duration::from_millis(DEFAULT_BATCH_MAX_LATENCY_MS);
 
-            match read_framed_payload_timeout(&mut reader)? {
-                FrameReadOwned::Payload(payload) => {
-                    let now = Instant::now();
-                    let was_empty = batch_payloads.is_empty();
-                    batch_payloads.push(payload);
-                    if was_empty {
-                        batch_start = Some(now);
+        loop {
+            let desired = if ends.is_empty() { None } else { idle_timeout };
+            set_batch_read_timeout(&mut reader, &mut current_timeout, desired)?;
+
+            match read_framed_payload_into_arena(&mut reader, &mut arena)? {
+                FrameReadArena::Payload => {
+                    if ends.is_empty() {
+                        batch_start = Some(Instant::now());
                     }
-                    last_recv = Some(now);
-                    if batch_payloads.len() < comm_batch_size {
+                    ends.push(arena.len());
+                    if ends.len() < comm_batch_size {
+                        let too_old = DEFAULT_BATCH_MAX_LATENCY_MS > 0
+                            && ends.len() % LATENCY_CHECK_EVERY == 0
+                            && batch_start.is_some_and(|start| start.elapsed() >= max_latency);
+                        if !too_old {
+                            continue;
+                        }
+                    }
+                }
+                FrameReadArena::Timeout => {
+                    if ends.is_empty() {
                         continue;
                     }
                 }
-                FrameReadOwned::Timeout => {
-                    if batch_payloads.is_empty() {
-                        continue;
-                    }
-                }
-                FrameReadOwned::Eof => {
-                    if batch_payloads.is_empty() {
+                FrameReadArena::Eof => {
+                    if ends.is_empty() {
                         break;
                     }
                 }
             }
 
-            let payloads = std::mem::take(&mut batch_payloads);
-            process_payloads(&payloads)?;
+            process_payloads(&arena, &ends)?;
+            arena.clear();
+            ends.clear();
             batch_start = None;
-            last_recv = None;
-            set_batch_read_timeout(&mut reader, &mut current_timeout, None)?;
         }
 
-        if !batch_payloads.is_empty() {
-            process_payloads(&batch_payloads)?;
+        if !ends.is_empty() {
+            process_payloads(&arena, &ends)?;
         }
 
         writer.flush().ok();

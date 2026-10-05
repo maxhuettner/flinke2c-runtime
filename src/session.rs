@@ -627,14 +627,15 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
     };
 
     let (result_tx, result_rx) = mpsc::channel::<WorkResult>();
-    let mut senders = Vec::with_capacity(worker_count);
     let mut worker_handles = Vec::with_capacity(worker_count);
     let inflight = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let input_pool: Arc<Mutex<Vec<(Vec<u8>, Vec<usize>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let output_pool: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut senders = Vec::with_capacity(worker_count);
 
     for _ in 0..worker_count {
-        let (tx, rx) = mpsc::channel::<Option<WorkItem>>();
+        let (tx, work_rx) = mpsc::channel::<Option<WorkItem>>();
         senders.push(tx);
-
         let result_tx = result_tx.clone();
         let session_cfg = session_cfg.clone();
         let udf_jars = config.args.udf_jars.clone();
@@ -646,6 +647,8 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
         let rust_udf_lib = resolve_rust_udf_lib(&config.args.rust_udf_lib, &udf_class);
         let reload_signal = reload_signal.clone();
         let udf_batch_size = udf_batch_size;
+        let input_pool = Arc::clone(&input_pool);
+        let output_pool = Arc::clone(&output_pool);
 
         let handle = thread::spawn(move || {
             let udf_handle = UdfHandle::new(udf_lang, &udf_jars, &udf_adapter, &udf_class, &udf_types, &rust_udf_lib);
@@ -661,8 +664,10 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
             };
 
             let mut last_reload_version = reload_signal.as_ref().map(|s| s.current()).unwrap_or(0);
-            for msg in rx {
-                let Some(work) = msg else { break };
+            let mut batch = ColumnarBatch::new(&session_cfg.pre_payload_types, udf_batch_size);
+            loop {
+                let msg = work_rx.recv();
+                let Ok(Some(mut work)) = msg else { break };
                 if let Err(err) = maybe_reload_udf(
                     &mut udf_handle,
                     &udf_class,
@@ -675,28 +680,46 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
                     });
                     continue;
                 }
-                let result = (|| {
-                    let mut batch = ColumnarBatch::new(&session_cfg.pre_payload_types, udf_batch_size);
-                    let mut out = Vec::with_capacity(work.payloads.len());
-                    for payload in &work.payloads {
+                batch.clear();
+                let mut out = output_pool.lock().expect("lock output pool").pop().unwrap_or_default();
+                out.clear();
+                let result = (|| -> Result<()> {
+                    let mut run = |batch: &ColumnarBatch, out: &mut Vec<u8>| -> Result<()> {
+                        apply_udf_to_batch_stream(&mut ColumnarUdfConfig {
+                            writer: out,
+                            batch,
+                            session: &session_cfg,
+                            udf: &mut udf_handle,
+                            method: &udf_method,
+                        })
+                    };
+                    let mut from = 0usize;
+                    for &to in &work.ends {
                         decode_payload_into_batch(
-                            payload,
+                            &work.arena[from..to],
                             &mut batch,
                             &session_cfg.pre_payload_types,
                             &session_cfg.pre_payload_needed,
                         )?;
+                        from = to;
                         if batch.len() >= udf_batch_size {
-                            let rows = apply_udf_to_batch(&batch, &session_cfg, &mut udf_handle, &udf_method)?;
-                            out.extend(rows);
+                            run(&batch, &mut out)?;
                             batch.clear();
                         }
                     }
                     if batch.len() > 0 {
-                        let rows = apply_udf_to_batch(&batch, &session_cfg, &mut udf_handle, &udf_method)?;
-                        out.extend(rows);
+                        run(&batch, &mut out)?;
+                        batch.clear();
                     }
-                    Ok(out)
+                    Ok(())
                 })();
+                work.arena.clear();
+                work.ends.clear();
+                input_pool
+                    .lock()
+                    .expect("lock input pool")
+                    .push((std::mem::take(&mut work.arena), std::mem::take(&mut work.ends)));
+                let result = result.map(|()| out);
                 if result_tx.send(WorkResult { seq: work.seq, result }).is_err() {
                     break;
                 }
@@ -708,27 +731,28 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
 
     let inflight_writer = Arc::clone(&inflight);
     let writer_buf_size = DEFAULT_BUF_SIZE;
-    let writer_session = session_cfg.clone();
+    let writer_output_pool = Arc::clone(&output_pool);
     let writer_handle = thread::spawn(move || -> Result<()> {
         let mut writer = BufWriter::with_capacity(writer_buf_size, post);
-        let mut pending: BTreeMap<usize, Vec<OutputBlock>> = BTreeMap::new();
+        let mut pending: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
         let mut next_seq = 0usize;
-        let mut payload_buf = Vec::with_capacity(256);
 
         while let Ok(work) = result_rx.recv() {
             let WorkResult { seq, result } = work;
-            let rows = result?;
+            let encoded = result?;
             if seq == next_seq {
-                write_output_blocks(&mut writer, &rows, &writer_session, &mut payload_buf)?;
+                writer.write_all(&encoded).context("write responses to POST")?;
                 writer.flush().ok();
+                writer_output_pool.lock().expect("lock output pool").push(encoded);
                 next_seq += 1;
-                while let Some(next_rows) = pending.remove(&next_seq) {
-                    write_output_blocks(&mut writer, &next_rows, &writer_session, &mut payload_buf)?;
+                while let Some(next) = pending.remove(&next_seq) {
+                    writer.write_all(&next).context("write responses to POST")?;
                     writer.flush().ok();
+                    writer_output_pool.lock().expect("lock output pool").push(next);
                     next_seq += 1;
                 }
             } else {
-                pending.insert(seq, rows);
+                pending.insert(seq, encoded);
             }
 
             let (lock, cvar) = &*inflight_writer;
@@ -749,73 +773,60 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
     let mut send_index = 0usize;
     let mut reader = BufReader::with_capacity(DEFAULT_BUF_SIZE, pre);
     let mut current_timeout: Option<Duration> = None;
-    let mut batch_payloads: Vec<Vec<u8>> = Vec::with_capacity(comm_batch_size);
+    let acquire_buffers = |pool: &Mutex<Vec<(Vec<u8>, Vec<usize>)>>| {
+        pool.lock().expect("lock input pool").pop().unwrap_or_else(|| {
+            (
+                Vec::with_capacity(comm_batch_size * 256),
+                Vec::with_capacity(comm_batch_size),
+            )
+        })
+    };
+    let (mut arena, mut ends) = acquire_buffers(&input_pool);
     let mut batch_start: Option<Instant> = None;
-    let mut last_recv: Option<Instant> = None;
+
+    // same batch flush rules as the single-worker path
+    const LATENCY_CHECK_EVERY: usize = 64;
+    let idle_timeout = if DEFAULT_BATCH_IDLE_MS > 0 {
+        Some(Duration::from_millis(DEFAULT_BATCH_IDLE_MS))
+    } else if DEFAULT_BATCH_MAX_LATENCY_MS > 0 {
+        Some(Duration::from_millis(DEFAULT_BATCH_MAX_LATENCY_MS))
+    } else {
+        None
+    };
+    let max_latency = Duration::from_millis(DEFAULT_BATCH_MAX_LATENCY_MS);
 
     loop {
-        if let Some(remaining) = next_batch_timeout(Instant::now(), batch_start, last_recv) {
-            if remaining == Duration::from_millis(0) {
-                if !batch_payloads.is_empty() {
-                    let payloads = std::mem::take(&mut batch_payloads);
-                    batch_start = None;
-                    last_recv = None;
-                    set_batch_read_timeout(&mut reader, &mut current_timeout, None)?;
-                    let (lock, cvar) = &*inflight;
-                    let mut count = lock.lock().expect("lock inflight");
-                    while *count >= max_in_flight {
-                        count = cvar.wait(count).expect("wait inflight");
+        let desired = if ends.is_empty() { None } else { idle_timeout };
+        set_batch_read_timeout(&mut reader, &mut current_timeout, desired)?;
+
+        match read_framed_payload_into_arena(&mut reader, &mut arena)? {
+            FrameReadArena::Payload => {
+                if ends.is_empty() {
+                    batch_start = Some(Instant::now());
+                }
+                ends.push(arena.len());
+                if ends.len() < comm_batch_size {
+                    let too_old = DEFAULT_BATCH_MAX_LATENCY_MS > 0
+                        && ends.len() % LATENCY_CHECK_EVERY == 0
+                        && batch_start.is_some_and(|start| start.elapsed() >= max_latency);
+                    if !too_old {
+                        continue;
                     }
-                    *count += 1;
-                    drop(count);
-
-                    let sender = &senders[send_index % senders.len()];
-                    sender
-                        .send(Some(WorkItem {
-                            seq: dispatched,
-                            payloads,
-                        }))
-                        .context("dispatch batch to worker")?;
-                    dispatched += 1;
-                    send_index += 1;
-                    continue;
                 }
-            } else {
-                set_batch_read_timeout(&mut reader, &mut current_timeout, Some(remaining))?;
             }
-        } else {
-            set_batch_read_timeout(&mut reader, &mut current_timeout, None)?;
-        }
-
-        match read_framed_payload_timeout(&mut reader)? {
-            FrameReadOwned::Payload(payload) => {
-                let now = Instant::now();
-                let was_empty = batch_payloads.is_empty();
-                batch_payloads.push(payload);
-                if was_empty {
-                    batch_start = Some(now);
-                }
-                last_recv = Some(now);
-                if batch_payloads.len() < comm_batch_size {
+            FrameReadArena::Timeout => {
+                if ends.is_empty() {
                     continue;
                 }
             }
-            FrameReadOwned::Timeout => {
-                if batch_payloads.is_empty() {
-                    continue;
-                }
-            }
-            FrameReadOwned::Eof => {
-                if batch_payloads.is_empty() {
+            FrameReadArena::Eof => {
+                if ends.is_empty() {
                     break;
                 }
             }
         }
 
-        let payloads = std::mem::take(&mut batch_payloads);
         batch_start = None;
-        last_recv = None;
-        set_batch_read_timeout(&mut reader, &mut current_timeout, None)?;
         let (lock, cvar) = &*inflight;
         let mut count = lock.lock().expect("lock inflight");
         while *count >= max_in_flight {
@@ -824,11 +835,12 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
         *count += 1;
         drop(count);
 
-        let sender = &senders[send_index % senders.len()];
-        sender
+        let (next_arena, next_ends) = acquire_buffers(&input_pool);
+        senders[send_index % senders.len()]
             .send(Some(WorkItem {
                 seq: dispatched,
-                payloads,
+                arena: std::mem::replace(&mut arena, next_arena),
+                ends: std::mem::replace(&mut ends, next_ends),
             }))
             .context("dispatch batch to worker")?;
         dispatched += 1;
@@ -851,10 +863,13 @@ fn run_session(config: TcpSessionConfig) -> Result<()> {
 
 struct WorkItem {
     seq: usize,
-    payloads: Vec<Vec<u8>>,
+    /// Frames of one batch back to back; `ends[i]` is the end offset of frame `i`.
+    arena: Vec<u8>,
+    ends: Vec<usize>,
 }
 
 struct WorkResult {
     seq: usize,
-    result: Result<Vec<OutputBlock>>,
+    /// Encoded response frames for the whole batch, ready to write in `seq` order.
+    result: Result<Vec<u8>>,
 }
